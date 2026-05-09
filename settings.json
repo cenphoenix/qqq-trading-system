@@ -1,0 +1,50 @@
+{
+  "_version": "1.0",
+  "_description": "热血青年交易所 - 交易参数配置",
+  "_last_modified": "2026-05-01 21:17:11",
+  "signal": {
+    "symbol": "QQQ.US",
+    "rsi_period": 14,
+    "rsi_overbought": 75,
+    "rsi_oversold": 25,
+    "lookback": 3,
+    "lookback_accel": 2,
+    "vol_mult": 0.8,
+    "min_body": 0.0003,
+    "max_gap": 0.002,
+    "pullback_confirm": false,
+    "reversal_drop": 0.002,
+    "reversal_bounce": 0.001
+  },
+  "risk": {
+    "capital": 100000,
+    "order_pct": 8,
+    "sl": 0.25,
+    "tp": 0.3,
+    "daily_limit": 25,
+    "max_trades": 999,
+    "contract_multiplier": 100,
+    "option_offset": 2.0,
+    "tp_partial_pct": 1.0,
+    "tp_trail_drop": 0.3,
+    "stock_trail_pct": 0.003,
+    "trail_activate": 0.1,
+    "trail_drop": 0.05,
+    "timeout_stage1_bars": 5,
+    "timeout_stage1_min": 0.3,
+    "timeout_stage2_bars": 10,
+    "timeout_stage2_min": 0.6,
+    "timeout_stage3_bars": 15
+  },
+  "trading": {
+    "start_time": "09:35",
+    "end_time": "15:50",
+    "check_interval": 20,
+    "post_open_cooldown": 15,
+    "loss_cooldown": 3
+  },
+  "feishu": {
+    "enabled": true,
+    "open_id": "YOUR_FEISHU_OPEN_ID"
+  }
+}

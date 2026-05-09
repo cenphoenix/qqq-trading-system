@@ -1,0 +1,32 @@
+# 环境变量
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# 日志
+*.log
+logs/
+
+# 运行时数据
+state.json
+longbridge_orders.json
+today.csv
+data/
+records/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

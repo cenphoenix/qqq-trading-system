@@ -1,0 +1,294 @@
+"""
+热血青年交易所 - 配置管理模块
+管理 settings.json 的读写，提供默认值和验证
+"""
+import os
+import sys
+import json
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+# 获取exe所在目录（打包后）或脚本所在目录（开发时）
+def get_base_dir():
+    """获取应用根目录"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+BASE_DIR = get_base_dir()
+SETTINGS_FILE = BASE_DIR / "settings.json"
+ENV_FILE = BASE_DIR / ".env"
+BACKUP_DIR = BASE_DIR / "config_backups"
+
+# ===== 默认配置（所有可调参数的默认值）=====
+DEFAULT_CONFIG = {
+    "_version": "1.0",
+    "_description": "热血青年交易所 - 交易参数配置",
+    "_last_modified": "",
+
+    # ---- 信号参数 ----
+    "signal": {
+        "symbol": "QQQ.US",
+        "rsi_period": 14,
+        "rsi_overbought": 75,
+        "rsi_oversold": 25,
+        "lookback": 3,              # Classic突破窗口
+        "lookback_accel": 2,        # Accelerated突破窗口
+        "vol_mult": 0.8,            # 成交量倍数阈值
+        "min_body": 0.0003,         # 最小K线实体比例
+        "max_gap": 0.002,           # 最大跳空 0.20%
+        "pullback_confirm": False,   # 是否需要回踩确认
+        # 衰竭反转
+        "reversal_drop": 0.002,     # 高点跌幅阈值
+        "reversal_bounce": 0.001,   # 反弹实体阈值
+    },
+
+    # ---- 资金风控 ----
+    "risk": {
+        "capital": 100000,          # 账户总资金
+        "order_pct": 8,             # 单笔下单占总资金百分比
+        "sl": 0.25,                 # 止损 25%
+        "tp": 0.30,                 # 止盈 30%（旧逻辑兼容）
+        "daily_limit": 25,          # 日亏损熔断百分比
+        "max_trades": 999,          # 日最大交易次数
+        "contract_multiplier": 100, # 每张期权对应股数
+        "option_offset": 2.0,       # 期权行权价偏移($2)
+        # 动态止盈
+        "tp_partial_pct": 1.00,     # 盈利100%平仓一半
+        "tp_trail_drop": 0.30,      # 峰值回撤30%全部平仓
+        # 跟踪止损
+        "stock_trail_pct": 0.003,   # 正股从高点回撤0.3%
+        "trail_activate": 0.10,     # 跟踪止损激活 10%
+        "trail_drop": 0.05,         # 跟踪止损回撤 5%
+        # 超时退出
+        "timeout_stage1_bars": 5,
+        "timeout_stage1_min": 0.30,
+        "timeout_stage2_bars": 10,
+        "timeout_stage2_min": 0.60,
+        "timeout_stage3_bars": 15,
+    },
+
+    # ---- 交易窗口 ----
+    "trading": {
+        "start_time": "09:35",      # 允许入场开始（美东）
+        "end_time": "15:50",        # 允许入场结束（美东）
+        "check_interval": 20,       # 检测间隔（秒）
+        "post_open_cooldown": 15,   # 开盘冷却（分钟）
+        "loss_cooldown": 3,         # 连续亏损后冷却次数
+    },
+
+    # ---- 飞书通知 ----
+    "feishu": {
+        "enabled": True,
+        "open_id": "YOUR_FEISHU_OPEN_ID",
+    },
+}
+
+# 参数类型映射（用于GUI和验证）
+PARAM_TYPES = {
+    # signal
+    "signal.rsi_period": {"type": "int", "min": 5, "max": 50, "label": "RSI周期"},
+    "signal.rsi_overbought": {"type": "int", "min": 60, "max": 90, "label": "RSI超买"},
+    "signal.rsi_oversold": {"type": "int", "min": 10, "max": 40, "label": "RSI超卖"},
+    "signal.lookback": {"type": "int", "min": 2, "max": 10, "label": "Classic突破窗口"},
+    "signal.lookback_accel": {"type": "int", "min": 1, "max": 5, "label": "加速突破窗口"},
+    "signal.vol_mult": {"type": "float", "min": 0.3, "max": 3.0, "label": "成交量倍数"},
+    "signal.min_body": {"type": "float", "min": 0.0001, "max": 0.01, "label": "最小实体比例"},
+    "signal.max_gap": {"type": "float", "min": 0.001, "max": 0.02, "label": "最大跳空"},
+    "signal.pullback_confirm": {"type": "bool", "label": "需要回踩确认"},
+    "signal.reversal_drop": {"type": "float", "min": 0.001, "max": 0.01, "label": "反转跌幅阈值"},
+    "signal.reversal_bounce": {"type": "float", "min": 0.0005, "max": 0.005, "label": "反转反弹阈值"},
+
+    # risk
+    "risk.capital": {"type": "float", "min": 1000, "max": 10000000, "label": "账户资金($)"},
+    "risk.order_pct": {"type": "float", "min": 1, "max": 50, "label": "单笔仓位(%)"},
+    "risk.sl": {"type": "float", "min": 0.05, "max": 0.50, "label": "止损(%)", "display_pct": True},
+    "risk.tp": {"type": "float", "min": 0.10, "max": 1.00, "label": "止盈(%)", "display_pct": True},
+    "risk.daily_limit": {"type": "float", "min": 5, "max": 50, "label": "日亏损熔断(%)"},
+    "risk.max_trades": {"type": "int", "min": 1, "max": 999, "label": "日最大交易次数"},
+    "risk.contract_multiplier": {"type": "int", "min": 1, "max": 1000, "label": "合约乘数"},
+    "risk.option_offset": {"type": "float", "min": 0.5, "max": 10.0, "label": "行权价偏移($)"},
+    "risk.tp_partial_pct": {"type": "float", "min": 0.20, "max": 5.00, "label": "部分止盈(%)", "display_pct": True},
+    "risk.tp_trail_drop": {"type": "float", "min": 0.05, "max": 0.50, "label": "峰值回撤平仓(%)", "display_pct": True},
+    "risk.stock_trail_pct": {"type": "float", "min": 0.001, "max": 0.02, "label": "正股跟踪止损(%)", "display_pct": True},
+    "risk.trail_activate": {"type": "float", "min": 0.05, "max": 0.30, "label": "跟踪止损激活(%)", "display_pct": True},
+    "risk.trail_drop": {"type": "float", "min": 0.01, "max": 0.15, "label": "跟踪止损回撤(%)", "display_pct": True},
+    "risk.timeout_stage1_bars": {"type": "int", "min": 2, "max": 15, "label": "超时1(分钟)"},
+    "risk.timeout_stage1_min": {"type": "float", "min": 0.05, "max": 0.50, "label": "超时1目标(%)", "display_pct": True},
+    "risk.timeout_stage2_bars": {"type": "int", "min": 5, "max": 30, "label": "超时2(分钟)"},
+    "risk.timeout_stage2_min": {"type": "float", "min": 0.10, "max": 1.00, "label": "超时2目标(%)", "display_pct": True},
+    "risk.timeout_stage3_bars": {"type": "int", "min": 10, "max": 60, "label": "超时3硬退出(分钟)"},
+
+    # trading
+    "trading.start_time": {"type": "time", "label": "开盘时间(ET)"},
+    "trading.end_time": {"type": "time", "label": "收盘时间(ET)"},
+    "trading.check_interval": {"type": "int", "min": 5, "max": 60, "label": "检测间隔(秒)"},
+    "trading.post_open_cooldown": {"type": "int", "min": 0, "max": 60, "label": "开盘冷却(分钟)"},
+    "trading.loss_cooldown": {"type": "int", "min": 1, "max": 20, "label": "亏损冷却次数"},
+
+    # feishu
+    "feishu.enabled": {"type": "bool", "label": "启用飞书推送"},
+    "feishu.open_id": {"type": "str", "label": "飞书Open ID"},
+}
+
+
+class ConfigManager:
+    """配置管理器 - 单例模式"""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._config = {}
+        self._observers = []  # 配置变更回调
+        self.load()
+
+    def load(self):
+        """从 settings.json 加载配置"""
+        if SETTINGS_FILE.exists():
+            try:
+                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    self._config = json.load(f)
+                # 合并默认值（新字段自动补全）
+                self._merge_defaults(self._config, DEFAULT_CONFIG)
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"[Config] settings.json 读取失败: {e}, 使用默认配置")
+                self._config = self._copy_default()
+        else:
+            self._config = self._copy_default()
+            self.save()
+
+    def _merge_defaults(self, loaded, defaults):
+        """递归合并默认值，保留用户已修改的"""
+        for key, val in defaults.items():
+            if key.startswith('_'):
+                loaded[key] = val
+                continue
+            if key not in loaded:
+                loaded[key] = val
+            elif isinstance(val, dict) and isinstance(loaded[key], dict):
+                self._merge_defaults(loaded[key], val)
+
+    def _copy_default(self):
+        """深拷贝默认配置"""
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+
+    def save(self):
+        """保存配置到 settings.json"""
+        self._config['_last_modified'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # 原子写入
+        tmp = SETTINGS_FILE.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self._config, f, indent=2, ensure_ascii=False)
+        tmp.replace(SETTINGS_FILE)
+
+    def backup(self):
+        """备份当前配置"""
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        dst = BACKUP_DIR / f"settings_{ts}.json"
+        shutil.copy2(SETTINGS_FILE, dst)
+        return str(dst)
+
+    def get(self, group, key, default=None):
+        """获取配置值: config.get('signal', 'rsi_period')"""
+        g = self._config.get(group, {})
+        return g.get(key, default)
+
+    def get_all(self, group=None):
+        """获取整组或全部配置"""
+        if group:
+            return self._config.get(group, {})
+        return self._config
+
+    def set(self, group, key, value):
+        """设置配置值"""
+        if group not in self._config:
+            self._config[group] = {}
+        self._config[group][key] = value
+
+    def set_group(self, group, values: dict):
+        """批量设置整组配置"""
+        self._config[group] = values
+
+    def get_flat(self):
+        """获取扁平化的 CONFIG dict（兼容 live_trader.py 的 CONFIG 格式）"""
+        flat = {}
+        for group in ['signal', 'risk', 'trading', 'feishu']:
+            group_data = self._config.get(group, {})
+            for k, v in group_data.items():
+                flat[k] = v
+        return flat
+
+    def reset_to_default(self, group=None):
+        """重置为默认值"""
+        if group:
+            self._config[group] = json.loads(json.dumps(DEFAULT_CONFIG.get(group, {})))
+        else:
+            self._config = self._copy_default()
+        self.save()
+
+    def notify_change(self):
+        """通知所有观察者配置已变更"""
+        for cb in self._observers:
+            try:
+                cb(self._config)
+            except Exception as e:
+                print(f"[Config] 观察者回调异常: {e}")
+
+    def add_observer(self, callback):
+        """添加配置变更观察者"""
+        self._observers.append(callback)
+
+    # ===== .env 密钥管理 =====
+    @staticmethod
+    def load_env():
+        """加载 .env 文件"""
+        env = {}
+        if ENV_FILE.exists():
+            with open(ENV_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        env[k.strip()] = v.strip()
+        return env
+
+    @staticmethod
+    def save_env(env_dict: dict):
+        """保存 .env 文件"""
+        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for k, v in env_dict.items():
+            lines.append(f"{k}={v}")
+        tmp = ENV_FILE.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        tmp.replace(ENV_FILE)
+
+    @staticmethod
+    def has_env_keys():
+        """检查 .env 是否已配置密钥"""
+        env = ConfigManager.load_env()
+        return bool(env.get('LONGPORT_APP_KEY') and env.get('LONGPORT_ACCESS_TOKEN'))
+
+
+# ===== 便捷函数 =====
+def get_config():
+    """获取配置管理器实例"""
+    return ConfigManager()
+
+
+def get_flat_config():
+    """获取扁平配置（兼容 CONFIG 格式）"""
+    return ConfigManager().get_flat()
