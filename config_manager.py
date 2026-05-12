@@ -236,10 +236,13 @@ class ConfigManager:
     def get_flat(self):
         """获取扁平化的 CONFIG dict（兼容 live_trader.py 的 CONFIG 格式）"""
         flat = {}
-        for group in ['signal', 'risk', 'trading', 'feishu', 'telegram']:
+        for group in ['signal', 'risk', 'trading']:
             group_data = self._config.get(group, {})
             for k, v in group_data.items():
                 flat[k] = v
+        # feishu/telegram 保留嵌套结构，供 _notify() 使用
+        flat['feishu'] = self._config.get('feishu', {})
+        flat['telegram'] = self._config.get('telegram', {})
         return flat
 
     def reset_to_default(self, group=None):

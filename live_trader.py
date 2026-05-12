@@ -2174,9 +2174,11 @@ class QQQLiveTrader:
 
     def _notify(self, msg):
         """统一通知 - 同时发送飞书和Telegram"""
+        tg_cfg = self.cfg.get('telegram', {})
+        print(f"  📨 Telegram配置: enabled={tg_cfg.get('enabled')}, bot_token={'已配置' if tg_cfg.get('bot_token') else '未配置'}")
         if self.cfg.get('feishu', {}).get('enabled', True):
             self._notify_feishu(msg)
-        if self.cfg.get('telegram', {}).get('enabled', False):
+        if tg_cfg.get('enabled', False):
             self._notify_telegram(msg)
 
     def _sync_gist(self):

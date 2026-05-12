@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+import signal
 import webbrowser
 from pathlib import Path
 
@@ -33,6 +34,28 @@ def load_env():
         os.environ[k] = v
 
 
+def notify_telegram(msg):
+    """发送Telegram通知"""
+    try:
+        import requests
+        from config_manager import get_flat_config
+        cfg = get_flat_config()
+        tg = cfg.get('telegram', {})
+        if not tg.get('enabled'):
+            return
+        bot_token = tg.get('bot_token', '')
+        chat_id = tg.get('chat_id', '')
+        if not bot_token or not chat_id:
+            return
+        requests.post(
+            f'https://api.telegram.org/bot{bot_token}/sendMessage',
+            json={'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+
 def start_trader():
     """启动交易引擎"""
     from live_trader import main as trader_main
@@ -45,12 +68,19 @@ def start_web():
     dashboard_web.main(8080)
 
 
+trader_started = False
+
+
 def main():
+    global trader_started
+
     print("=" * 50)
     print("🔥 热血青年交易所 Web版 v6.2")
     print("=" * 50)
 
     load_env()
+
+    notify_telegram("🚀 系统启动")
 
     # 启动Web仪表盘（阻塞）
     web_thread = threading.Thread(target=start_web, daemon=True)
@@ -63,8 +93,17 @@ def main():
 
     # 启动交易引擎
     print("🚀 启动交易引擎...")
+    trader_started = True
     start_trader()
 
 
+def exit_handler(signum, frame):
+    notify_telegram("🛑 系统关闭")
+    print("\n👋 已发送关闭通知")
+    sys.exit(0)
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, exit_handler)
+    signal.signal(signal.SIGTERM, exit_handler)
     main()

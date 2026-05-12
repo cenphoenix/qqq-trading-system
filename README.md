@@ -10,14 +10,14 @@
 - **动态止盈**：盈利 100% 平半仓，剩余追踪最高点回撤 30% 全平
 - **分阶段超时退出**：持仓时间越长，止损越紧，避免深度套牢
 - **VIX 波动率过滤**：根据 VIX 水平动态调整仓位和策略
-- **飞书通知**：开仓/平仓/异常实时推送
+- **通知推送**：飞书/Telegram 双通道，开仓/平仓/异常实时推送
 - **看门狗崩溃恢复**：进程异常退出后自动重启
 
 ## 界面
 
-- **桌面控制面板**（Tkinter）：系统托盘常驻，实时监控
-- **Web 仪表盘**：浏览器访问，支持手机查看
-- **控制面板**：在线调整交易参数，无需重启
+- **Web 仪表盘**：浏览器访问 `http://localhost:8080`，支持手机查看
+- **启动/关闭通知**：系统启动和关闭时自动推送到 Telegram
+- **控制面板**：在线调整交易参数，无需重启（开发中）
 
 ## 快速开始
 
@@ -52,32 +52,72 @@ LONGPORT_ACCESS_TOKEN=你的AccessToken
 ### 4. 启动系统
 
 ```bash
-# 桌面版（推荐，含系统托盘）
-python main_app.py
+# Web版（推荐，无需 GUI 界面，适合服务器/无显示环境）
+python3 run_web.py
 
-# 或使用启动脚本
-start.bat
+# 桌面版（含系统托盘，需要 Tkinter 支持）
+python3 main_app.py
 ```
 
 启动后浏览器访问 `http://localhost:8080` 查看 Web 仪表盘。
+
+> 注意：运行 `run_web.py` 需要系统 Python 3.10+（带 Tkinter），或使用无 GUI 的纯命令行模式。
 
 ## 项目结构
 
 ```
 ├── main_app.py          # 主入口（Tkinter GUI + 系统托盘）
+├── run_web.py           # Web版入口（无 GUI，适合服务器部署）
 ├── live_trader.py       # 核心交易引擎 v6.2
-├── trader_web.py        # Web 仪表盘
-├── dashboard_web.py     # 轻量 Web 仪表盘（无依赖）
-├── dashboard_tk.py      # Tkinter 桌面仪表盘
-├── config_manager.py    # 配置管理器
-├── settings_gui.py      # 设置界面
-├── update_gist.py       # 交易记录同步到 GitHub Gist
-├── watchdog.py          # 看门狗（崩溃自动重启）
-├── backtest_v6.py       # 回测引擎（Black-Scholes 定价）
-├── settings.json        # 交易参数配置
-├── requirements.txt     # Python 依赖
-└── .env.example         # 环境变量模板
+├── trader_web.py        # Web 仪表盘 API
+├── dashboard_web.py    # 轻量 Web 仪表盘（无依赖）
+├── config_manager.py   # 配置管理器
+├── settings_gui.py     # 设置界面
+├── update_gist.py      # 交易记录同步到 GitHub Gist
+├── watchdog.py         # 看门狗（崩溃自动重启）
+├── backtest_v6.py      # 回测引擎（Black-Scholes 定价）
+├── settings.json       # 交易参数配置
+├── requirements.txt    # Python 依赖
+└── .env.example        # 环境变量模板
 ```
+
+## 通知配置
+
+### 飞书通知
+
+在 `settings.json` 中配置：
+```json
+{
+  "feishu": {
+    "enabled": true,
+    "open_id": "你的飞书Open ID"
+  }
+}
+```
+
+### Telegram 通知
+
+1. 通过 @BotFather 创建一个 Bot，获取 Bot Token
+2. 通过 @userinfobot 获取你的 Chat ID
+3. 在 `settings.json` 中配置：
+
+```json
+{
+  "telegram": {
+    "enabled": true,
+    "bot_token": "你的BotToken",
+    "chat_id": "你的ChatID"
+  }
+}
+```
+
+或设置环境变量：
+```bash
+TELEGRAM_BOT_TOKEN=你的BotToken
+TELEGRAM_CHAT_ID=你的ChatID
+```
+
+通知内容：开仓/平仓信号、系统启动/关闭通知、异常警告
 
 ## 策略逻辑
 
@@ -115,10 +155,9 @@ start.bat
 | 组件 | 技术 |
 |------|------|
 | 交易引擎 | Python, NumPy, SciPy |
-| 桌面 GUI | Tkinter, pystray |
-| Web 服务 | Python http.server / Flask |
+| Web 服务 | Python http.server (零依赖) |
 | API 通信 | Longbridge OpenAPI (WebSocket + REST) |
-| 通知 | 飞书 Webhook |
+| 通知 | 飞书 Webhook + Telegram Bot API |
 | 打包 | PyInstaller |
 
 ## License
