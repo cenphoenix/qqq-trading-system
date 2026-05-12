@@ -1,7 +1,7 @@
 {
   "_version": "1.0",
   "_description": "热血青年交易所 - 交易参数配置",
-  "_last_modified": "2026-05-12 15:59:16",
+  "_last_modified": "",
   "signal": {
     "rsi_period": 14,
     "rsi_overbought": 75,
@@ -48,8 +48,8 @@
     "open_id": "YOUR_FEISHU_OPEN_ID"
   },
   "telegram": {
-    "enabled": true,
-    "bot_token": "8522460224:AAEEPlLYS5eWj7S5XOSvVlI-mpIWhD13IFs",
-    "chat_id": "405745622"
+    "enabled": false,
+    "bot_token": "YOUR_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
   }
 }

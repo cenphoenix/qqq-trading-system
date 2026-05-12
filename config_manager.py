@@ -304,3 +304,12 @@ def get_config():
 def get_flat_config():
     """获取扁平配置（兼容 CONFIG 格式）"""
     return ConfigManager().get_flat()
+
+
+# 向后兼容：导出默认配置供 live_trader.py 使用
+def get_default_config() -> dict:
+    """获取默认配置字典（兼容旧代码）"""
+    flat = get_flat_config()
+    # 补充旧代码需要的额外字段
+    flat['lookback_accel'] = flat.get('lookback_accel', 2)
+    return flat

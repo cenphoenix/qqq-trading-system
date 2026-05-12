@@ -71,7 +71,7 @@ class SettingsWindow:
         self.tab_signal = self._create_tab(notebook, "📊 信号参数", "signal")
         self.tab_risk = self._create_tab(notebook, "💰 资金风控", "risk")
         self.tab_trading = self._create_tab(notebook, "🌐 交易窗口", "trading")
-        self.tab_feishu = self._create_tab(notebook, "🔑 API配置", "feishu")
+        self.tab_feishu = self._create_tab(notebook, "📨 飞书", "feishu")
         self.tab_telegram = self._create_tab(notebook, "📨 Telegram", "telegram")
 
         # 底部按钮栏
