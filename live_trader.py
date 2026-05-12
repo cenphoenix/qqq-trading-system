@@ -203,6 +203,9 @@ class QQQLiveTrader:
         self._lb_pos_cache = 0            # 长桥持仓缓存
         self._lb_pos_cache_time = 0       # 缓存时间戳
         self._trading_lock = False        # 开仓防重入锁
+        self._position_check_lock = False # 报价推送触发风控时防重入
+        self._subscribed_quote_symbols = set()
+        self.latest_quote_prices = {}
 
         # 实时事件日志（供仪表盘读取）
         self.events = []  # [{'time': 'HH:MM:SS', 'msg': '...', 'tag': 'info/signal/trade/error'}]
@@ -309,6 +312,7 @@ class QQQLiveTrader:
             self.config = Config.from_apikey_env()
             self.quote_ctx = QuoteContext(self.config)
             self.trade_ctx = TradeContext(self.config)
+            self.quote_ctx.set_on_quote(self._on_quote)
             print("✅ 长桥API连接成功")
             self._add_event("✅ 长桥API连接成功", "engine")
         except Exception as e:
@@ -316,6 +320,73 @@ class QQQLiveTrader:
             self._add_event(f"❌ API连接失败: {e}", "error")
             import traceback
             traceback.print_exc()
+
+    def _extract_quote_price(self, event):
+        """兼容不同SDK推送对象结构，提取最新价"""
+        quote = getattr(event, 'quote', event)
+        for attr in ('last_done', 'last_price', 'price'):
+            value = getattr(quote, attr, None)
+            if value is not None:
+                try:
+                    price = float(value)
+                    if price > 0:
+                        return price
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    def _subscribe_quotes(self, symbols):
+        """订阅报价推送，避免重复订阅"""
+        symbols = [s for s in symbols if s and s not in self._subscribed_quote_symbols]
+        if not symbols or not self.quote_ctx:
+            return
+        try:
+            self.quote_ctx.subscribe(symbols, [SubType.Quote])
+            self._subscribed_quote_symbols.update(symbols)
+            print(f"📡 已订阅报价推送: {', '.join(symbols)}")
+        except Exception as e:
+            print(f"⚠️ 报价订阅失败 {symbols}: {e}")
+
+    def _unsubscribe_quotes(self, symbols):
+        """取消不再需要的报价推送"""
+        symbols = [s for s in symbols if s and s in self._subscribed_quote_symbols and s != self.cfg['symbol']]
+        if not symbols or not self.quote_ctx:
+            return
+        try:
+            self.quote_ctx.unsubscribe(symbols, [SubType.Quote])
+            for symbol in symbols:
+                self._subscribed_quote_symbols.discard(symbol)
+                self.latest_quote_prices.pop(symbol, None)
+            print(f"📴 已取消报价推送: {', '.join(symbols)}")
+        except Exception as e:
+            print(f"⚠️ 取消报价订阅失败 {symbols}: {e}")
+
+    def _subscribe_position_quote(self, opt_symbol):
+        """持仓建立/恢复后订阅期权报价，价格变动即触发风控"""
+        if not opt_symbol:
+            return
+        self._subscribe_quotes([opt_symbol])
+
+    def _on_quote(self, symbol, event):
+        """报价推送回调：更新缓存，并用持仓期权价格实时检查止盈止损"""
+        price = self._extract_quote_price(event)
+        if price <= 0:
+            return
+
+        self.latest_quote_prices[symbol] = price
+        if symbol == self.cfg['symbol']:
+            self.current_price = price
+            return
+
+        pos = self.position
+        if not self.running or not pos or symbol != pos.get('opt_symbol'):
+            return
+
+        self._check_position(
+            opt_price=price,
+            current_stock=self.current_price or None,
+            triggered_by_push=True,
+        )
 
     def _preload_history(self):
         """启动时预加载今日全部K线，并回放信号检测"""
@@ -414,6 +485,7 @@ class QQQLiveTrader:
                                             'order_status': 'restored',
                                         }
                                         print(f"  ✅ 已恢复内部持仓状态")
+                                        self._subscribe_position_quote(self.position.get('opt_symbol'))
                                         break
                         if has_position:
                             break
@@ -482,9 +554,13 @@ class QQQLiveTrader:
             self.cfg['symbol'], Period.Min_1, TradeSessions.All
         )
         self.quote_ctx.set_on_candlestick(self._on_candlestick)
+        self._subscribe_quotes([self.cfg['symbol']])
+        if self.position:
+            self._subscribe_position_quote(self.position.get('opt_symbol'))
 
         print("📡 已订阅QQQ 1分钟K线推送")
-        print("⏳ 每20秒检测一次信号...")
+        print("📡 已订阅QQQ报价推送，持仓期权将用推送实时风控")
+        print("⏳ 每20秒检测一次信号（持仓止盈止损由报价推送实时触发）...")
 
         # 主循环 - 每20秒检测一次
         last_order_sync = 0
@@ -507,7 +583,7 @@ class QQQLiveTrader:
                 _maybe_reload_config()
                 # 每20秒检测一次信号
                 self._check_signal_20s()
-                self._check_position()
+                self._check_position(triggered_by_push=False)
                 
                 # 每60秒同步一次长桥订单到文件
                 now = time.time()
@@ -554,7 +630,9 @@ class QQQLiveTrader:
             self.daily_signals = 0
             self.trades_today = []
             self.daily_pnl = 0
+            old_symbol = self.position.get('opt_symbol') if self.position else None
             self.position = None
+            self._unsubscribe_quotes([old_symbol])
             self.consecutive_losses = 0  # 新交易日重置亏损计数
             self.cooldown_remaining = 0  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
@@ -1267,6 +1345,7 @@ class QQQLiveTrader:
                 'stock_peak': float(price),  # 正股最高价(Call)/最低价(Put)
                 'peak_opt_pnl': 0,           # 期权峰值盈利(用于半仓跟踪)
             }
+            self._subscribe_position_quote(opt_symbol)
             self.trades_today.append(self.position.copy())
             self._add_event(f"📈 开仓: {opt_symbol} x{contracts}张 @${executed_price:.2f}", "trade")
 
@@ -1428,13 +1507,24 @@ class QQQLiveTrader:
                             'order_status': 'synced',
                         }
                         print(f"  🔄 从长桥同步持仓: {symbol} x {qty}张, 成本${cost:.2f}, 盈亏{pnl_pct:+.1f}%")
+                        self._subscribe_position_quote(symbol)
                         self._save_state()
                         return
         except Exception as e:
             print(f"  ⚠️ 长桥持仓同步失败: {e}")
 
-    def _check_position(self):
-        """检查持仓状态（每20秒调用）"""
+    def _check_position(self, opt_price=None, current_stock=None, triggered_by_push=False):
+        """检查持仓状态；持仓期权报价推送时会实时调用，主循环仅作兜底"""
+        if self._position_check_lock:
+            return
+        self._position_check_lock = True
+        try:
+            return self._check_position_impl(opt_price, current_stock, triggered_by_push)
+        finally:
+            self._position_check_lock = False
+
+    def _check_position_impl(self, opt_price=None, current_stock=None, triggered_by_push=False):
+        """持仓风控实现"""
         # ===== 0DTE 强制收盘平仓（16:00 ET）=====
         now_et = datetime.now(TZ_ET)
         if now_et.hour >= 16 and now_et.minute >= 0:
@@ -1450,6 +1540,7 @@ class QQQLiveTrader:
                 # 使用缓存避免API限频
                 lb_count = self._check_longbridge_position()
                 if lb_count == 0:
+                    self._unsubscribe_quotes([self.position.get('opt_symbol') if self.position else None])
                     self.position = None
                 return
 
@@ -1463,22 +1554,27 @@ class QQQLiveTrader:
             self._sync_verify_position()
 
         # 获取正股当前价格
-        try:
-            stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
-            if not stock_quotes:
+        if current_stock is None:
+            current_stock = self.latest_quote_prices.get(self.cfg['symbol']) or self.current_price or None
+        if current_stock is None:
+            try:
+                stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
+                if not stock_quotes:
+                    return
+                current_stock = float(stock_quotes[0].last_done)
+            except:
                 return
-            current_stock = float(stock_quotes[0].last_done)
-        except:
-            return
 
         # 获取期权当前价格（尝试获取实时价）
-        opt_price = None
-        try:
-            opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
-            if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
-                opt_price = float(opt_quotes[0].last_done)
-        except:
-            pass
+        if opt_price is None:
+            opt_price = self.latest_quote_prices.get(pos['opt_symbol'])
+        if opt_price is None and not triggered_by_push:
+            try:
+                opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
+                if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
+                    opt_price = float(opt_quotes[0].last_done)
+            except:
+                pass
 
         # 如果获取不到期权价格，用BS估算
         if opt_price is None:
@@ -1588,7 +1684,8 @@ class QQQLiveTrader:
             return
 
         # 每5根K线打印一次持仓状态
-        if bars_held > 0 and bars_held % 5 == 0:
+        if bars_held > 0 and bars_held % 5 == 0 and pos.get('_last_status_bar') != bars_held:
+            pos['_last_status_bar'] = bars_held
             d = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
             peak = pos.get('stock_peak', entry_stock)
             trail_dist = abs(current_stock - peak) / peak * 100 if peak > 0 else 0
@@ -1622,6 +1719,7 @@ class QQQLiveTrader:
                                     # 如果实际持仓为0，说明被强平或出错
                                     if actual_qty == 0:
                                         print(f"  ❌ 持仓已清空! 清除内部持仓")
+                                        self._unsubscribe_quotes([pos.get('opt_symbol')])
                                         self.position = None
                                         self._save_state()
                                     return
@@ -1639,6 +1737,7 @@ class QQQLiveTrader:
                 # 连续3次（3分钟）都找不到才清空持仓
                 if self._missing_position_count >= 3:
                     print(f"  ❌ 连续{self._missing_position_count}次未找到持仓，清除内部持仓")
+                    self._unsubscribe_quotes([pos.get('opt_symbol')])
                     self.position = None
                     self._save_state()
                     self._missing_position_count = 0
@@ -1799,6 +1898,7 @@ class QQQLiveTrader:
                         # ⚠️ 订单被拒：立即清除持仓，不再重试
                         if str(order_status) == 'OrderStatus.Rejected':
                             print(f"  ❌ 平仓订单被拒! 清除内部持仓")
+                            self._unsubscribe_quotes([pos.get('opt_symbol')])
                             self.position = None
                             self._save_state()
                             return
@@ -1902,7 +2002,9 @@ class QQQLiveTrader:
                 f"{'盈利' if pnl_pct>0 else '亏损'}: {pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
             )
 
+            closed_symbol = pos.get('opt_symbol')
             self.position = None  # 成功后才清空
+            self._unsubscribe_quotes([closed_symbol])
             # 更新亏损冷却
             if pnl_pct < 0:
                 self.consecutive_losses += 1
