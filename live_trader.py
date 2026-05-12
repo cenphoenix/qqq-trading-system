@@ -126,6 +126,8 @@ class QQQLiveTrader:
         self.consecutive_losses = 0  # 连续亏损次数
         self.cooldown_remaining = 0  # 冷却剩余次数
         self.last_loss_dir = None    # 最近一次亏损的方向（'call'或'put'），冷却期间允许反向
+        self.big_loss_cooldown = 0   # 大亏(>20%)后同方向冷却剩余K线数
+        self._big_loss_dir = None    # 大亏冷却的方向
         self.current_price = 0       # 当前正股价格
         self.actual_capital = self.cfg['capital']  # 实际资金（_execute_trade中更新）
 
@@ -637,6 +639,7 @@ class QQQLiveTrader:
             self.consecutive_losses = 0  # 新交易日重置亏损计数
             self.cooldown_remaining = 0  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
+            self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self.engine.reset_day()  # v6.2 重置 FilterEngine
             # 只在非预加载情况下清空K线数据
             if not self.one_min_candles:
@@ -836,12 +839,12 @@ class QQQLiveTrader:
         if self.daily_pnl <= -self.actual_capital * self.cfg['daily_limit'] / 100:
             self._update_filters_current(bar)
             return
-        # RSI过滤
+        # RSI预过滤：仅过滤极端值（<20或>80），方向确认移到信号检测后
         rsi = self._calc_rsi(self.cfg['rsi_period'])
-        if rsi > self.cfg['rsi_overbought']:
+        if rsi > 80:
             self._update_filters_current(bar)
             return
-        if rsi < self.cfg['rsi_oversold']:
+        if rsi < 20:
             self._update_filters_current(bar)
             return
 
@@ -890,6 +893,15 @@ class QQQLiveTrader:
             if sma20 > sma50 and entry_price > sma20 and sig_dir == 'put':
                 print(f"  ⛔ 趋势过滤: SMA20({sma20:.2f})>SMA50({sma50:.2f}) 价格在均线上方，禁止做空")
                 return
+
+        # ===== C. RSI 方向确认 =====
+        rsi_val = self._calc_rsi(self.cfg['rsi_period'])
+        if sig_dir == 'call' and (rsi_val < 40 or rsi_val > 70):
+            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做多要求40-70")
+            return
+        if sig_dir == 'put' and (rsi_val < 30 or rsi_val > 60):
+            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做空要求30-60")
+            return
 
         # ===== 动量确认：当前K线同向 =====
         mom_ok = (bar['close'] >= bar['open']) if sig_dir == 'call' else (bar['close'] <= bar['open'])
@@ -988,6 +1000,12 @@ class QQQLiveTrader:
         }
 
         # ===== 冷却检查 =====
+        # E. 大亏冷却：每根K线递减
+        if self.big_loss_cooldown > 0:
+            self.big_loss_cooldown -= 1
+            if sig_dir == getattr(self, '_big_loss_dir', None):
+                print(f"  ⏳ 大亏冷却中({sig_dir}方向)，剩余{self.big_loss_cooldown}根K线")
+                return
         if self.cooldown_remaining > 0 and self.last_loss_dir is not None:
             self.cooldown_remaining -= 1  # 任何信号都递减冷却（防止无限卡住）
             if sig_dir == self.last_loss_dir:
@@ -2044,6 +2062,11 @@ class QQQLiveTrader:
                 if self.consecutive_losses >= 2:
                     self.cooldown_remaining = self.cfg['loss_cooldown']
                     print(f"  ⏳ 连续亏损{self.consecutive_losses}次，冷却{self.cooldown_remaining}次检测（{self.last_loss_dir}方向）")
+                # E. 单笔大亏(>20%)：同方向冷却5根K线
+                if pnl_pct <= -20:
+                    self.big_loss_cooldown = 5
+                    self._big_loss_dir = pos['dir']
+                    print(f"  ⏳ 大亏{pnl_pct:+.1f}%，{pos['dir']}方向冷却5根K线")
             else:
                 self.consecutive_losses = 0
             self._save_state()
