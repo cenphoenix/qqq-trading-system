@@ -196,6 +196,7 @@ class QQQLiveTrader:
             'trend': {'ok': None, 'val': '--', 'detail': '--'},
             'vwap': {'ok': None, 'val': '--', 'detail': '--'},
             'macd': {'ok': None, 'val': '--', 'detail': '--'},
+            'atr': {'ok': None, 'val': '--', 'detail': '--'},
             'dir': '', 'mode': '', 'price': '--', 'all_ok': False,
         }
         self.current_signal = None
@@ -807,6 +808,7 @@ class QQQLiveTrader:
             'trend': pre_filters.get('trend', self.filter_status.get('trend', {})),
             'vwap': pre_filters.get('vwap', self.filter_status.get('vwap', {})),
             'macd': pre_filters.get('macd', self.filter_status.get('macd', {})),
+            'atr': self.engine.state.get('atr', self.filter_status.get('atr', {})),
             'dir': '做多' if ref_dir == 'call' else '做空',
             'mode': f'{regime}({lb}根)',
             'regime_detail': regime_params['detail'],
@@ -875,6 +877,20 @@ class QQQLiveTrader:
         if not sig_dir:
             return
 
+        # ===== B. 趋势方向过滤：禁止逆势交易 =====
+        ch = self.close_history
+        if len(ch) >= 50:
+            sma20 = np.mean(ch[-20:])
+            sma50 = np.mean(ch[-50:])
+            # 下降趋势（SMA20 < SMA50 且价格在SMA20下方）→ 禁止做多
+            if sma20 < sma50 and entry_price < sma20 and sig_dir == 'call':
+                print(f"  ⛔ 趋势过滤: SMA20({sma20:.2f})<SMA50({sma50:.2f}) 价格在均线下方，禁止做多")
+                return
+            # 上升趋势（SMA20 > SMA50 且价格在SMA20上方）→ 禁止做空
+            if sma20 > sma50 and entry_price > sma20 and sig_dir == 'put':
+                print(f"  ⛔ 趋势过滤: SMA20({sma20:.2f})>SMA50({sma50:.2f}) 价格在均线上方，禁止做空")
+                return
+
         # ===== 动量确认：当前K线同向 =====
         mom_ok = (bar['close'] >= bar['open']) if sig_dir == 'call' else (bar['close'] <= bar['open'])
         if not mom_ok:
@@ -894,14 +910,29 @@ class QQQLiveTrader:
         if not body_ok:
             return
 
-        # ===== 价格位置过滤：禁止追高做多/追低做空 =====
-        if self.session_high > self.session_low:
-            price_pos = (entry_price - self.session_low) / (self.session_high - self.session_low)
-            if sig_dir == 'call' and price_pos > 0.85:
-                print(f"  ⛔ 做多拒绝: 价格${entry_price:.2f}在今日高位({price_pos:.0%})，禁止追高")
+        # ===== D. VWAP 硬过滤：价格必须在VWAP正确一侧 =====
+        vwap = self.engine.vwap
+        if vwap > 0:
+            if sig_dir == 'call' and entry_price < vwap:
+                print(f"  ⛔ VWAP过滤: 价格${entry_price:.2f} < VWAP${vwap:.2f}，禁止做多")
                 return
-            if sig_dir == 'put' and price_pos < 0.15:
-                print(f"  ⛔ 做空拒绝: 价格${entry_price:.2f}在今日低位({price_pos:.0%})，禁止追低")
+            if sig_dir == 'put' and entry_price > vwap:
+                print(f"  ⛔ VWAP过滤: 价格${entry_price:.2f} > VWAP${vwap:.2f}，禁止做空")
+                return
+
+        # ===== A. ATR 动态追高/追低（替代固定0.15/0.85）=====
+        atr = self.engine.atr
+        if atr > 0 and self.session_high > self.session_low:
+            price_pos = (entry_price - self.session_low) / (self.session_high - self.session_low)
+            # 趋势市放宽到 2.0*ATR，中性/震荡用 1.5*ATR
+            atr_mult = 2.0 if regime == 'trending' else 1.5
+            atr_threshold = atr * atr_mult
+            session_range = self.session_high - self.session_low
+            if sig_dir == 'call' and entry_price > self.session_high - atr_threshold:
+                print(f"  ⛔ ATR追高: 价格${entry_price:.2f} 距当日高点${self.session_high:.2f}仅${self.session_high - entry_price:.2f} < {atr_mult}×ATR(${atr_threshold:.2f})，禁止追高")
+                return
+            if sig_dir == 'put' and entry_price < self.session_low + atr_threshold:
+                print(f"  ⛔ ATR追低: 价格${entry_price:.2f} 距当日低点${self.session_low:.2f}仅${entry_price - self.session_low:.2f} < {atr_mult}×ATR(${atr_threshold:.2f})，禁止追低")
                 return
 
         # ===== 回踩确认（趋势市+动量豁免）=====
@@ -948,6 +979,7 @@ class QQQLiveTrader:
             'trend': pre_filters.get('trend', {}),
             'vwap': pre_filters.get('vwap', {}),
             'macd': pre_filters.get('macd', {}),
+            'atr': self.engine.state.get('atr', {}),
             'dir': direction,
             'mode': mode_tag,
             'regime_detail': regime_params['detail'],

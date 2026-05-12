@@ -26,6 +26,9 @@ class FilterEngine:
         self.macd_hist = 0.0
         self._macd_bars = 0
         self._macd_line_history = []
+        # ATR (Average True Range) for dynamic chase filter
+        self._atr_tr = []       # True Range history
+        self.atr = 0.0          # current ATR value
         self.state = {
             'sma20': {'ok': None, 'val': '--', 'detail': '--'},
             'sma50': {'ok': None, 'val': '--', 'detail': '--'},
@@ -33,6 +36,7 @@ class FilterEngine:
             'trend': {'ok': None, 'val': '--', 'detail': '--'},
             'vwap': {'ok': None, 'val': '--', 'detail': '--'},
             'macd': {'ok': None, 'val': '--', 'detail': '--'},
+            'atr': {'ok': None, 'val': '--', 'detail': '--'},
             'gap': {'ok': None, 'val': '--', 'detail': '--'},
             'dir': '', 'price': '--', 'all_ok': False,
         }
@@ -86,6 +90,28 @@ class FilterEngine:
 
         sma50 = np.mean(ch[-50:]) if len(ch) >= 50 else None
 
+        # ATR calculation (14-period Wilder smoothing)
+        if len(self.bars) >= 2:
+            prev_bar = self.bars[-2]
+            tr = max(
+                bar['high'] - bar['low'],
+                abs(bar['high'] - prev_bar['close']),
+                abs(bar['low'] - prev_bar['close'])
+            )
+        else:
+            tr = bar['high'] - bar['low']
+        self._atr_tr.append(tr)
+        if len(self._atr_tr) > 200:
+            self._atr_tr = self._atr_tr[-200:]
+        atr_period = 14
+        if len(self._atr_tr) < atr_period:
+            self.atr = np.mean(self._atr_tr)
+        elif len(self._atr_tr) == atr_period:
+            self.atr = np.mean(self._atr_tr[-atr_period:])
+        else:
+            # Wilder smoothing
+            self.atr = (self.atr * (atr_period - 1) + tr) / atr_period
+
         price_pos = 0.5
         if self.session_high > self.session_low:
             price_pos = (price - self.session_low) / (self.session_high - self.session_low)
@@ -138,6 +164,12 @@ class FilterEngine:
             'macd_hist': self.macd_hist,
             'macd_line': self.macd_line,
             'signal_line': self.signal_line,
+        }
+        self.state['atr'] = {
+            'ok': None,
+            'val': f'${self.atr:.2f}',
+            'detail': f'ATR14=${self.atr:.2f}',
+            'atr': self.atr,
         }
         self.state['gap'] = {
             'ok': None,
@@ -266,6 +298,8 @@ class FilterEngine:
         self.macd_hist = 0.0
         self._macd_bars = 0
         self._macd_line_history = []
+        self._atr_tr = []
+        self.atr = 0.0
 
     def detect_regime(self) -> tuple:
         """检测市场状态：trending(趋势) / neutral(中性) / choppy(震荡)"""
