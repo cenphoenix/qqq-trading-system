@@ -2018,7 +2018,7 @@ class QQQLiveTrader:
     def _notify(self, msg):
         """统一通知 - 同时发送飞书和Telegram"""
         if self.cfg.get('feishu', {}).get('enabled', True):
-            self._notify(msg)
+            self._notify_feishu(msg)
         if self.cfg.get('telegram', {}).get('enabled', False):
             self._notify_telegram(msg)
 
