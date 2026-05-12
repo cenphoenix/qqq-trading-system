@@ -83,6 +83,13 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "open_id": "YOUR_FEISHU_OPEN_ID",
     },
+
+    # ---- Telegram通知 ----
+    "telegram": {
+        "enabled": False,
+        "bot_token": "",
+        "chat_id": "",
+    },
 }
 
 # 参数类型映射（用于GUI和验证）
@@ -130,6 +137,11 @@ PARAM_TYPES = {
     # feishu
     "feishu.enabled": {"type": "bool", "label": "启用飞书推送"},
     "feishu.open_id": {"type": "str", "label": "飞书Open ID"},
+
+    # telegram
+    "telegram.enabled": {"type": "bool", "label": "启用Telegram推送"},
+    "telegram.bot_token": {"type": "str", "label": "Bot Token"},
+    "telegram.chat_id": {"type": "str", "label": "Chat ID"},
 }
 
 
@@ -224,7 +236,7 @@ class ConfigManager:
     def get_flat(self):
         """获取扁平化的 CONFIG dict（兼容 live_trader.py 的 CONFIG 格式）"""
         flat = {}
-        for group in ['signal', 'risk', 'trading', 'feishu']:
+        for group in ['signal', 'risk', 'trading', 'feishu', 'telegram']:
             group_data = self._config.get(group, {})
             for k, v in group_data.items():
                 flat[k] = v

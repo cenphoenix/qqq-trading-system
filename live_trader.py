@@ -1668,7 +1668,7 @@ class QQQLiveTrader:
                                 except Exception as cancel_err:
                                     print(f"  ⚠️ 取消订单失败: {cancel_err}")
                                     self._log_order(order_id, opt_symbol, sig['dir'], contracts, 'cancel_failed')
-                                self._notify_feishu(
+                                self._notify(
                                     f"❌ 订单超时取消\n"
                                     f"期权: {opt_symbol}\n"
                                     f"原因: {max_retries}次重试后仍未成交"
@@ -1747,7 +1747,7 @@ class QQQLiveTrader:
             print(f"  {'='*50}\n")
 
             self._save_state()
-            self._notify_feishu(
+            self._notify(
                 f"🎯 {'做多' if sig['dir']=='call' else '做空'} {opt_symbol}\n"
                 f"正股入场: ${float(price):.2f}\n"
                 f"期权入场: ${self.position.get('entry_opt_price', 0):.2f}\n"
@@ -2174,7 +2174,7 @@ class QQQLiveTrader:
             print(f"  📋 订单: {resp.order_id}")
             print(f"  {'='*50}\n")
 
-            self._notify_feishu(
+            self._notify(
                 f"✂️ 部分平仓: {reason}\n"
                 f"期权: {pos['opt_symbol']}\n"
                 f"平仓: {half}张 | 剩余: {pos['contracts']}张\n"
@@ -2346,7 +2346,7 @@ class QQQLiveTrader:
             print(f"  📋 订单: {order_id}")
             print(f"  {'='*50}\n")
 
-            self._notify_feishu(
+            self._notify(
                 f"🏁 平仓: {reason}\n"
                 f"期权: {pos['opt_symbol']}\n"
                 f"{entry_opt:.2f} → {exit_opt:.2f}\n"
@@ -2430,6 +2430,48 @@ class QQQLiveTrader:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+
+    def _notify_telegram(self, msg):
+        """Telegram通知 - 发送消息到用户"""
+        try:
+            import requests
+            tg_cfg = self.cfg.get('telegram', {})
+            bot_token = tg_cfg.get('bot_token', '')
+            chat_id = tg_cfg.get('chat_id', '')
+            if not bot_token or not chat_id:
+                print(f"  ⚠️ Telegram凭据未配置，写日志: {msg}")
+                log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+                return
+
+            text = f"[QQQ Trader]\n{msg}"
+            resp = requests.post(
+                f'https://api.telegram.org/bot{bot_token}/sendMessage',
+                json={'chat_id': chat_id, 'text': text},
+                timeout=10
+            )
+            result = resp.json()
+            if result.get('ok'):
+                print(f"  ✅ Telegram推送成功")
+            else:
+                print(f"  ⚠️ Telegram推送失败: {result}")
+        except Exception as e:
+            import traceback
+            print(f"  ⚠️ Telegram通知异常: {e}")
+            traceback.print_exc()
+            log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+
+    def _notify(self, msg):
+        """统一通知 - 同时发送飞书和Telegram"""
+        if self.cfg.get('feishu', {}).get('enabled', True):
+            self._notify(msg)
+        if self.cfg.get('telegram', {}).get('enabled', False):
+            self._notify_telegram(msg)
 
     def _sync_gist(self):
         """实时同步交易记录到Gist（供小程序读取）"""
