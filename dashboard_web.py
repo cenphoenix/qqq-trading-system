@@ -312,20 +312,26 @@ setInterval(poll,5000);
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/' or self.path == '/index.html':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(HTML.encode('utf-8'))
-        elif self.path == '/api/state':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            data = self._read_state()
-            self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode('utf-8'))
-        else:
-            self.send_error(404)
+        try:
+            if self.path == '/' or self.path == '/index.html':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(HTML.encode('utf-8'))
+            elif self.path == '/api/state':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                data = self._read_state()
+                self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode('utf-8'))
+            else:
+                self.send_error(404)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            # 浏览器刷新/关闭时的正常断开，静默忽略
+            pass
+        except Exception:
+            self.send_error(500)
 
     def _read_state(self):
         sd = str(BASE_DIR)

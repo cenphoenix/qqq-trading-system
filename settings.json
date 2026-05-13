@@ -21,7 +21,7 @@
     "order_pct": 8.0,
     "sl": 0.25,
     "tp": 0.3,
-    "daily_limit": 25.0,
+    "daily_limit": 12.0,
     "max_trades": 999,
     "contract_multiplier": 100,
     "option_offset": 2.0,
@@ -34,7 +34,18 @@
     "timeout_stage1_min": 0.3,
     "timeout_stage2_bars": 10,
     "timeout_stage2_min": 0.6,
-    "timeout_stage3_bars": 15
+    "timeout_stage3_bars": 15,
+    "timeout_stage3_min": 1.0,
+    "timeout_min_bars": 6,
+    "daily_limit_warning_pct": 5.0,
+    "daily_limit_conservative_pct": 8.0,
+    "vol_adjusted_sizing": true,
+    "base_atr": 0.35,
+    "half_close_sl_tighten": 0.15,
+    "loss_cooldown_thresholds": [5, 8],
+    "loss_cooldown_values": [2, 4, 8],
+    "loss_consecutive_limit": 3,
+    "loss_consecutive_cooldown": 6
   },
   "trading": {
     "start_time": "09:35",

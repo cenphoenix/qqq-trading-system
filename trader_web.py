@@ -105,25 +105,64 @@ class StateReader:
             pass
 
         shared_trades = shared.get('trades_today', [])
+        # 如果 state.json 里没有 trades_today，尝试从 records/ 目录恢复
+        if not shared_trades:
+            try:
+                from datetime import datetime
+                today_bj = datetime.now().strftime('%Y-%m-%d')
+                rec_dir = _app_dir()
+                rec_file = os.path.join(rec_dir, 'records', f'{today_bj}.json')
+                if os.path.exists(rec_file):
+                    with open(rec_file, encoding='utf-8') as f:
+                        rec_data = json.load(f)
+                    shared_trades = rec_data.get('trades', [])
+            except Exception:
+                pass
+
         trades = []
         for t in shared_trades:
             opt = t.get('opt_symbol', '')
+            # 提取 HH:MM:SS 格式时间
+            raw_time = t.get('time', t.get('entry_time', ''))
+            if isinstance(raw_time, str) and 'T' in raw_time:
+                # ISO datetime → 取时分秒
+                time_part = raw_time.split('T')[1].split('.')[0] if '.' in raw_time.split('T')[-1] else raw_time.split('T')[-1]
+                time_str = time_part[:8]
+            else:
+                time_str = raw_time[:8] if len(str(raw_time)) >= 8 else str(raw_time)
+
             trades.append({
                 'id': len(trades) + 1,
-                'time': t.get('time', '--:--'),
-                'dir': '做多' if t.get('dir') == 'call' else '做空',
+                'time': time_str or '--:--:--',
+                'dir': '做多' if t.get('dir') == 'call' else '做空' if t.get('dir') == 'put' else str(t.get('dir', '--')),
                 'dir_up': t.get('dir') == 'call',
-                'ep': f"${t.get('entry_price', 0):.2f}",
+                'ep': f"${t.get('entry_price', 0):.2f}" if t.get('entry_price', 0) > 0 else '--',
                 'qty': t.get('contracts', t.get('qty', 0)),
                 'opt': opt,
                 'active': False,
                 'pnl_pct': round(t.get('pnl_pct', 0), 2),
                 'pnl_usd': round(t.get('pnl_usd', 0), 2),
                 'exit_reason': t.get('exit_reason', ''),
-                'exit_price': f"${t.get('exit_price', 0):.2f}" if t.get('exit_price') else '',
+                'exit_price': f"${t.get('exit_price', 0):.2f}" if t.get('exit_price', 0) > 0 else '--',
                 'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
             })
-            lb_today_pnl += t.get('pnl_usd', 0)
+
+        # 优先显示真实持仓（从长桥 API 拉取），否则降级到策略持仓
+        positions = []
+        broker_positions = shared.get('broker_positions', [])
+        if broker_positions:
+            for bp in broker_positions:
+                positions.append({
+                    'sym': bp.get('symbol', '--'),
+                    'qty': bp.get('qty', 0),
+                    'cost': f"${bp.get('cost', 0):.4f}" if bp.get('cost', 0) > 0 else '--',
+                    'cur': '--',
+                    'pnl': 0,
+                    'channel': bp.get('channel', ''),
+                })
+        else:
+            # 降级到旧的 position_snapshot.json
+            pass
 
         cur_signal = shared.get('current_signal')
         sig_dir = ''
@@ -143,12 +182,47 @@ class StateReader:
         if cur_signal:
             filters['dir'] = '做多' if cur_signal.get('dir') == 'call' else '做空'
 
+        account = shared.get('account', {})
+        net_assets = 0
+        cash_val = 0
+        buying_power = 0
+        for cur, info in account.items():
+            net_assets += info.get('net_assets', 0)
+            cash_val += info.get('total_cash', 0)
+            buying_power = max(buying_power, info.get('net_assets', 0) * 2)  # 2x margin
+
+        # 运行时间：从 events 里第一条工程事件算起
+        uptime_str = '--'
+        events = shared.get('events', [])
+        if events:
+            try:
+                first_event = events[0]
+                first_ts = first_event.get('time', '')
+                updated_ts = shared.get('updated', '')
+                if first_ts and updated_ts:
+                    # 简单按时间字符串差值计算
+                    def _ts_to_sec(ts):
+                        parts = ts.split(':')
+                        if len(parts) == 3:
+                            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                        return 0
+                    diff = abs(_ts_to_sec(updated_ts) - _ts_to_sec(first_ts))
+                    uptime_str = f"{diff // 3600}h {diff % 3600 // 60}m {diff % 60}s"
+            except:
+                pass
+
         return {
             'connected': shared.get('connected', False),
             'running': shared.get('running', False),
+            'current_price': shared.get('current_price', 0),
             'quote': {},
-            'account': {},
+            'account': {
+                'net_assets': net_assets,
+                'cash': cash_val,
+                'buying_power': buying_power,
+            },
             'positions': positions,
+            'broker_positions': positions,  # 前端兼容性别名
             'strat_pos': None,
             'signal': {
                 'dir': sig_dir or '无信号',
@@ -159,12 +233,14 @@ class StateReader:
             'filters': filters,
             'trades': trades,
             'lb_orders': lb_orders,
+            'daily_pnl': shared.get('daily_pnl', 0),
+            'uptime': uptime_str,
             'daily': {
                 'open': len(positions),
                 'closed': len([t for t in trades if not t.get('active')]),
                 'holding': len(positions),
-                'pnl': lb_today_pnl,
-                'pnl_str': f"${lb_today_pnl:+,.2f}",
+                'pnl': shared.get('daily_pnl', 0) + lb_today_pnl,
+                'pnl_str': f"${shared.get('daily_pnl', 0) + lb_today_pnl:+,.2f}",
                 'count': len(trades),
                 'max': 999,
             },
@@ -172,14 +248,15 @@ class StateReader:
                 'open': len(positions),
                 'closed': len([t for t in trades if not t.get('active')]),
                 'holding': len(positions),
-                'pnl': lb_today_pnl,
-                'pnl_str': f"${lb_today_pnl:+,.2f}",
+                'pnl': shared.get('daily_pnl', 0),
+                'pnl_str': f"${shared.get('daily_pnl', 0):+,.2f}",
                 'count': len(lb_orders) if lb_orders else len(trades),
                 'max': 999,
             },
             'daily_history': [],
+            'events': shared.get('events', []),
+            'filter_status': shared.get('filter_status', {}),
             'logs': self.logs[-30:],
-            'config': {},
         }
 
 
@@ -308,11 +385,12 @@ tr:hover{background:var(--surface-2)}
 
   <div class="grid-2">
     <div class="card"><div class="card-title">📋 当前持仓</div>
-      <table><thead><tr><th>标的</th><th>数量</th><th>成本</th><th>现价</th><th>盈亏</th><th>盈亏%</th></tr></thead>
+      <table><thead><tr><th>标的</th><th>数量</th><th>成本</th></tr></thead>
       <tbody id="tb-pos"></tbody></table>
     </div>
+
     <div class="card"><div class="card-title">📝 交易记录</div>
-      <table><thead><tr><th>时间</th><th>方向</th><th>期权</th><th>开仓</th><th>平仓</th><th>盈亏</th></tr></thead>
+      <table><thead><tr><th>时间</th><th>方向</th><th>期权</th><th>开仓</th><th>平仓</th><th>数量</th><th>盈亏</th></tr></thead>
       <tbody id="tb-trd"></tbody></table>
     </div>
   </div>
@@ -360,6 +438,19 @@ function render(d){
     $('sig-reason').textContent='';
   }
 
+  // 💰 Account data (后端已展平为 {net_assets, cash, buying_power})
+  const acct=d.account||{};
+  $('v-equity').textContent=acct.net_assets?'$'+Number(acct.net_assets).toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  $('v-cash').textContent=acct.cash?'$'+Number(acct.cash).toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+  $('v-power').textContent=acct.buying_power?'$'+Number(acct.buying_power).toLocaleString('en-US',{minimumFractionDigits:2}):'--';
+
+  // ⏱️ Uptime
+  if(d.uptime)$('v-uptime').textContent=d.uptime;
+
+  // 📊 QQQ price
+  if(d.current_price&&d.current_price>0)$('v-qqq').textContent='$'+d.current_price.toFixed(2);
+  if(d.candle_count)$('v-candles').textContent=d.candle_count;
+
   const fs=d.filters||{};
   const fmap=[['sma20','SMA20'],['volume','量能'],['momentum','动量'],['body','K线实体']];
   let fhtml='';
@@ -372,19 +463,28 @@ function render(d){
   });
   $('filters').innerHTML=fhtml||'<div style="color:var(--text-2);text-align:center;padding:20px">无过滤数据</div>';
 
+  // 📋 Positions table
   let phtml='';
-  (d.positions||[]).forEach(p=>{
-    const pnl=parseFloat((p.pnl+'').replace(/[,+$]/g,''))||0;
-    phtml+=`<tr><td>${p.sym||'--'}</td><td>${p.qty||0}</td><td>${fmt$(p.cost)}</td><td>${fmt$(p.cur)}</td><td class="${pnl>=0?'t-up':'t-down'}">${pnl>=0?'+':''}{pnl.toFixed(2)}</td><td class="${pnl>=0?'t-up':'t-down'}">${(pnl/(p.cost*p.qty)*100).toFixed(1)}%</td></tr>`;
-  });
-  $('tb-pos').innerHTML=phtml||'<tr><td colspan="6" style="text-align:center;color:var(--text-2)">无持仓</td></tr>';
+  const bp=d.broker_positions||[];
+  if(bp.length){
+    bp.forEach(p=>{
+      const sym=p.symbol||'--';
+      const qty=p.qty||0;
+      const cost=p.cost||0;
+      phtml+=`<tr><td>${sym}</td><td>${qty}</td><td>${cost>0?'$'+cost.toFixed(2):'--'}</td></tr>`;
+    });
+  }else{
+    phtml='<tr><td colspan="3" style="text-align:center;color:var(--text-2)">无持仓</td></tr>';
+  }
+  $('tb-pos').innerHTML=phtml;
 
   let thtml='';
   trades.slice(-15).reverse().forEach(t=>{
     const pnl=t.pnl_usd||0;
-    thtml+=`<tr><td>${t.time||'--'}</td><td>${t.dir||'--'}</td><td>${t.opt||'--'}</td><td>${t.ep||'--'}</td><td>${t.exit_price||'--'}</td><td class="${pnl>0?'t-up':pnl<0?'t-down':''}">${pnl?'$'+pnl.toLocaleString('en-US',{signDisplay:'always',minimumFractionDigits:2}):'--'}</td></tr>`;
+    const dirClass=(t.dir=='做多')?'t-up':'t-down';
+    thtml+=`<tr><td>${t.time||'--:--:--'}</td><td class="${dirClass}">${t.dir||'--'}</td><td>${t.opt||'--'}</td><td>${t.ep||'--'}</td><td>${t.exit_price||'--'}</td><td>${t.qty||0}</td><td class="${pnl>0?'t-up':pnl<0?'t-down':''}">${pnl?'$'+pnl.toLocaleString('en-US',{signDisplay:'always',minimumFractionDigits:2}):'--'}</td></tr>`;
   });
-  $('tb-trd').innerHTML=thtml||'<tr><td colspan="6" style="text-align:center;color:var(--text-2)">无交易记录</td></tr>';
+  $('tb-trd').innerHTML=thtml||'<tr><td colspan="7" style="text-align:center;color:var(--text-2)">无交易记录</td></tr>';
 
   (d.events||[]).forEach(e=>{
     const key=e.time+'|'+e.msg;

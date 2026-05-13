@@ -29,6 +29,12 @@ class FilterEngine:
         # ATR (Average True Range) for dynamic chase filter
         self._atr_tr = []       # True Range history
         self.atr = 0.0          # current ATR value
+        # -- P1 #1 Regime Detection v2 extras --
+        self._price_atr_ratio_history = []  # ATR/price ratio
+        self._open_period_bars = 0          # bars in opening-range period
+        self._opening_range_done = False    # whether opening range has ended
+        self._current_et_minute = 0         # current ET minute (1030=17:10 etc)
+        self._base_atr = cfg.get('base_atr', 0.35)  # baseline ATR for normalization
         self.state = {
             'sma20': {'ok': None, 'val': '--', 'detail': '--'},
             'sma50': {'ok': None, 'val': '--', 'detail': '--'},
@@ -41,8 +47,16 @@ class FilterEngine:
             'dir': '', 'price': '--', 'all_ok': False,
         }
 
-    def update(self, bar: dict) -> None:
+    def update(self, bar: dict, et_minute: int = 0) -> None:
         """每根K线完成后调用，预计算滤镜状态"""
+        self._current_et_minute = et_minute
+        # Track opening range period: first 30 min of trading (09:35-10:05 ET ≈ min 575-605)
+        if not self._opening_range_done:
+            if et_minute >= 605:  # 10:05 ET
+                self._opening_range_done = True
+            else:
+                self._open_period_bars += 1
+
         self.bars.append(bar)
         self.closes.append(bar['close'])
         self.volumes.append(bar['volume'])
@@ -109,8 +123,15 @@ class FilterEngine:
         elif len(self._atr_tr) == atr_period:
             self.atr = np.mean(self._atr_tr[-atr_period:])
         else:
-            # Wilder smoothing
+        # Wilder smoothing
             self.atr = (self.atr * (atr_period - 1) + tr) / atr_period
+
+        # -- P1 #1: Track ATR/price ratio for normalized volatility --
+        price = ch[-1] if ch else 1
+        atr_pct = (self.atr / price * 100) if price > 0 else 0
+        self._price_atr_ratio_history.append(atr_pct)
+        if len(self._price_atr_ratio_history) > 200:
+            self._price_atr_ratio_history = self._price_atr_ratio_history[-200:]
 
         price_pos = 0.5
         if self.session_high > self.session_low:
@@ -300,13 +321,18 @@ class FilterEngine:
         self._macd_line_history = []
         self._atr_tr = []
         self.atr = 0.0
+        # P1 #1 重置新变量
+        self._price_atr_ratio_history = []
+        self._open_period_bars = 0
+        self._opening_range_done = False
+        self._current_et_minute = 0
 
     def detect_regime(self) -> tuple:
-        """检测市场状态：trending(趋势) / neutral(中性) / choppy(震荡)"""
-        if len(self.bars) < 20:
+        """P1 #1 市场状态检测 v2 — 升级：ATR归一化 + 开盘区间 + 时间衰减"""
+        if len(self.bars) < 10:
             return 'neutral', '数据不足'
 
-        recent = self.bars[-20:]
+        recent = self.bars[-10:]
 
         recent_range = np.mean([b['high'] - b['low'] for b in recent[-5:]])
         older_range = np.mean([b['high'] - b['low'] for b in recent[:-5]])
@@ -314,7 +340,7 @@ class FilterEngine:
 
         bull = sum(1 for b in recent if b['close'] >= b['open'])
         bear = 20 - bull
-        consistency = max(bull, bear) / 20.0
+        consistency = max(bull, bear) / 10.0
 
         highs = [b['high'] for b in recent]
         lows = [b['low'] for b in recent]
@@ -322,17 +348,39 @@ class FilterEngine:
         new_lows = sum(1 for i in range(1, len(lows)) if lows[i] <= min(lows[:i]))
         trend_strength = (new_highs + new_lows) / 19.0
 
-        all_highs = max(b['high'] for b in recent)
-        all_lows = min(b['low'] for b in recent)
-        price_range = all_highs - all_lows
-        mid_price = self.closes[-1]
-        price_pos = (mid_price - all_lows) / price_range if price_range > 0 else 0.5
+        # -- P1 #1 (a): ATR归一化 --
+        price = self.closes[-1] if self.closes else 1
+        atr_pct = (self.atr / price * 100) if price > 0 else 0
+        base_atr_pct = self._base_atr / price * 100
+        atr_normalized = atr_pct / base_atr_pct if base_atr_pct > 0 else 1.0
 
-        detail = f'波动比{range_ratio:.2f} 方向{consistency:.0%} 趋势{trend_strength:.0%}'
+        # 近期ATR加速
+        atr_accel = 1.0
+        if len(self._price_atr_ratio_history) >= 10:
+            recent_atr = np.mean(self._price_atr_ratio_history[-10:])
+            older_atr = np.mean(self._price_atr_ratio_history[-20:-10])
+            if older_atr > 0:
+                atr_accel = recent_atr / older_atr
 
-        if range_ratio < 0.85 and consistency < 0.65 and trend_strength < 0.4:
+        detail = f'波动比{range_ratio:.2f} 方向{consistency:.0%} 趋势{trend_strength:.0%} ATR%{atr_pct:.2f}'
+
+        # -- P1 #1 (b): 开盘区间（前30min，降低灵敏度）--
+        if not self._opening_range_done and self._open_period_bars > 5:
+            return 'neutral', f'开盘探索期({self._open_period_bars}根) ATR%{atr_pct:.2f}'
+
+        # -- P1 #1 (c): 时间衰减（14:00 ET后流动性下降，倾向震荡）--
+        time_decay_factor = 1.0
+        if self._current_et_minute >= 840:  # 14:00 ET
+            time_decay_factor = 0.85  # 趋势阈值收紧15%
+            detail += f' 午后衰减×{time_decay_factor:.2f}'
+
+        # 综合判断
+        adjusted_trend_threshold = 0.5 * time_decay_factor
+        adjusted_range_threshold = 1.2 * (1 / time_decay_factor) if time_decay_factor < 1 else 1.2
+
+        if range_ratio < 0.85 and consistency < 0.65 and trend_strength < 0.4 * time_decay_factor:
             return 'choppy', detail
-        elif range_ratio > 1.2 or consistency > 0.70 or trend_strength > 0.5:
+        elif range_ratio > adjusted_range_threshold or consistency > 0.65 or trend_strength > adjusted_trend_threshold or atr_accel > 1.3:
             return 'trending', detail
         else:
             return 'neutral', detail
@@ -355,6 +403,7 @@ class FilterEngine:
                 'sl_pct': 0.25,
                 'timeout_bars': 9999,
                 'pos_mult': 0.7,
+                'is_opening_period': False,
             }
         elif regime == 'choppy':
             return {
@@ -370,8 +419,10 @@ class FilterEngine:
                 'sl_pct': 0.30,
                 'timeout_bars': 8,
                 'pos_mult': 0.8,
+                'is_opening_period': False,
             }
         else:
+            is_open = not self._opening_range_done and self._open_period_bars > 5
             return {
                 'regime': 'neutral',
                 'detail': detail,
@@ -385,6 +436,7 @@ class FilterEngine:
                 'sl_pct': 0.25,
                 'timeout_bars': 4,
                 'pos_mult': 0.4,
+                'is_opening_period': is_open,
             }
 
     def status(self) -> dict:
