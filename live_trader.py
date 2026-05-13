@@ -130,6 +130,8 @@ class QQQLiveTrader:
         self._big_loss_dir = None    # 大亏冷却的方向
         self.current_price = 0       # 当前正股价格
         self.actual_capital = self.cfg['capital']  # 实际资金（_execute_trade中更新）
+        self.start_time = datetime.now()  # 启动时间，用于计算运行时间
+        self.account_info = {}  # 账户资金信息
 
         # 初始化其他变量
         self._init_vars()
@@ -240,6 +242,11 @@ class QQQLiveTrader:
         """保存状态到state.json（供trader_web.py读取）"""
         try:
             import json
+            uptime = int((datetime.now() - self.start_time).total_seconds())
+            hours, remainder = divmod(uptime, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+
             state = {
                 'connected': True,
                 'running': self.running,
@@ -254,6 +261,10 @@ class QQQLiveTrader:
                 'candle_count': len(self.one_min_candles),
                 'updated': datetime.now().strftime('%H:%M:%S'),
                 'events': self.events[-30:],  # 最近30条事件
+                'uptime': uptime_str,  # 运行时间
+                'equity': self.account_info.get('equity', self.cfg.get('capital', 100000)),
+                'cash': self.account_info.get('cash', 0),
+                'buying_power': self.account_info.get('buying_power', 0),
             }
             if self.position:
                 state['position'] = {
@@ -284,6 +295,27 @@ class QQQLiveTrader:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(state, f, ensure_ascii=False, indent=2, default=_json_default)
             os.replace(tmp_path, self.state_path)  # 原子替换
+
+            # 保存持仓快照
+            if self.position:
+                script_dir = str(_app_dir())
+                pos_snapshot = [{
+                    'sym': self.position.get('opt_symbol', 'QQQ'),
+                    'qty': self.position.get('contracts', 0),
+                    'cost': f"${self.position.get('entry_opt_price', 0):.2f}",
+                    'cur': f"${self.current_price:.2f}",
+                    'pnl': f"${self.position.get('pnl_usd', 0):.2f}",
+                    'pct': f"{self.position.get('pnl_pct', 0):.1f}%"
+                }]
+                pos_path = os.path.join(script_dir, 'position_snapshot.json')
+                with open(pos_path, 'w', encoding='utf-8') as f:
+                    json.dump(pos_snapshot, f, ensure_ascii=False)
+            else:
+                # 无持仓时删除快照文件
+                script_dir = str(_app_dir())
+                pos_path = os.path.join(script_dir, 'position_snapshot.json')
+                if os.path.exists(pos_path):
+                    os.remove(pos_path)
         except Exception as e:
             print(f"  ⚠️ 状态保存失败: {e}")
 
@@ -1204,24 +1236,43 @@ class QQQLiveTrader:
         try:
             assets = self.trade_ctx.account_balance()
             total_cash = 0
+            equity = 0
+            buying_power = 0
             acct_currency = 'USD'  # 默认美元
             if assets:
                 for asset in assets:
                     if hasattr(asset, 'total_cash') and asset.total_cash:
                         total_cash += float(asset.total_cash)
+                    if hasattr(asset, 'cash') and asset.cash:
+                        cash = float(asset.cash)
+                    else:
+                        cash = 0
+                    if hasattr(asset, 'buying_power') and asset.buying_power:
+                        buying_power += float(asset.buying_power)
+                    if hasattr(asset, 'total_equity') and asset.total_equity:
+                        equity += float(asset.total_equity)
                     if hasattr(asset, 'currency') and asset.currency:
                         acct_currency = str(asset.currency)
             # 根据实际货币决定是否转换
             if acct_currency == 'HKD':
                 capital = total_cash / 7.8
+                equity = equity / 7.8 if equity else capital
+                buying_power = buying_power / 7.8 if buying_power else capital
                 print(f"  💰 账户余额: HKD {total_cash:,.2f} → USD {capital:,.2f}")
             else:
                 capital = total_cash
+                equity = equity if equity else total_cash
                 print(f"  💰 账户余额: USD {capital:,.2f}")
             self.actual_capital = capital if capital > 0 else self.cfg['capital']
+            self.account_info = {
+                'equity': equity,
+                'cash': total_cash,
+                'buying_power': buying_power if buying_power > 0 else capital
+            }
         except Exception as e:
             print(f"  ⚠️ 获取余额失败: {e}，使用默认资金: ${self.cfg['capital']:,}")
             capital = self.cfg['capital']
+            self.account_info = {'equity': capital, 'cash': capital, 'buying_power': capital}
 
         # ===== 生成期权合约代码 =====
         opt_symbol = get_option_symbol(float(price), sig['dir'], self.cfg['option_offset'])

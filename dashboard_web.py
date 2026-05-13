@@ -182,6 +182,7 @@ function render(d){
   $('s-conn').textContent=d.connected?'已连接':'未连接';
   $('v-updated').textContent=d.updated||'--';
   $('v-candles').textContent=d.candle_count||'--';
+  $('v-uptime').textContent=d.uptime||'--';
 
   // 当日
   const pnl=d.daily_pnl||0;
@@ -198,6 +199,11 @@ function render(d){
 
   // 行情
   $('v-qqq').textContent=d.current_price?'$'+d.current_price.toFixed(2):'--';
+
+  // 资金
+  if(d.equity)$('v-equity').textContent='$'+Number(d.equity).toLocaleString('en-US',{minimumFractionDigits:2});
+  if(d.cash)$('v-cash').textContent='$'+Number(d.cash).toLocaleString('en-US',{minimumFractionDigits:2});
+  if(d.buying_power)$('v-power').textContent='$'+Number(d.buying_power).toLocaleString('en-US',{minimumFractionDigits:2});
 
   // 信号
   const sig=d.current_signal;
@@ -332,16 +338,29 @@ class Handler(BaseHTTPRequestHandler):
         except:
             pass
 
-        # 持仓
+        # 持仓 - 优先从 state.json 读取，其次从 position_snapshot.json 读取
         positions = []
-        pf = os.path.join(sd, 'position_snapshot.json')
-        if os.path.exists(pf):
-            try:
-                with open(pf, encoding='utf-8') as f:
-                    raw = json.load(f)
-                positions = raw if isinstance(raw, list) else raw.get('positions', [raw])
-            except:
-                pass
+        pos_data = state.get('position')
+        if pos_data:
+            pnl = pos_data.get('pnl_usd', 0)
+            pnl_pct = pos_data.get('pnl_pct', 0)
+            positions = [{
+                'sym': pos_data.get('opt_symbol', pos_data.get('dir', 'QQQ')),
+                'qty': pos_data.get('contracts', 0),
+                'cost': f"${pos_data.get('entry_opt_price', 0):.2f}",
+                'cur': f"${state.get('current_price', 0):.2f}",
+                'pnl': f"${pnl:.2f}",
+                'pct': f"{pnl_pct:.1f}%"
+            }]
+        else:
+            pf = os.path.join(sd, 'position_snapshot.json')
+            if os.path.exists(pf):
+                try:
+                    with open(pf, encoding='utf-8') as f:
+                        raw = json.load(f)
+                    positions = raw if isinstance(raw, list) else raw.get('positions', [raw])
+                except:
+                    pass
 
         # 交易记录
         trades = list(state.get('trades_today', []))
