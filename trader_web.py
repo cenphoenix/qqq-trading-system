@@ -52,8 +52,15 @@ class StateReader:
             if os.path.exists(state_file):
                 with open(state_file, encoding='utf-8') as f:
                     shared = json.load(f)
-        except Exception:
-            pass
+                # 调试：打印 broker_positions
+                bp = shared.get('broker_positions', [])
+                print(f"[DEBUG] state.json loaded: broker_positions count={len(bp)}")
+                if bp:
+                    print(f"[DEBUG] first bp: {bp[0]}")
+            else:
+                print("[DEBUG] state.json not found")
+        except Exception as e:
+            print(f"[DEBUG] load state.json error: {e}")
 
         positions = []
         try:
@@ -147,9 +154,21 @@ class StateReader:
                 'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
             })
 
-        # 优先显示真实持仓（从长桥 API 拉取），否则降级到策略持仓
+        # 优先显示真实持仓（从长桥 API 拉取）
         positions = []
         broker_positions = shared.get('broker_positions', [])
+        
+        # 🔧 如果 shared 中没有（可能是旧版本 state.json），直接从 state.json 读取
+        if not broker_positions:
+            try:
+                with open(os.path.join(_app_dir(), 'state.json'), encoding='utf-8') as f:
+                    state_data = json.load(f)
+                    broker_positions = state_data.get('broker_positions', [])
+                    print(f"[WEB] 从 state.json 直接读取 broker_positions: {len(broker_positions)} 条")
+            except Exception as e:
+                print(f"[WEB] 读取 state.json 失败: {e}")
+        
+        # 🔧 将 broker_positions 转换为 positions（供前端表格显示）
         if broker_positions:
             for bp in broker_positions:
                 positions.append({
@@ -160,6 +179,19 @@ class StateReader:
                     'pnl': 0,
                     'channel': bp.get('channel', ''),
                 })
+                print(f"[WEB] 持仓: {bp.get('symbol')} x{bp.get('qty')} @ ${bp.get('cost', 0):.4f}")
+        
+        if broker_positions:
+            for bp in broker_positions:
+                positions.append({
+                    'sym': bp.get('symbol', '--'),
+                    'qty': bp.get('qty', 0),
+                    'cost': f"${bp.get('cost', 0):.4f}" if bp.get('cost', 0) > 0 else '--',
+                    'cur': '--',
+                    'pnl': 0,
+                    'channel': bp.get('channel', ''),
+                })
+                print(f"[WEB] 持仓: {bp.get('symbol')} x{bp.get('qty')} @ ${bp.get('cost', 0):.4f}")
         else:
             # 降级到旧的 position_snapshot.json
             pass
@@ -186,10 +218,34 @@ class StateReader:
         net_assets = 0
         cash_val = 0
         buying_power = 0
-        for cur, info in account.items():
-            net_assets += info.get('net_assets', 0)
-            cash_val += info.get('total_cash', 0)
-            buying_power = max(buying_power, info.get('net_assets', 0) * 2)  # 2x margin
+        
+        # 兼容两种结构：
+        # 1. 扁平结构（新）: {net_assets: x, cash: y, buying_power: z}  # 已是 USD 总值
+        # 2. 多币种结构（旧）: {"HKD": {net_assets: ...}, "USD": {...}}
+        if isinstance(account, dict):
+            # 检测是否为扁平结构（有 net_assets/cash/buying_power 键且值为数字）
+            if all(k in account and isinstance(account[k], (int, float)) for k in ['net_assets', 'cash', 'buying_power']):
+                # 扁平结构：直接使用
+                net_assets = account.get('net_assets', 0)
+                cash_val = account.get('cash', 0)
+                buying_power = account.get('buying_power', 0)
+            else:
+                # 多币种结构：遍历合并
+                for cur, info in account.items():
+                    if isinstance(info, dict):
+                        net_assets += info.get('net_assets', 0)
+                        cash_val += info.get('total_cash', 0)
+                        # 购买力取各币种净值×2的最大值（模拟盘通常无杠杆，取最大即可）
+                        buying_power = max(buying_power, info.get('net_assets', 0) * 2)
+                    else:
+                        # 扁平结构：info 是数值，根据 cur 字段累加到对应变量
+                        val = float(info) if info else 0
+                        if cur == 'net_assets':
+                            net_assets += val
+                        elif cur == 'cash':
+                            cash_val += val
+                        elif cur == 'buying_power':
+                            buying_power = max(buying_power, val)  # 取最大
 
         # 运行时间：从 events 里第一条工程事件算起
         uptime_str = '--'
@@ -217,6 +273,15 @@ class StateReader:
         for cur, info in account.items():
             account_data[cur] = info
 
+        # 🔧 调试：在响应中直接包含原始 broker_positions
+        debug_broker_count = len(shared.get('broker_positions', []))
+        debug_msg = f"broker_positions from shared: {debug_broker_count}"
+        print(f"[DEBUG] {debug_msg}", file=sys.stderr)
+        
+        # 🔧 确保 broker_positions 是数组
+        broker_positions_raw = shared.get('broker_positions', [])
+        broker_positions_list = broker_positions_raw if isinstance(broker_positions_raw, list) else []
+        
         return {
             'connected': shared.get('connected', False),
             'running': shared.get('running', False),
@@ -229,7 +294,12 @@ class StateReader:
                 'buying_power': buying_power,
             },
             'positions': positions,
-            'broker_positions': positions,  # 前端兼容性别名
+            'broker_positions': broker_positions_list,  # 前端兼容性别名
+            '_debug': {
+                'broker_count': debug_broker_count,
+                'shared_keys': list(shared.keys()),
+                'msg': debug_msg,
+            },
             'strat_pos': None,
             'signal': {
                 'dir': sig_dir or '无信号',
@@ -410,6 +480,9 @@ function fmt$(v){return v?'$'+Number(v).toLocaleString('en-US',{minimumFractionD
 function cls(v){return v>=0?'up':'down'}
 
 function render(d){
+  console.log('[RENDER] full data:', d);
+  console.log('[RENDER] broker_positions:', d.broker_positions);
+  
   $('dot-engine').className='status-dot '+(d.running?'dot-green':'dot-red');
   $('s-engine').textContent=d.running?'运行中':'已停止';
   $('dot-conn').className='status-dot '+(d.connected?'dot-green':'dot-yellow');
@@ -471,7 +544,7 @@ function render(d){
 
   // 📋 Positions table
   let phtml='';
-  const bp=d.broker_positions||[];
+  const bp=Array.isArray(d.broker_positions)?d.broker_positions:[];
   if(bp.length){
     bp.forEach(p=>{
       const sym=p.symbol||'--';

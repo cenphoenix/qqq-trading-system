@@ -48,7 +48,7 @@ from strategy import get_option_symbol, FilterEngine
 # ===== 长桥SDK =====
 from longbridge.openapi import (
     Config, QuoteContext, TradeContext,
-    SubType, Period, AdjustType, TradeSessions,
+    SubType, Period, AdjustType, OAuthBuilder,
     OrderSide, OrderType, TimeInForceType, OutsideRTH
 )
 
@@ -293,7 +293,8 @@ class QQQLiveTrader:
                 state['trades_today'].append({
                     'time': t.get('time', t.get('entry_time', '')),
                     'dir': t.get('dir', ''),
-                    'entry_price': t.get('entry_price', 0),
+                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
+                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_price': t.get('exit_opt_price') or t.get('exit_price', 0),
                     'entry_time': t.get('entry_time', ''),
                     'exit_time': t.get('exit_time', ''),
@@ -338,6 +339,7 @@ class QQQLiveTrader:
         """初始化长桥API - 支持WSL和Windows"""
         self.quote_ctx = None
         self.trade_ctx = None
+        import os
         try:
             script_dir = str(_app_dir())
             env_paths = [
@@ -359,7 +361,16 @@ class QQQLiveTrader:
                     print(f"Loaded env from: {env_file}")
                     break
 
-            self.config = Config.from_apikey_env()
+            # 使用环境变量中的 ACCESS_TOKEN（模拟盘静态 Token）
+            # OAuth 2.0 认证（自动管理 token）
+            import os
+            client_id = os.environ.get('LONGBRIDGE_CLIENT_ID', '555390a4-1348-49f4-9283-a300713bf50f')
+            
+            # 首次运行会打印授权链接，完成后 token 自动缓存
+            oauth = OAuthBuilder(client_id).build(
+                lambda url: print(f"🔗 请授权: {url}")
+            )
+            self.config = Config.from_oauth(oauth)
             self.quote_ctx = QuoteContext(self.config)
             self.trade_ctx = TradeContext(self.config)
             self.quote_ctx.set_on_quote(self._on_quote)
@@ -472,7 +483,7 @@ class QQQLiveTrader:
             print(f"📥 加载今日K线（最多{count}根）...", end=" ")
             candles = self.quote_ctx.candlesticks(
                 self.cfg['symbol'], Period.Min_1, count,
-                AdjustType.NoAdjust, TradeSessions.All
+                AdjustType.NoAdjust
             )
             if not candles:
                 print("无数据")
@@ -632,7 +643,8 @@ class QQQLiveTrader:
                         self.position = {
                             'dir': direction,
                             'contracts': qty,
-                            'entry_price': cost,
+                            'entry_price': cost,              # 期权成本价
+                            'entry_opt_price': cost,          # 期权成本价（显式）
                             'opt_symbol': symbol,
                             # 设为当前时间，防止被误判超时直接平仓
                             'entry_time': datetime.now(),
@@ -695,7 +707,7 @@ class QQQLiveTrader:
 
         # 订阅1分钟K线
         self.quote_ctx.subscribe_candlesticks(
-            self.cfg['symbol'], Period.Min_1, TradeSessions.All
+            self.cfg['symbol'], Period.Min_1
         )
         self.quote_ctx.set_on_candlestick(self._on_candlestick)
         self._subscribe_quotes([self.cfg['symbol']])
@@ -1262,10 +1274,16 @@ class QQQLiveTrader:
                 equity = equity if equity else total_cash
                 print(f"  💰 账户余额: USD {capital:,.2f}")
             self.actual_capital = capital if capital > 0 else self.cfg['capital']
+            # 货币统一为 USD
+            if acct_currency == 'HKD':
+                cash_usd = total_cash / 7.8
+            else:
+                cash_usd = total_cash
+            
             self.account_info = {
-                'equity': equity,
-                'cash': total_cash,
-                'buying_power': buying_power if buying_power > 0 else capital
+                'equity': equity,           # 已转 USD
+                'cash': cash_usd,            # 统一转 USD
+                'buying_power': buying_power if buying_power > 0 else capital  # 已转 USD
             }
         except Exception as e:
             print(f"  ⚠️ 获取余额失败: {e}，使用默认资金: ${self.cfg['capital']:,}")
@@ -1389,6 +1407,24 @@ class QQQLiveTrader:
                         order_status = getattr(order_info, 'status', None)
                         executed_qty = float(getattr(order_info, 'executed_quantity', 0) or 0)
                         executed_price = float(getattr(order_info, 'executed_price', 0) or 0)
+                        
+                        # 🔧 调试：打印订单所有关键字段
+                        print(f"  📋 订单详情: ID={order_id}, status={order_status}, exec_qty={executed_qty}, exec_price={executed_price}")
+                        print(f"     订单字段: {[a for a in dir(order_info) if not a.startswith('_') and 'price' in a.lower() or 'done' in a.lower() or 'exec' in a.lower()]}")
+                        
+                        # 🔧 如果 executed_price 为 0 但订单已成交/部分成交，用 last_done 作为补充
+                        if executed_price <= 0 and executed_qty > 0:
+                            last_done = getattr(order_info, 'last_done', 0)
+                            if last_done and float(last_done) > 0:
+                                executed_price = float(last_done)
+                                print(f"  ℹ️  使用 last_done 作为成交价: ${executed_price}")
+                        
+                        # 🔧 如果还是没有，尝试用订单的 price 字段（限价单价格）
+                        if executed_price <= 0 and executed_qty > 0:
+                            order_price = getattr(order_info, 'price', 0)
+                            if order_price and float(order_price) > 0:
+                                executed_price = float(order_price)
+                                print(f"  ℹ️  使用订单 price 作为成交价: ${executed_price}")
                         
                         print(f"  📊 订单状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
                         
@@ -1632,9 +1668,9 @@ class QQQLiveTrader:
                         self.position = {
                             'order_id': 'synced',
                             'dir': 'call' if 'C' in str(symbol) else 'put',
-                            'entry_price': cost,
+                            'entry_price': cost,              # 期权成本
+                            'entry_opt_price': cost,          # 期权成本
                             'opt_symbol': symbol,
-                            'entry_opt_price': cost,
                             'sl_pct': self.cfg['sl'],
                             'tp_pct': self.cfg['tp'],
                             'contracts': qty,
@@ -2337,18 +2373,52 @@ class QQQLiveTrader:
                 if balance:
                     # balance 本身就是一个 list
                     currencies_list = list(balance) if isinstance(balance, (list, tuple)) else (getattr(balance, 'currencies', None) or [])
+                    # 累加器：合并所有币种，统一为 USD
+                    total_net_assets_usd = 0.0
+                    total_cash_usd = 0.0
+                    total_buying_power_usd = 0.0
+                    
                     for cur in currencies_list:
                         currency = str(getattr(cur, 'currency', 'unknown') or 'unknown')
                         net_assets = float(getattr(cur, 'net_assets', 0) or 0)
                         cash = float(getattr(cur, 'cash', 0) or 0)
                         market_value = float(getattr(cur, 'market_value', 0) or 0)
-                        total_cash = float(getattr(cur, 'total_cash', 0) or 0)
-                        account_info[currency] = {
-                            'cash': cash,
-                            'total_cash': total_cash,
-                            'net_assets': net_assets,
-                            'market_value': market_value,
-                        }
+                        total_cash_val = float(getattr(cur, 'total_cash', 0) or 0)
+                        buying_power = float(getattr(cur, 'buying_power', 0) or 0)
+                        
+                        # 转换为 USD
+                        if currency == 'HKD':
+                            rate = 7.8
+                            net_assets_usd = net_assets / rate
+                            cash_usd = cash / rate
+                            total_cash_usd += total_cash_val / rate
+                            buying_power_usd = buying_power / rate
+                        elif currency == 'CNY':
+                            rate = 7.2  # 人民币汇率，可根据需要调整
+                            net_assets_usd = net_assets / rate
+                            cash_usd = cash / rate
+                            total_cash_usd += total_cash_val / rate
+                            buying_power_usd = buying_power / rate
+                        else:
+                            # USD 或其他货币（如 SGD、EUR 等），暂按 1:1
+                            net_assets_usd = net_assets
+                            cash_usd = cash
+                            total_cash_usd += total_cash_val
+                            buying_power_usd = buying_power
+                        
+                        total_net_assets_usd += net_assets_usd
+                        total_cash_usd += cash_usd
+                        total_buying_power_usd += buying_power_usd
+                    
+                    # 保存合并后的扁平结构（Web 用）
+                    account_info = {
+                        'net_assets': total_net_assets_usd,
+                        'cash': total_cash_usd,
+                        'buying_power': total_buying_power_usd,
+                    }
+                    
+                    # 打印日志
+                    print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_cash_usd:,.0f} 购买力=${total_buying_power_usd:,.0f}")
                     # 兜底
                     if not currencies_list:
                         for attr in ['total_assets', 'net_assets', 'cash', 'market_value']:
@@ -2510,7 +2580,8 @@ class QQQLiveTrader:
                 restored = {
                     'time': entry_time_str,  # web 用的 time 字段
                     'dir': t.get('dir', ''),
-                    'entry_price': t.get('entry_price', 0),
+                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
+                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_opt_price': t.get('exit_price', 0),  # 和 position 里的一致
                     'exit_price': t.get('exit_price', 0),
                     'contracts': t.get('contracts', 0),
@@ -2874,7 +2945,8 @@ class QQQLiveTrader:
                     'entry_time': entry_time_str,
                     'exit_time': exit_time_str,
                     'dir': t.get('dir', ''),
-                    'entry_price': t.get('entry_price', 0),
+                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
+                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_price': t.get('exit_opt_price') or t.get('exit_price', 0),
                     'contracts': t.get('contracts', 0),
                     'pnl_pct': round(t.get('pnl_pct', 0), 2),
@@ -2961,7 +3033,8 @@ class QQQLiveTrader:
                     'entry_time': time_str,
                     'exit_time': exit_time_str,
                     'dir': t.get('dir', ''),
-                    'entry_price': t.get('entry_price', 0),
+                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
+                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_price': t.get('exit_opt_price', t.get('entry_price', 0)),
                     'qty': t.get('quantity', 0),
                     'contracts': t.get('contracts', 0),
