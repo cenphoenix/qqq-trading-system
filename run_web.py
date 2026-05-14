@@ -64,8 +64,8 @@ def start_trader():
 
 def start_web():
     """启动Web仪表盘"""
-    import dashboard_web
-    dashboard_web.main(8080)
+    import trader_web
+    trader_web.start_web(8080)
 
 
 trader_started = False

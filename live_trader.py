@@ -3031,7 +3031,12 @@ def main():
     trader = QQQLiveTrader(CONFIG)
 
     def signal_handler(sig, frame):
+        sig_name = 'Ctrl+C' if sig == signal.SIGINT else 'SIGTERM'
         trader.stop()
+        try:
+            trader._notify(f"⚠️ 系统{sig_name}退出\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n今日交易: {len(trader.trades_today)}笔\n盈亏: ${trader.daily_pnl:+,.2f}")
+        except:
+            pass
         sys.exit(0)
 
     try:
@@ -3040,7 +3045,15 @@ def main():
     except (ValueError, OSError):
         pass  # Windows console=False 时 signal 可能不可用
 
-    trader.start()
+    # 异常兜底：任何未捕获的异常都会发通知
+    try:
+        trader.start()
+    except Exception as e:
+        try:
+            trader._notify(f"❌ 系统异常崩溃\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n错误: {e}")
+        except:
+            pass
+        raise
 
 
 if __name__ == '__main__':

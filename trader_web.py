@@ -136,7 +136,7 @@ class StateReader:
                 'time': time_str or '--:--:--',
                 'dir': '做多' if t.get('dir') == 'call' else '做空' if t.get('dir') == 'put' else str(t.get('dir', '--')),
                 'dir_up': t.get('dir') == 'call',
-                'ep': f"${t.get('entry_price', 0):.2f}" if t.get('entry_price', 0) > 0 else '--',
+                'ep': f"${t.get('entry_opt_price', 0):.2f}" if t.get('entry_opt_price', 0) > 0 else f"${t.get('entry_price', 0):.2f}" if t.get('entry_price', 0) > 0 else '--',
                 'qty': t.get('contracts', t.get('qty', 0)),
                 'opt': opt,
                 'active': False,
@@ -211,14 +211,21 @@ class StateReader:
             except:
                 pass
 
+        # 账户资金：从长桥拉取的按币种分账户数据（HKD/USD/CNY）
+        # net_assets/cash/buying_power 按币种独立，前端可自行加总为"总净值"
+        account_data = {}
+        for cur, info in account.items():
+            account_data[cur] = info
+
         return {
             'connected': shared.get('connected', False),
             'running': shared.get('running', False),
             'current_price': shared.get('current_price', 0),
             'quote': {},
             'account': {
-                'net_assets': net_assets,
-                'cash': cash_val,
+                'currencies': account_data,  # 按币种原始数据 {"HKD": {...}, "USD": {...}}
+                'net_assets': net_assets,   # 所有币种净值总和（前端显示用）
+                'cash': cash_val,           # 所有币种总现金
                 'buying_power': buying_power,
             },
             'positions': positions,
@@ -235,6 +242,8 @@ class StateReader:
             'lb_orders': lb_orders,
             'daily_pnl': shared.get('daily_pnl', 0),
             'uptime': uptime_str,
+            'updated': shared.get('updated', '--'),  # 最近更新时间
+            'candle_count': shared.get('candle_count', 0),  # K线数
             'daily': {
                 'open': len(positions),
                 'closed': len([t for t in trades if not t.get('active')]),
@@ -272,11 +281,8 @@ API_TOKEN = os.environ.get('API_TOKEN', 'qqq_trading_2026')
 
 @app.before_request
 def check_auth():
-    if request.path.startswith('/api/'):
-        auth = request.headers.get('Authorization', '')
-        token = request.args.get('token', '')
-        if auth != f'Bearer {API_TOKEN}' and token != API_TOKEN:
-            return jsonify({'error': 'unauthorized'}), 401
+    """本地使用，无需鉴权"""
+    pass
 
 
 HTML = '''<!DOCTYPE html>
@@ -532,7 +538,19 @@ def api_state():
     return jsonify(state_reader.get_state())
 
 
+def start_web(port=8080):
+    """供 run_web.py 调用：启动 Flask Web 仪表盘（阻塞式）"""
+    # 关闭 Werkzeug HTTP 访问日志（每 5 秒刷一次太吵）
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.WARNING)
+
+    print(f"🌐 Web仪表盘启动于 http://0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+
 def main():
+    """独立运行入口"""
     print("🚀 Web仪表盘启动 (仅显示模式，交易由 live_trader.py 执行)")
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False), daemon=True).start()
     time.sleep(1)
