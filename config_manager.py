@@ -1,5 +1,5 @@
 """
-热血青年交易所 - 配置管理模块
+天才浚浚交易所 - 配置管理模块
 管理 settings.json 的读写，提供默认值和验证
 """
 import os
@@ -24,7 +24,7 @@ BACKUP_DIR = BASE_DIR / "config_backups"
 # ===== 默认配置（所有可调参数的默认值）=====
 DEFAULT_CONFIG = {
     "_version": "1.0",
-    "_description": "热血青年交易所 - 交易参数配置",
+    "_description": "天才浚浚交易所 - 交易参数配置",
     "_last_modified": "",
 
     # ---- 信号参数 ----

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-热血青年交易所 - Web版入口（无GUI）
+天才浚浚交易所 - Web版入口（无GUI）
 运行后启动：
 1. 交易引擎（后台线程）
 2. Web仪表盘（http://localhost:8080）
@@ -75,7 +75,7 @@ def main():
     global trader_started
 
     print("=" * 50)
-    print("🔥 热血青年交易所 Web版 v6.5")
+    print("🔥 天才浚浚交易所 Web版 v6.5")
     print("=" * 50)
 
     load_env()

@@ -325,7 +325,7 @@ HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>热血青年的交易所</title>
+<title>天才浚浚交易所</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap');
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
