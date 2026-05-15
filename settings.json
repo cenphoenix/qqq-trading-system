@@ -48,8 +48,8 @@
     "loss_consecutive_cooldown": 6
   },
   "trading": {
-    "start_time": "09:35",
-    "end_time": "15:50",
+    "start_time": "09:40",
+    "end_time": "14:00",
     "check_interval": 20,
     "post_open_cooldown": 15,
     "loss_cooldown": 3

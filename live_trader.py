@@ -73,7 +73,7 @@ def _load_config():
             'timeout_stage2_bars': 10, 'timeout_stage2_min': 0.60, 'timeout_stage3_bars': 15,
             'option_offset': 2.0, 'order_pct': 8, 'contract_multiplier': 100,
             'pos_pct': 8, 'max_trades': 999, 'daily_limit': 25,
-            'start_time': '09:35', 'end_time': '15:50',
+            'start_time': '09:40', 'end_time': '14:00',
             'trail_activate': 0.10, 'trail_drop': 0.05,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
