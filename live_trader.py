@@ -2486,12 +2486,22 @@ class QQQLiveTrader:
                     for cur in currencies_list:
                         currency = str(getattr(cur, 'currency', 'unknown') or 'unknown')
                         net_assets = float(getattr(cur, 'net_assets', 0) or 0)
-                        cash = float(getattr(cur, 'cash', 0) or 0)
-                        market_value = float(getattr(cur, 'market_value', 0) or 0)
                         total_cash_val = float(getattr(cur, 'total_cash', 0) or 0)
-                        # buying_power 在不同SDK版本可能字段名不同
+                        # cash 字段在 SDK 4.x 中不存在，从 cash_infos 获取
+                        cash = 0.0
+                        cash_attr = getattr(cur, 'cash', None)
+                        if cash_attr is not None:
+                            cash = float(cash_attr or 0)
+                        elif hasattr(cur, 'cash_infos'):
+                            for ci in cur.cash_infos:
+                                if hasattr(ci, 'available_cash'):
+                                    cash += float(ci.available_cash or 0)
+                        if cash == 0:
+                            cash = total_cash_val
+                        market_value = float(getattr(cur, 'market_value', 0) or 0)
+                        # buy_power 在 SDK 4.x 中叫 buy_power，旧版叫 buying_power
                         buying_power = 0.0
-                        for bp_attr in ['buying_power', 'max_power', 'power', 'available_funds', 'max_power_long']:
+                        for bp_attr in ['buy_power', 'buying_power', 'max_power', 'power', 'available_funds', 'max_power_long']:
                             bp_val = getattr(cur, bp_attr, None)
                             if bp_val is not None:
                                 buying_power = float(bp_val or 0)
