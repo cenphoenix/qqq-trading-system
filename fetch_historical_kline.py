@@ -30,7 +30,8 @@ for key in list(os.environ.keys()):
         if new_key not in os.environ:
             os.environ[new_key] = os.environ[key]
 
-from longbridge.openapi import Config, QuoteContext, Period, AdjustType
+import json
+from longbridge.openapi import Config, QuoteContext, Period, AdjustType, OAuthBuilder
 
 # === 配置 ===
 SYMBOL = "QQQ.US"
@@ -45,8 +46,19 @@ START_DT_UTC = datetime(YEAR, 1, 1)
 
 
 def main():
-    print(f"🔌 连接长桥 API...")
-    ctx = QuoteContext(Config.from_env())
+    print(f"🔌 连接长桥 API (OAuth2)...")
+    # OAuth2
+    client_id = os.environ.get('LONGBRIDGE_CLIENT_ID', '555390a4-1348-49f4-9283-a300713bf50f')
+    token_file = os.path.expanduser(f'~/.longbridge/openapi/tokens/{client_id}')
+    td = {}
+    if os.path.exists(token_file):
+        with open(token_file) as tf:
+            td = json.load(tf)
+    if not td.get('access_token'):
+        print("❌ OAuth token not found, run live_trader first to authorize")
+        return
+    oauth = OAuthBuilder(client_id).build(lambda url: None)
+    ctx = QuoteContext(Config.from_oauth(oauth))
 
     Path("data").mkdir(exist_ok=True)
 

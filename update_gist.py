@@ -25,32 +25,49 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 
 
 def load_account_info():
-    """从长桥API获取实盘账户信息"""
+    """从长桥API获取实盘账户信息（OAuth2）"""
     try:
-        # 加载环境变量
-        for f in [os.path.expanduser('~/.hermes/.env'), os.path.join(SCRIPT_DIR, '.env')]:
-            if os.path.exists(f):
-                with open(f, encoding='utf-8') as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if line and '=' in line and not line.startswith('#'):
-                            k, v = line.split('=', 1)
-                            if 'LONGPORT' in k:
-                                os.environ[k] = v.strip('"').strip("'")
-                break
+        import json
+        from longbridge.openapi import Config, TradeContext, OAuthBuilder
 
-        from longbridge.openapi import Config, TradeContext
-        config = Config.from_apikey_env()
+        client_id = os.environ.get('LONGBRIDGE_CLIENT_ID', '555390a4-1348-49f4-9283-a300713bf50f')
+        token_file = os.path.expanduser('~/.longbridge/openapi/tokens/' + client_id)
+
+        if not os.path.exists(token_file):
+            print("  ⚠️ OAuth token not found, skipping account info")
+            return None
+
+        with open(token_file) as tf:
+            token_data = json.load(tf)
+        if not token_data.get('access_token'):
+            return None
+
+        oauth = OAuthBuilder(client_id).build(lambda url: None)
+        config = Config.from_oauth(oauth)
         tc = TradeContext(config)
-        b = tc.account_balance()[0]
+        balances = tc.account_balance()
+
+        total_assets = 0.0
+        total_cash = 0.0
+        buy_power = 0.0
+
+        for b in balances:
+            na = float(getattr(b, 'net_assets', 0) or 0)
+            tc_val = float(getattr(b, 'total_cash', 0) or 0)
+            bp = float(getattr(b, 'buy_power', 0) or 0)
+            ccy = str(getattr(b, 'currency', 'USD') or 'USD')
+            rate = 7.8 if ccy == 'HKD' else (7.2 if ccy == 'CNY' else 1.0)
+            total_assets += na / rate
+            total_cash += tc_val / rate
+            buy_power += bp / rate
 
         return {
-            'total_assets': round(float(b.net_assets or 0), 2),
-            'cash': round(float(b.total_cash or 0), 2),
-            'buy_power': round(float(b.buy_power or 0), 2),
+            'total_assets': round(total_assets, 2),
+            'cash': round(total_cash, 2),
+            'buy_power': round(buy_power, 2),
         }
     except Exception as e:
-        print(f"⚠️ 获取账户信息失败: {e}")
+        print(f"  ⚠️ 获取账户信息失败: {e}")
         return None
 
 

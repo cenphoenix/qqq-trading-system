@@ -293,8 +293,12 @@ class ConfigManager:
 
     @staticmethod
     def has_env_keys():
-        """检查 .env 是否已配置密钥"""
+        """检查 .env 是否已配置认证（OAuth2: client_id / 旧版: app_key）"""
         env = ConfigManager.load_env()
+        # OAuth2 (当前)
+        if env.get('LONGBRIDGE_CLIENT_ID'):
+            return True
+        # 旧版 API Key (兼容)
         return bool(env.get('LONGPORT_APP_KEY') and env.get('LONGPORT_ACCESS_TOKEN'))
 
 

@@ -324,6 +324,10 @@ def check_first_run():
     if not ENV_FILE.exists():
         return True
     env = ConfigManager.load_env()
+    # OAuth2: 有client_id就算已配置
+    if env.get('LONGBRIDGE_CLIENT_ID'):
+        return False
+    # 旧版API Key
     return not (env.get('LONGPORT_APP_KEY') and env.get('LONGPORT_ACCESS_TOKEN'))
 
 
