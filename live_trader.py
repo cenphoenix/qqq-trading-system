@@ -1083,7 +1083,6 @@ class QQQLiveTrader:
         # ===== A. ATR 动态追高/追低（替代固定0.15/0.85）=====
         atr = self.engine.atr
         if atr > 0 and self.session_high > self.session_low:
-            price_pos = (entry_price - self.session_low) / (self.session_high - self.session_low)
             # 趋势市放宽到 2.0*ATR，中性/震荡用 1.5*ATR
             atr_mult = 2.0 if regime == 'trending' else 1.5
             atr_threshold = atr * atr_mult
@@ -1456,6 +1455,10 @@ class QQQLiveTrader:
         effective_pct = self.cfg['order_pct'] * combined_mult / 100
         print(f"  📊 下单: {contracts}张 × ${opt_price:.2f} × {self.cfg['contract_multiplier']}股 = ${order_amount:,.2f} (pos_mult={pos_mult:.2f}, vol_coef={vol_mult_factor:.2f}, time_coef={time_risk_mult:.2f})")
 
+        if contracts <= 0:
+            print(f"  ⛔ 尾端风控禁止开仓，放弃交易")
+            return
+
         side = OrderSide.Buy  # 买入期权（Call看多/ Put看空，都是Buy开仓）
 
         try:
@@ -1807,7 +1810,7 @@ class QQQLiveTrader:
         """持仓风控实现"""
         # ===== 0DTE 强制收盘平仓（16:00 ET）=====
         now_et = datetime.now(TZ_ET)
-        if now_et.hour >= 16 and now_et.minute >= 0:
+        if now_et.hour >= 16:
             if self.position:
                 self._close_position("⏰ 16:00 ET 强制收盘平仓")
             return
@@ -1820,7 +1823,7 @@ class QQQLiveTrader:
                 # 使用缓存避免API限频
                 lb_count = self._check_longbridge_position()
                 if lb_count == 0:
-                    self._unsubscribe_quotes([self.position.get('opt_symbol') if self.position else None])
+                    self._unsubscribe_quotes([None])
                     self.position = None
                 return
 
@@ -3159,10 +3162,10 @@ class QQQLiveTrader:
 
             reconciled.append({
                 'date': trade_date,
-                'entry_time': today_et,  # broker对账无精确时间
+                'entry_time': today_et,
                 'exit_time': today_et,
                 'dir': direction,
-                'entry_price': strike,
+                'entry_price': round(avg_buy, 2),
                 'exit_price': avg_sell,
                 'qty': matched_contracts * 100,
                 'contracts': matched_contracts,
@@ -3173,7 +3176,7 @@ class QQQLiveTrader:
                 'exit_reason': 'broker对账',
                 'opt_symbol': sym,
                 'entry_opt_price': round(avg_buy, 2),
-                '_source': 'broker_reconcile',  # 标记来源
+                '_source': 'broker_reconcile',
             })
 
         return reconciled
@@ -3302,7 +3305,7 @@ class QQQLiveTrader:
                     'dir': t.get('dir', ''),
                     # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
                     'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
-                    'exit_price': t.get('exit_opt_price', t.get('entry_price', 0)),
+                    'exit_price': t.get('exit_opt_price', 0),
                     'qty': t.get('quantity', 0),
                     'contracts': t.get('contracts', 0),
                     'pnl_pct': round(pnl, 2) if pnl else 0,
