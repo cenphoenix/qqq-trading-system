@@ -22,7 +22,7 @@ import numpy as np
 # 时区常量（自动处理夏令时/冬令时）
 from zoneinfo import ZoneInfo
 TZ_ET = ZoneInfo("America/New_York")    # 美东（自动EDT/EST切换）
-TZ_HKT = timezone(timedelta(hours=8))   # 北京/香港时间
+
 
 # stdout兜底（打包后console=False时为None，由入口main_app.py统一处理）
 if sys.stdout is None:
@@ -200,10 +200,10 @@ class QQQLiveTrader:
         self.session_low = 999999    # 当日最低价
         self.reversal_fired = False  # 今日是否已触发过反转信号
 
-        # CSV文件路径（与脚本同目录）
+        # CSV文件目录（按日归档）
         script_dir = str(_app_dir())
-        self.csv_path = os.path.join(script_dir, 'today.csv')
-        self.csv_initialized = False
+        self.csv_dir = os.path.join(script_dir, 'data', 'candles')
+        os.makedirs(self.csv_dir, exist_ok=True)
         self._last_position_verify = 0  # 上次持仓验证时间戳
 
         # 共享状态文件（供trader_web.py读取）
@@ -251,15 +251,22 @@ class QQQLiveTrader:
             self.events = self.events[-100:]
 
     def _write_csv(self, candle):
-        """写入K线数据到today.csv（供cron监控读取）"""
+        """写入K线数据到 data/candles/{日期}.csv（按日归档）"""
         try:
-            if not self.csv_initialized:
-                # 新的一天，写表头
-                with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
+            # 从K线时间戳获取日期（candle['time']已是ET）
+            dt = candle['time']
+            if isinstance(dt, datetime):
+                date_str = dt.strftime('%Y-%m-%d')
+            else:
+                date_str = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+            filepath = os.path.join(self.csv_dir, f'{date_str}.csv')
+
+            # 文件不存在则写表头
+            if not os.path.exists(filepath):
+                with open(filepath, 'w', newline='', encoding='utf-8') as f:
                     f.write('timestamp,open,high,low,close,volume,turnover\n')
-                self.csv_initialized = True
             # 追加K线数据
-            with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
+            with open(filepath, 'a', newline='', encoding='utf-8') as f:
                 ts = candle['time'].strftime('%Y-%m-%d %H:%M:%S')
                 f.write(f"{ts},{candle['open']},{candle['high']},{candle['low']},"
                         f"{candle['close']},{candle['volume']},{candle.get('turnover', 0)}\n")
@@ -855,7 +862,6 @@ class QQQLiveTrader:
                 self.kline_buffer = []
                 self.close_history = []
                 self.volume_history = []
-            self.csv_initialized = False
 
         # 解析1分钟K线
         bar = {
@@ -3095,15 +3101,9 @@ class QQQLiveTrader:
             # 但如果records文件不存在，可能是被kill后重启，需要保存
             pass
 
-        # 0DTE期权到期日=美东交易日，records文件用北京时间（+1天）
-        # 例如: 到期日2026-04-29(ET) → records/2026-04-30.json(北京)
-        from datetime import timedelta
-        et_date = datetime.strptime(most_common_date, '%Y-%m-%d')
-        beijing_date = (et_date + timedelta(days=1)).strftime('%Y-%m-%d')
-
-        # 检查是否已经有该日期的records文件
+# records文件统一用美东日期
         records_dir = os.path.join(script_dir, 'records')
-        record_file = os.path.join(records_dir, f'{beijing_date}.json')
+        record_file = os.path.join(records_dir, f'{most_common_date}.json')
 
         # 先用broker数据计算期望的交易数
         expected_trades = self._count_broker_trades(lb_data)
@@ -3115,15 +3115,15 @@ class QQQLiveTrader:
                 # 如果已有文件且交易数>=broker对账数，跳过（已完整保存）
                 existing_count = len(existing.get('trades', []))
                 if existing_count >= expected_trades:
-                    print(f"📋 {beijing_date}记录已存在({existing_count}笔,期望{expected_trades}笔)，跳过")
+                    print(f"📋 {most_common_date}记录已存在({existing_count}笔,期望{expected_trades}笔)，跳过")
                     return
                 else:
-                    print(f"⚠️ {beijing_date}记录不完整({existing_count}/{expected_trades}笔)，将用broker数据覆盖")
+                    print(f"⚠️ {most_common_date}记录不完整({existing_count}/{expected_trades}笔)，将用broker数据覆盖")
             except:
                 pass
-        print(f"🔄 发现未保存的{most_common_date}(ET)/{beijing_date}(BJ)交易记录，正在对账...")
+        print(f"🔄 发现未保存的{most_common_date}(ET)交易记录，正在对账...")
         # 用对账逻辑重建并保存
-        self._reconcile_and_save(lb_data, beijing_date)
+        self._reconcile_and_save(lb_data, most_common_date)
 
     def _reconcile_and_save(self, lb_data, trade_date):
         """从broker数据对账并保存到指定日期的records文件"""
@@ -3406,7 +3406,7 @@ class QQQLiveTrader:
             tmp_path = filepath + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'date': today_bj,
+                    'date': today_et,
                     'trades': trades,
                     'total': len(trades),
                     'wins': wins,

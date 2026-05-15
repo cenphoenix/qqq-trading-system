@@ -15,7 +15,7 @@ import webbrowser
 from datetime import datetime, timezone, timedelta
 
 TZ_ET = __import__('zoneinfo').ZoneInfo("America/New_York")
-TZ_HKT = timezone(timedelta(hours=8))
+
 
 def _app_dir():
     if getattr(sys, 'frozen', False):
@@ -110,9 +110,10 @@ class StateReader:
         if not shared_trades:
             try:
                 from datetime import datetime
-                today_bj = datetime.now().strftime('%Y-%m-%d')
+                from zoneinfo import ZoneInfo
+                today_et = datetime.now(ZoneInfo("America/New_York")).strftime('%Y-%m-%d')
                 rec_dir = _app_dir()
-                rec_file = os.path.join(rec_dir, 'records', f'{today_bj}.json')
+                rec_file = os.path.join(rec_dir, 'records', f'{today_et}.json')
                 if os.path.exists(rec_file):
                     with open(rec_file, encoding='utf-8') as f:
                         rec_data = json.load(f)
@@ -440,7 +441,7 @@ tr:hover{background:var(--surface-2)}
 </div>
 
 <script>
-let prevEventKey='';const $=id=>document.getElementById(id);
+const $=id=>document.getElementById(id);
 function fmt$(v){return v?'$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'--'}
 function cls(v){return v>=0?'up':'down'}
 
@@ -527,10 +528,13 @@ function render(d){
   });
   $('tb-trd').innerHTML=thtml||'<tr><td colspan="7" style="text-align:center;color:var(--text-2)">无交易记录</td></tr>';
 
+  // 实时事件（去重：Set保存所有已显示过的key）
+  const seenKeys=$('log-box').__seen||new Set();
+  $('log-box').__seen=seenKeys;
   (d.events||[]).forEach(e=>{
     const key=e.time+'|'+e.msg;
-    if(key!==prevEventKey){
-      prevEventKey=key;
+    if(!seenKeys.has(key)){
+      seenKeys.add(key);
       const tag=e.tag==='signal'?'sig':e.tag==='error'?'err':e.tag==='trade'?'trade':'info';
       addLog(e.msg,tag);
     }
