@@ -52,15 +52,9 @@ class StateReader:
             if os.path.exists(state_file):
                 with open(state_file, encoding='utf-8') as f:
                     shared = json.load(f)
-                # 调试：打印 broker_positions
-                bp = shared.get('broker_positions', [])
-                print(f"[DEBUG] state.json loaded: broker_positions count={len(bp)}")
-                if bp:
-                    print(f"[DEBUG] first bp: {bp[0]}")
-            else:
-                print("[DEBUG] state.json not found")
+                pass
         except Exception as e:
-            print(f"[DEBUG] load state.json error: {e}")
+            pass
 
         positions = []
         try:
@@ -164,22 +158,8 @@ class StateReader:
                 with open(os.path.join(_app_dir(), 'state.json'), encoding='utf-8') as f:
                     state_data = json.load(f)
                     broker_positions = state_data.get('broker_positions', [])
-                    print(f"[WEB] 从 state.json 直接读取 broker_positions: {len(broker_positions)} 条")
-            except Exception as e:
-                print(f"[WEB] 读取 state.json 失败: {e}")
-        
-        # 🔧 将 broker_positions 转换为 positions（供前端表格显示）
-        if broker_positions:
-            for bp in broker_positions:
-                positions.append({
-                    'sym': bp.get('symbol', '--'),
-                    'qty': bp.get('qty', 0),
-                    'cost': f"${bp.get('cost', 0):.4f}" if bp.get('cost', 0) > 0 else '--',
-                    'cur': '--',
-                    'pnl': 0,
-                    'channel': bp.get('channel', ''),
-                })
-                print(f"[WEB] 持仓: {bp.get('symbol')} x{bp.get('qty')} @ ${bp.get('cost', 0):.4f}")
+            except Exception:
+                pass
         
         if broker_positions:
             for bp in broker_positions:
@@ -191,10 +171,6 @@ class StateReader:
                     'pnl': 0,
                     'channel': bp.get('channel', ''),
                 })
-                print(f"[WEB] 持仓: {bp.get('symbol')} x{bp.get('qty')} @ ${bp.get('cost', 0):.4f}")
-        else:
-            # 降级到旧的 position_snapshot.json
-            pass
 
         cur_signal = shared.get('current_signal')
         sig_dir = ''
@@ -273,12 +249,6 @@ class StateReader:
         for cur, info in account.items():
             account_data[cur] = info
 
-        # 🔧 调试：在响应中直接包含原始 broker_positions
-        debug_broker_count = len(shared.get('broker_positions', []))
-        debug_msg = f"broker_positions from shared: {debug_broker_count}"
-        print(f"[DEBUG] {debug_msg}", file=sys.stderr)
-        
-        # 🔧 确保 broker_positions 是数组
         broker_positions_raw = shared.get('broker_positions', [])
         broker_positions_list = broker_positions_raw if isinstance(broker_positions_raw, list) else []
         
@@ -288,18 +258,13 @@ class StateReader:
             'current_price': shared.get('current_price', 0),
             'quote': {},
             'account': {
-                'currencies': account_data,  # 按币种原始数据 {"HKD": {...}, "USD": {...}}
-                'net_assets': net_assets,   # 所有币种净值总和（前端显示用）
-                'cash': cash_val,           # 所有币种总现金
+                'currencies': account_data,
+                'net_assets': net_assets,
+                'cash': cash_val,
                 'buying_power': buying_power,
             },
             'positions': positions,
-            'broker_positions': broker_positions_list,  # 前端兼容性别名
-            '_debug': {
-                'broker_count': debug_broker_count,
-                'shared_keys': list(shared.keys()),
-                'msg': debug_msg,
-            },
+            'broker_positions': broker_positions_list,
             'strat_pos': None,
             'signal': {
                 'dir': sig_dir or '无信号',
@@ -480,9 +445,6 @@ function fmt$(v){return v?'$'+Number(v).toLocaleString('en-US',{minimumFractionD
 function cls(v){return v>=0?'up':'down'}
 
 function render(d){
-  console.log('[RENDER] full data:', d);
-  console.log('[RENDER] broker_positions:', d.broker_positions);
-  
   $('dot-engine').className='status-dot '+(d.running?'dot-green':'dot-red');
   $('s-engine').textContent=d.running?'运行中':'已停止';
   $('dot-conn').className='status-dot '+(d.connected?'dot-green':'dot-yellow');

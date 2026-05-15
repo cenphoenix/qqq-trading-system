@@ -1362,10 +1362,10 @@ class QQQLiveTrader:
                         cash = float(asset.cash)
                     else:
                         cash = 0
-                    if hasattr(asset, 'buying_power') and asset.buying_power:
-                        buying_power += float(asset.buying_power)
-                    if hasattr(asset, 'total_equity') and asset.total_equity:
-                        equity += float(asset.total_equity)
+                    if hasattr(asset, 'buy_power') and asset.buy_power:
+                        buying_power += float(asset.buy_power)
+                    if hasattr(asset, 'net_assets') and asset.net_assets:
+                        equity += float(asset.net_assets)
                     if hasattr(asset, 'currency') and asset.currency:
                         acct_currency = str(asset.currency)
             # 根据实际货币决定是否转换
@@ -2604,8 +2604,11 @@ class QQQLiveTrader:
         try:
             all_orders = self.trade_ctx.today_orders()
             if not all_orders:
-                print(f"  ⚠️ 长桥返回空订单列表")
+                if not getattr(self, '_warned_empty_orders', False):
+                    print(f"  ⚠️ 长桥返回空订单列表（仅提示一次）")
+                    self._warned_empty_orders = True
                 return
+            self._warned_empty_orders = False
             
             print(f"  📥 长桥返回 {len(all_orders)} 笔订单")
             
