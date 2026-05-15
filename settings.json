@@ -1,6 +1,6 @@
 {
-  "_version": "1.0",
-  "_description": "热血青年交易所 - 交易参数配置",
+  "_version": "v6.5",
+  "_description": "QQQ 0DTE Regime-Adaptive Trading System v6.5",
   "_last_modified": "2026-05-12 15:59:16",
   "signal": {
     "rsi_period": 14,

@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-QQQ 0DTE 动态过滤突破策略 - 实盘交易系统 v6.5
-Regime-adaptive 市场状态检测 (trending/neutral/choppy)
-预加载滤镜(SMA20+SMA50+位置+趋势+VWAP+MACD) + 核心过滤(量能+动量+实体)
-RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
-动态参数: lookback/vol_mult/body/gap_mult/SL/timeout/pos_mult
+QQQ 0DTE 双路径突破策略 - 实盘交易系统 v6.2
+Classic(LB5/0.8x量/回踩确认) + Accelerated(LB3/1.2x量/近3根回踩) 自动切换
+预加载滤镜(SMA20+SMA50+位置+趋势 4取3) + 核心过滤(量能+动量+实体)
+按方向冷却 | 衰竭反转独立信号 | engine.status() 实时状态
 
 功能：
-1. 实时订阅QQQ 1分钟K线 → 信号检测
-2. Regime自适应双向突破信号 (v6.3核心策略 + v6.5现代优化)
-3. 自动下单（长桥API / OAuth2）
-4. 风控：动态止损/半仓止盈/分阶段超时/日亏损熔断/冷却
-5. Telegram推送交易信号 / Web仪表盘
+1. 实时订阅QQQ 1分钟K线 → 聚合5分钟
+2. v6.2 双路径突破信号检测（Classic/Accelerated 自动切换）
+3. 自动下单（长桥API）
+4. 风控：止损/止盈/跟踪止损/日亏损熔断/最大交易次数
+5. 飞书推送交易信号
 """
 import os, sys, time, json, signal, math
 from datetime import datetime, timedelta, timezone
@@ -969,7 +968,11 @@ class QQQLiveTrader:
         self._save_state()
 
     def _check_breakout(self, bar, cur_min):
-        """v6.3 动态过滤突破信号（根据市场状态自适应）"""
+        """精简版突破信号 — 基于 v6.2 原始逻辑
+
+        核心逻辑：价格突破 N 周期高低点 + 量能确认 + 基础趋势过滤
+        不再使用 regime 自适应、预加载滤镜、RSI 方向确认、ATR 追高
+        """
         # 时间窗口
         s_h, s_m = map(int, self.cfg['start_time'].split(':'))
         e_h, e_m = map(int, self.cfg['end_time'].split(':'))
@@ -983,224 +986,116 @@ class QQQLiveTrader:
                 return
         except:
             return
-        # v6.3: 取消每日交易次数限制
-        if self.daily_pnl <= -self.actual_capital * self.cfg['daily_limit'] / 100:
-            self._update_filters_current(bar)
+        # 阶梯熔断检查
+        circuit_level, circuit_msg = self._check_tiered_loss_circuit()
+        if circuit_level >= 2:
+            print(f"  🛑 熔断/保守模式: {circuit_msg}")
             return
-        # RSI预过滤：仅过滤极端值（<20或>80），方向确认移到信号检测后
-        rsi = self._calc_rsi(self.cfg['rsi_period'])
-        if rsi > 80:
-            self._update_filters_current(bar)
-            return
-        if rsi < 20:
-            self._update_filters_current(bar)
-            return
-
-        # ===== v6.3 市场状态检测 =====
-        regime_params = self.engine.get_regime_params()
-        regime = regime_params['regime']
 
         cs = self.one_min_candles
-        # 动态lookback：趋势市3根，震荡市2根，中性3根
-        lb = regime_params['lookback']
+        ch = self.close_history
+        lb = self.cfg.get('lookback', 3)
         if len(cs) < lb + 1:
-            self._update_filters_current(bar)
             return
 
         entry_price = bar['close']
 
-        # ===== v6.3 动态突破检测 =====
-        # 只用一个lookback（动态），不再双路径
+        # ===== 1. 突破检测 =====
         upper = max(c['high'] for c in cs[-lb-1:-1])
         lower = min(c['low'] for c in cs[-lb-1:-1])
-
-        # 突破检测
         gap_up = (entry_price - upper) / upper if upper > 0 else 999
         gap_dn = (lower - entry_price) / lower if lower > 0 else 999
-        max_gap = self.cfg['max_gap'] * regime_params['gap_mult']
+        max_gap = self.cfg.get('max_gap', 0.002)
 
         sig_dir = None
         if entry_price > upper and gap_up < max_gap:
             sig_dir = 'call'
         elif entry_price < lower and gap_dn < max_gap:
             sig_dir = 'put'
-
         if not sig_dir:
             return
 
-        # ===== B. 趋势方向过滤：禁止逆势交易 =====
-        ch = self.close_history
-        if len(ch) >= 50:
-            sma20 = np.mean(ch[-20:])
-            sma50 = np.mean(ch[-50:])
-            # 下降趋势（SMA20 < SMA50 且价格在SMA20下方）→ 禁止做多
-            if sma20 < sma50 and entry_price < sma20 and sig_dir == 'call':
-                print(f"  ⛔ 趋势过滤: SMA20({sma20:.2f})<SMA50({sma50:.2f}) 价格在均线下方，禁止做多")
-                return
-            # 上升趋势（SMA20 > SMA50 且价格在SMA20上方）→ 禁止做空
-            if sma20 > sma50 and entry_price > sma20 and sig_dir == 'put':
-                print(f"  ⛔ 趋势过滤: SMA20({sma20:.2f})>SMA50({sma50:.2f}) 价格在均线上方，禁止做空")
-                return
+        direction = '做多' if sig_dir == 'call' else '做空'
 
-        # ===== C. RSI 方向确认 =====
-        rsi_val = self._calc_rsi(self.cfg['rsi_period'])
-        if sig_dir == 'call' and (rsi_val < 40 or rsi_val > 70):
-            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做多要求40-70")
-            return
-        if sig_dir == 'put' and (rsi_val < 30 or rsi_val > 60):
-            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做空要求30-60")
-            return
-
-        # ===== 动量确认：当前K线同向 =====
+        # ===== 2. 动量确认：当前 K 线方向 =====
         mom_ok = (bar['close'] >= bar['open']) if sig_dir == 'call' else (bar['close'] <= bar['open'])
         if not mom_ok:
             return
 
-        # ===== 量能确认（动态阈值）=====
+        # ===== 3. 量能确认（固定阈值，不再 regime 自适应）=====
         vh = self.volume_history
         vol_avg = np.mean(vh[-20:]) if len(vh) >= 20 else 0
         cur_vol = bar['volume']
-        vol_ok = cur_vol >= vol_avg * regime_params['vol_mult'] if vol_avg > 0 else True
+        vol_mult = self.cfg.get('vol_mult', 0.8)
+        vol_ok = cur_vol >= vol_avg * vol_mult if vol_avg > 0 else True
         if not vol_ok:
             return
 
-        # ===== 实体确认（动态阈值）====
+        # ===== 4. 实体确认 =====
         cur_body = abs(bar['close'] - bar['open']) / bar['open'] if bar['open'] else 0
-        body_ok = cur_body >= regime_params['min_body']
+        min_body = self.cfg.get('min_body', 0.0003)
+        body_ok = cur_body >= min_body
         if not body_ok:
             return
 
-        # ===== D. VWAP 硬过滤：价格必须在VWAP正确一侧 =====
+        # ===== 5. 趋势方向过滤（SMA20/SMA50，禁止逆势）=====
+        if len(ch) >= 50:
+            sma20 = np.mean(ch[-20:])
+            sma50 = np.mean(ch[-50:])
+            # 下降趋势 → 禁止做多
+            if sma20 < sma50 and entry_price < sma20 and sig_dir == 'call':
+                return
+            # 上升趋势 → 禁止做空
+            if sma20 > sma50 and entry_price > sma20 and sig_dir == 'put':
+                return
+
+        # ===== 6. VWAP 硬过滤 =====
         vwap = self.engine.vwap
         if vwap > 0:
             if sig_dir == 'call' and entry_price < vwap:
-                print(f"  ⛔ VWAP过滤: 价格${entry_price:.2f} < VWAP${vwap:.2f}，禁止做多")
                 return
             if sig_dir == 'put' and entry_price > vwap:
-                print(f"  ⛔ VWAP过滤: 价格${entry_price:.2f} > VWAP${vwap:.2f}，禁止做空")
                 return
 
-        # ===== A. ATR 动态追高/追低（替代固定0.15/0.85）=====
-        atr = self.engine.atr
-        if atr > 0 and self.session_high > self.session_low:
+        # ===== 7. 价格位置：禁止追高做多/追低做空 =====
+        if self.session_high > self.session_low:
             price_pos = (entry_price - self.session_low) / (self.session_high - self.session_low)
-            # 趋势市放宽到 2.0*ATR，中性/震荡用 1.5*ATR
-            atr_mult = 2.0 if regime == 'trending' else 1.5
-            atr_threshold = atr * atr_mult
-            if sig_dir == 'call' and entry_price > self.session_high - atr_threshold:
-                print(f"  ⛔ ATR追高: 价格${entry_price:.2f} 距当日高点${self.session_high:.2f}仅${self.session_high - entry_price:.2f} < {atr_mult}×ATR(${atr_threshold:.2f})，禁止追高")
+            if sig_dir == 'call' and price_pos > 0.85:
                 return
-            if sig_dir == 'put' and entry_price < self.session_low + atr_threshold:
-                print(f"  ⛔ ATR追低: 价格${entry_price:.2f} 距当日低点${self.session_low:.2f}仅${entry_price - self.session_low:.2f} < {atr_mult}×ATR(${atr_threshold:.2f})，禁止追低")
+            if sig_dir == 'put' and price_pos < 0.15:
                 return
-
-        # ===== 回踩确认（趋势市+动量豁免）=====
-        if regime_params['pullback']:
-            # 动量豁免：连续3根同向K线 → 跳过回踩，直接追入
-            recent_3 = cs[-3:] if len(cs) >= 3 else cs
-            if sig_dir == 'call':
-                consecutive_bull = sum(1 for b in recent_3 if b['close'] >= b['open'])
-                if consecutive_bull >= 3:
-                    print(f"  ⚡ 动量直入: 连续{consecutive_bull}根阳线，跳过回踩")
-                else:
-                    prev = cs[-2] if len(cs) >= 2 else None
-                    if prev and prev['close'] > prev['open']:
-                        return  # 做多要求前1根是阴线
-            elif sig_dir == 'put':
-                consecutive_bear = sum(1 for b in recent_3 if b['close'] <= b['open'])
-                if consecutive_bear >= 3:
-                    print(f"  ⚡ 动量直入: 连续{consecutive_bear}根阴线，跳过回踩")
-                else:
-                    prev = cs[-2] if len(cs) >= 2 else None
-                    if prev and prev['close'] < prev['open']:
-                        return  # 做空要求前1根是阳线
-
-        # ===== 预加载滤镜（动态阈值）=====
-        pre_ok, pre_filters, bonus_count = self.engine.check_preloaded(sig_dir, regime=regime)
-        preloaded_pass = regime_params['preloaded_pass']
-        if bonus_count < preloaded_pass:
-            fails = [k for k, v in pre_filters.items() if not v.get('ok')]
-            print(f"  🔍 {sig_dir}(regime={regime}) 预加载滤镜不足({bonus_count}/{preloaded_pass}): {', '.join(fails)}")
-            return
-
-        # ===== 核心过滤状态（供Web显示）=====
-        core_ok, core_filters = self.engine.check_filters(sig_dir, entry_price, bar, vol_avg)
-
-        direction = '做多' if sig_dir == 'call' else '做空'
-        mode_tag = f'{regime}({lb}根)'
-        self.filter_status = {
-            'sma20': pre_filters.get('sma20', {}),
-            'sma50': pre_filters.get('sma50', {}),
-            'volume': core_filters.get('volume', {}),
-            'momentum': core_filters.get('momentum', {}),
-            'body': core_filters.get('body', {}),
-            'price_pos': pre_filters.get('price_pos', {}),
-            'trend': pre_filters.get('trend', {}),
-            'vwap': pre_filters.get('vwap', {}),
-            'macd': pre_filters.get('macd', {}),
-            'atr': self.engine.state.get('atr', {}),
-            'dir': direction,
-            'mode': mode_tag,
-            'regime_detail': regime_params['detail'],
-            'price': f'${entry_price:.2f}',
-            'all_ok': True,
-        }
+        else:
+            price_pos = 0.5  # 初始状态（无高低点）
 
         # ===== 冷却检查 =====
-        # E. 大亏冷却：每根K线递减
-        if self.big_loss_cooldown > 0:
-            self.big_loss_cooldown -= 1
-            if sig_dir == getattr(self, '_big_loss_dir', None):
-                print(f"  ⏳ 大亏冷却中({sig_dir}方向)，剩余{self.big_loss_cooldown}根K线")
-                return
         if self.cooldown_remaining > 0 and self.last_loss_dir is not None:
-            self.cooldown_remaining -= 1  # 任何信号都递减冷却（防止无限卡住）
+            self.cooldown_remaining -= 1
             if sig_dir == self.last_loss_dir:
-                print(f"  ⏳ 冷却中({self.last_loss_dir}方向)，跳过有效信号，剩余{self.cooldown_remaining}次")
+                print(f"  ⏳ 冷却中({self.last_loss_dir}方向)，剩余{self.cooldown_remaining}次")
                 return
             else:
-                print(f"  ⏳ 冷却中但方向相反({sig_dir}≠{self.last_loss_dir})，允许交易，冷却剩余{self.cooldown_remaining}次")
+                print(f"  ⏳ 冷却中但方向相反({sig_dir}≠{self.last_loss_dir})，允许交易")
 
-        # ===== 构建信号（使用regime动态参数）=====
+        # ===== 构建信号 =====
         gap_pct = gap_up if sig_dir == 'call' else gap_dn
-        sl_pct = regime_params['sl_pct']
-        tp_partial = regime_params['tp_partial_pct']
         sig = {
             'dir': sig_dir,
-            'reason': f'{regime}突破{(upper if sig_dir=="call" else lower):.2f}{direction}(跳空{gap_pct*100:.2f}%,LB{lb})',
+            'reason': f'突破{(upper if sig_dir=="call" else lower):.2f}{direction}(跳空{gap_pct*100:.2f}%,LB{lb})',
             'price': entry_price,
-            'sl': entry_price * (1 - sl_pct) if sig_dir == 'call' else entry_price * (1 + sl_pct),
-            'tp': entry_price * (1 + self.cfg['tp']) if sig_dir == 'call' else entry_price * (1 - self.cfg['tp']),
-            'sl_pct': sl_pct,
-            'tp_partial_pct': tp_partial,
-            'timeout_bars': regime_params['timeout_bars'],
-            'pos_mult': regime_params['pos_mult'],
-            'regime': regime,
+            'sl': self.cfg.get('sl', 0.25),
+            'sl_pct': self.cfg.get('sl', 0.25),
+            'tp_partial_pct': self.cfg.get('tp_partial_pct', 1.00),
+            'timeout_bars': self.cfg.get('timeout_stage3_bars', 15),
+            'pos_mult': 1.0,  # 固定仓位倍率
+            'regime': 'neutral',
         }
 
-        self._save_state()
-
         # 打印过滤日志
-        vol_t = core_filters['volume']['detail']
-        mom_v = core_filters['momentum']['val']
-        body_v = core_filters['body']['val']
-        vwap_v = '✓' if pre_filters.get('vwap', {}).get('ok') else '✗'
-        macd_v = '✓' if pre_filters.get('macd', {}).get('ok') else '✗'
         filters_str = (
-            f"regime={regime} | "
-            f"LB{lb} | "
-            f"量能({vol_t}) | "
-            f"动量({mom_v}) | "
-            f"实体({body_v}) | "
-            f"VWAP({vwap_v}) | "
-            f"MACD({macd_v}) | "
-            f"滤镜({bonus_count}/{preloaded_pass})"
+            f"LB{lb} | 量能{vol_mult}x | 动量{'阳线' if sig_dir=='call' else '阴线'}✓ | "
+            f"实体{cur_body*100:.3f}% | VWAP{'✓' if vwap>0 else 'N/A'} | 趋势✓ | 位置{'%.0f%%' % (price_pos*100)}"
         )
-        print(f"  🎯 {direction}[{regime}]突破@${entry_price:.2f} | {filters_str}")
-
-        # ===== 执行交易 =====
-        filters_passed = [f"regime={regime}", f"LB{lb}", f"量能✓", f"动量✓", f"实体✓", f"滤镜{bonus_count}/{preloaded_pass}"]
-        sig['reason'] += f" [{', '.join(filters_passed)}]"
+        print(f"  🎯 {direction}突破@${entry_price:.2f} | {filters_str}")
 
         self.daily_signals += 1
         self._add_event(f"🎯 {direction}突破@${entry_price:.2f} | {filters_str}", "signal")
