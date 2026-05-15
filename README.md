@@ -1,4 +1,4 @@
-# QQQ 0DTE 实盘交易系统 v6.2
+# QQQ 0DTE 实盘交易系统 v6.5
 
 热血青年交易所 — QQQ 零日到期期权全自动交易系统
 
@@ -68,7 +68,7 @@ python3 main_app.py
 ```
 ├── main_app.py          # 主入口（Tkinter GUI + 系统托盘）
 ├── run_web.py           # Web版入口（无 GUI，适合服务器部署）
-├── live_trader.py       # 核心交易引擎 v6.2
+├── live_trader.py       # 核心交易引擎 v6.5
 ├── trader_web.py        # Web 仪表盘 API
 ├── dashboard_web.py    # 轻量 Web 仪表盘（无依赖）
 ├── config_manager.py   # 配置管理器

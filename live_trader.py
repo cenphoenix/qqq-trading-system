@@ -139,7 +139,7 @@ class QQQLiveTrader:
         # 初始化其他变量
         self._init_vars()
 
-        # v6.2 FilterEngine
+        # v6.5 FilterEngine
         self.engine = FilterEngine(self.cfg)
 
         # 初始化长桥连接
@@ -525,7 +525,7 @@ class QQQLiveTrader:
                 self.volume_history.append(bar['volume'])
                 self.session_high = max(self.session_high, bar['high'])
                 self.session_low = min(self.session_low, bar['low'])
-                # v6.2 同步填充 FilterEngine
+                # v6.5 同步填充 FilterEngine
                 bar_with_dir = dict(bar)
                 bar_with_dir['body_pct'] = abs(bar['close'] - bar['open']) / bar['open'] * 100 if bar['open'] else 0
                 bar_with_dir['dir'] = 1 if bar['close'] >= bar['open'] else -1
@@ -811,7 +811,7 @@ class QQQLiveTrader:
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
             self._loss_circuit_conservative_fired = False  # 新交易日重置熔断通知
-            self.engine.reset_day()  # v6.2 重置 FilterEngine
+            self.engine.reset_day()  # v6.5 重置 FilterEngine
             # 只在非预加载情况下清空K线数据
             if not self.one_min_candles:
                 self.kline_buffer = []
@@ -943,7 +943,7 @@ class QQQLiveTrader:
         self.session_high = max(self.session_high, current_price)
         self.session_low = min(self.session_low, current_price)
 
-        # v6.2 同步 FilterEngine（用于20秒轮询的滤镜状态）
+        # v6.5 同步 FilterEngine（用于20秒轮询的滤镜状态）
         self.engine.session_high = self.session_high
         self.engine.session_low = self.session_low
         # 注意：不调用 engine.update(fake_bar)，避免假K线污染SMA/趋势计算
@@ -1894,7 +1894,7 @@ class QQQLiveTrader:
         if pos['half_closed']:
             pos['half_closed_max_pct'] = max(pos.get('half_closed_max_pct', 0), pnl_pct)
 
-        # ===== v6.2 正股跟踪止损：更新正股峰值 =====
+        # ===== v6.5 正股跟踪止损：更新正股峰值 =====
         if pos['dir'] == 'call':
             pos['stock_peak'] = max(pos.get('stock_peak', entry_stock), current_stock)
         else:  # put
@@ -2459,7 +2459,7 @@ class QQQLiveTrader:
         print("\n" + "=" * 60)
         print("📊 今日交易总结")
         print("=" * 60)
-        print(f"  策略版本: v6.2双路径(Classic/Accelerated) | 09:35-15:50美东")
+        print(f"  策略版本: v6.5 Regime-Adaptive | 09:35-15:50美东")
         print(f"  交易次数: {total} (做多: {sum(1 for t in self.trades_today if t.get('dir')=='call')}, "
               f"做空: {sum(1 for t in self.trades_today if t.get('dir')=='put')})")
         print(f"  胜率: {wins}/{total} ({wins/total*100:.0f}%)" if total > 0 else "  胜率: N/A")
@@ -2533,9 +2533,14 @@ class QQQLiveTrader:
                                 account_info['_direct'][attr] = float(val or 0)
 
                     if account_info:
-                        summary = ', '.join([
-                            f"{k}=${v.get('net_assets',0):,.0f}" for k,v in account_info.items()
-                        ])
+                        # 修复: account_info 值可能是 float (net_assets/cash) 或 dict (_direct)
+                        summary_parts = []
+                        for k, v in account_info.items():
+                            if isinstance(v, dict):
+                                summary_parts.append(f"{k}=${v.get('net_assets',0):,.0f}")
+                            else:
+                                summary_parts.append(f"{k}=${v:,.0f}")
+                        summary = ', '.join(summary_parts)
                         print(f"💰 账户资金: {summary}")
                     else:
                         print(f"  ⚠️ account_balance 返回空: {type(balance).__name__} {dir(balance)}")

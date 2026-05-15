@@ -75,7 +75,7 @@ def main():
     global trader_started
 
     print("=" * 50)
-    print("🔥 热血青年交易所 Web版 v6.2")
+    print("🔥 热血青年交易所 Web版 v6.5")
     print("=" * 50)
 
     load_env()
