@@ -2489,7 +2489,16 @@ class QQQLiveTrader:
                         cash = float(getattr(cur, 'cash', 0) or 0)
                         market_value = float(getattr(cur, 'market_value', 0) or 0)
                         total_cash_val = float(getattr(cur, 'total_cash', 0) or 0)
-                        buying_power = float(getattr(cur, 'buying_power', 0) or 0)
+                        # buying_power 在不同SDK版本可能字段名不同
+                        buying_power = 0.0
+                        for bp_attr in ['buying_power', 'max_power', 'power', 'available_funds', 'max_power_long']:
+                            bp_val = getattr(cur, bp_attr, None)
+                            if bp_val is not None:
+                                buying_power = float(bp_val or 0)
+                                if buying_power > 0:
+                                    break
+                        if buying_power == 0:
+                            buying_power = cash
                         
                         # 转换为 USD
                         if currency == 'HKD':
