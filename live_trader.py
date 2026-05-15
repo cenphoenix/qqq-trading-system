@@ -127,6 +127,19 @@ class QQQLiveTrader:
         self.close_history = []      # 收盘价历史（计算SMA）
         self.volume_history = []     # 成交量历史（计算均量）
         self.consecutive_losses = 0  # 连续亏损次数
+        self.consecutive_wins = 0    # 当前连胜计数
+        self.max_consecutive_wins = 0  # 历史最长连胜
+        self.max_consecutive_losses = 0  # 历史最长连亏
+        self.largest_win_usd = 0     # 最大单笔盈利
+        self.largest_loss_usd = 0    # 最大单笔亏损
+        self.largest_win_pct = 0     # 最大单笔盈利%
+        self.largest_loss_pct = 0    # 最大单笔亏损%
+        self.call_trades = 0         # CALL方向交易数
+        self.put_trades = 0          # PUT方向交易数
+        self.call_wins = 0           # CALL方向盈利数
+        self.put_wins = 0            # PUT方向盈利数
+        self.call_pnl = 0.0          # CALL方向累计盈亏
+        self.put_pnl = 0.0           # PUT方向累计盈亏
         self.cooldown_remaining = 0  # 冷却剩余次数
         self.last_loss_dir = None    # 最近一次亏损的方向（'call'或'put'），冷却期间允许反向
         self.big_loss_cooldown = 0   # 大亏(>20%)后同方向冷却剩余K线数
@@ -135,6 +148,10 @@ class QQQLiveTrader:
         self.actual_capital = self.cfg['capital']  # 实际资金（_execute_trade中更新）
         self.start_time = datetime.now()  # 启动时间，用于计算运行时间
         self.account_info = {}  # 账户资金信息
+        self.yesterday_pnl = 0.0   # 昨日盈亏（启动时加载）
+        self.yesterday_trades = 0  # 昨日交易笔数
+        self.yesterday_wr = 0.0    # 昨日胜率
+        self._daily_summary_sent = False  # 日终总结是否已发送
 
         # 初始化其他变量
         self._init_vars()
@@ -744,6 +761,13 @@ class QQQLiveTrader:
             print(f"📤 启动同步长桥订单完成")
         except Exception as e:
             print(f"⚠️ 启动同步订单失败: {e}")
+
+        # 🚀 发送启动通知
+        try:
+            self._notify("🚀 系统启动", msg_type='startup')
+        except Exception as e:
+            print(f"⚠️ 启动通知发送失败: {e}")
+
         try:
             while self.running:
                 # 配置热重载（检测 settings.json 变化）
@@ -806,11 +830,25 @@ class QQQLiveTrader:
             self.position = None
             self._unsubscribe_quotes([old_symbol])
             self.consecutive_losses = 0  # 新交易日重置亏损计数
+            self.consecutive_wins = 0
+            self.max_consecutive_wins = 0
+            self.max_consecutive_losses = 0
+            self.largest_win_usd = 0
+            self.largest_loss_usd = 0
+            self.largest_win_pct = 0
+            self.largest_loss_pct = 0
+            self.call_trades = 0
+            self.put_trades = 0
+            self.call_wins = 0
+            self.put_wins = 0
+            self.call_pnl = 0.0
+            self.put_pnl = 0.0
             self.cooldown_remaining = 0  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
             self._loss_circuit_conservative_fired = False  # 新交易日重置熔断通知
+            self._daily_summary_sent = False  # 新交易日重置日终总结标记
             self.engine.reset_day()  # v6.5 重置 FilterEngine
             # 只在非预加载情况下清空K线数据
             if not self.one_min_candles:
@@ -1813,6 +1851,13 @@ class QQQLiveTrader:
         if now_et.hour >= 16:
             if self.position:
                 self._close_position("⏰ 16:00 ET 强制收盘平仓")
+            # 发送日终总结（只发送一次）
+            if not self._daily_summary_sent:
+                self._daily_summary_sent = True
+                try:
+                    self._notify("📊 日终总结", msg_type='daily_summary')
+                except Exception as e:
+                    print(f"⚠️ 日终总结发送失败: {e}")
             return
 
         # 如果没有内部持仓，尝试从长桥同步
@@ -2310,9 +2355,31 @@ class QQQLiveTrader:
             closed_symbol = pos.get('opt_symbol')
             self.position = None  # 成功后才清空
             self._unsubscribe_quotes([closed_symbol])
+            
+            # 更新连续统计
+            if pnl_pct > 0:
+                self.consecutive_wins += 1
+                self.consecutive_losses = 0
+                self.max_consecutive_wins = max(self.max_consecutive_wins, self.consecutive_wins)
+                if pnl_usd > self.largest_win_usd:
+                    self.largest_win_usd = pnl_usd
+                    self.largest_win_pct = pnl_pct
+                if pos['dir'] == 'call':
+                    self.call_wins += 1
+                    self.call_pnl += pnl_usd
+                else:
+                    self.put_wins += 1
+                    self.put_pnl += pnl_usd
+            else:
+                self.consecutive_losses += 1
+                self.consecutive_wins = 0
+                self.max_consecutive_losses = max(self.max_consecutive_losses, self.consecutive_losses)
+                if pnl_usd < self.largest_loss_usd:
+                    self.largest_loss_usd = pnl_usd
+                    self.largest_loss_pct = pnl_pct
+
             # P1 #10 简化冷却：根据单笔亏损幅度 + 连亏次数
             if pnl_pct < 0:
-                self.consecutive_losses += 1
                 self.last_loss_dir = pos['dir']
 
                 abs_loss = abs(pnl_pct)
@@ -2334,8 +2401,6 @@ class QQQLiveTrader:
                     print(f"  🛡 半仓后亏损，下次止损收紧至{tighten*100:.0f}%")
 
                 # ⏸ 冷却逻辑已暂时移除，等今晚交易数据后再加
-            else:
-                self.consecutive_losses = 0
 
             # 每次平仓后实时写入 records 文件（独立于 Gist 的安全备份）
             self._save_records_snapshot()
@@ -2415,8 +2480,11 @@ class QQQLiveTrader:
         regime = sig.get('regime', '--')
         reason = sig.get('reason', '--')
         entry_opt = self.position.get('entry_opt_price', 0) if self.position else 0
+        total = len(self.trades_today)
+        wins = sum(1 for t in self.trades_today if t.get('win'))
+        wr = wins/total*100 if total > 0 else 0
         return (
-            f"<b>🎯 开仓</b>\n"
+            f"<b>🎯 开仓 #{total+1}</b>\n"
             f"───────────\n"
             f"{dir_emoji} <b>{dir_text}</b>\n"
             f"<code>{opt_symbol}</code>\n"
@@ -2425,7 +2493,11 @@ class QQQLiveTrader:
             f"数量 <b>{contracts}</b>张 ({qty}股)\n"
             f"市场 <b>{regime}</b>\n"
             f"理由 {reason}\n"
-            f"订单 {order_id}"
+            f"订单 {order_id}\n"
+            f"───────────\n"
+            f"📈 今日统计\n"
+            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
+            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
         )
 
     def _fmt_exit(self, pos, reason, entry_opt, exit_opt, pnl_pct, pnl_usd, order_id='--'):
@@ -2434,15 +2506,22 @@ class QQQLiveTrader:
         dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
         dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
         label = '盈利' if pnl_pct > 0 else '亏损'
+        total = len(self.trades_today)
+        wins = sum(1 for t in self.trades_today if t.get('win'))
+        wr = wins/total*100 if total > 0 else 0
         return (
-            f"<b>🏁 平仓</b>\n"
+            f"<b>🏁 平仓 #{total}</b>\n"
             f"───────────\n"
             f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
             f"原因 <b>{reason}</b>\n"
             f"───────────\n"
             f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
             f"{emoji} {label} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
-            f"订单 {order_id}"
+            f"订单 {order_id}\n"
+            f"───────────\n"
+            f"📈 今日统计\n"
+            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
+            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
         )
 
     def _fmt_partial(self, pos, reason, entry_opt, exit_opt, half, remaining, pnl_pct, pnl_usd):
@@ -2503,6 +2582,84 @@ class QQQLiveTrader:
             )
         return ''
 
+    def _fmt_startup(self):
+        """格式化启动通知"""
+        return (
+            f"<b>🚀 系统启动</b>\n"
+            f"───────────\n"
+            f"版本 <code>v6.5 Regime-Adaptive</code>\n"
+            f"时间 <code>{datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M ET')}</code>\n"
+            f"账户 <b>${self.actual_capital:,.2f}</b>\n"
+            f"昨日盈亏 <b>${self.yesterday_pnl:+,.2f}</b> ({self.yesterday_trades}笔, 胜率{self.yesterday_wr:.0f}%)\n"
+            f"───────────\n"
+            f"<code>QQQ 0DTE v6.5</code>"
+        )
+
+    def _fmt_shutdown(self, reason='未知'):
+        """格式化停止通知"""
+        runtime = datetime.now() - self.start_time
+        hours = int(runtime.total_seconds() // 3600)
+        mins = int((runtime.total_seconds() % 3600) // 60)
+        total = len(self.trades_today)
+        wins = sum(1 for t in self.trades_today if t.get('win'))
+        return (
+            f"<b>⏹️ 系统停止</b>\n"
+            f"───────────\n"
+            f"原因 <b>{reason}</b>\n"
+            f"运行时长 <b>{hours}h {mins}m</b>\n"
+            f"今日交易 <b>{total}</b>笔 | 盈利<b>{wins}</b> | 亏损<b>{total-wins}</b>\n"
+            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>\n"
+            f"───────────\n"
+            f"<code>QQQ 0DTE v6.5</code>"
+        )
+
+    def _fmt_daily_summary(self):
+        """格式化日终总结通知"""
+        total = len(self.trades_today)
+        wins = sum(1 for t in self.trades_today if t.get('win'))
+        wr = wins/total*100 if total > 0 else 0
+        
+        call_cnt = sum(1 for t in self.trades_today if t.get('dir')=='call')
+        put_cnt = total - call_cnt
+        call_win = sum(1 for t in self.trades_today if t.get('dir')=='call' and t.get('win'))
+        put_win = sum(1 for t in self.trades_today if t.get('dir')=='put' and t.get('win'))
+        call_wr = call_win/call_cnt*100 if call_cnt > 0 else 0
+        put_wr = put_win/put_cnt*100 if put_cnt > 0 else 0
+        
+        return (
+            f"<b>📊 日终总结 {datetime.now(TZ_ET).strftime('%Y-%m-%d')}</b>\n"
+            f"───────────\n"
+            f"总交易 <b>{total}</b>笔 | 盈利<b>{wins}</b> | 亏损<b>{total-wins}</b>\n"
+            f"胜率 <b>{wr:.1f}%</b>\n"
+            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>\n"
+            f"───────────\n"
+            f"方向分布\n"
+            f"🟢 CALL <b>{call_cnt}</b>笔 (胜率{call_wr:.0f}%, ${self.call_pnl:+,.2f})\n"
+            f"🔴 PUT  <b>{put_cnt}</b>笔 (胜率{put_wr:.0f}%, ${self.put_pnl:+,.2f})\n"
+            f"───────────\n"
+            f"连续统计\n"
+            f"🔥 最长连胜 <b>{self.max_consecutive_wins}</b>笔\n"
+            f"❄️ 最长连亏 <b>{self.max_consecutive_losses}</b>笔\n"
+            f"───────────\n"
+            f"单笔最佳\n"
+            f"✅ 最大盈利 <b>+${self.largest_win_usd:,.2f}</b> ({self.largest_win_pct:+.1f}%)\n"
+            f"❌ 最大亏损 <b>-${abs(self.largest_loss_usd):,.2f}</b> ({self.largest_loss_pct:+.1f}%)\n"
+            f"───────────\n"
+            f"<code>QQQ 0DTE v6.5</code>"
+        )
+
+    def _get_today_stats_html(self):
+        """获取今日统计HTML片段（用于开仓/平仓通知底部）"""
+        total = len(self.trades_today)
+        wins = sum(1 for t in self.trades_today if t.get('win'))
+        wr = wins/total*100 if total > 0 else 0
+        
+        return (
+            f"📈 今日统计\n"
+            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
+            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
+        )
+
     def _notify_telegram(self, msg, msg_type='info', **kw):
         """Telegram通知 - 支持HTML格式的消息"""
         try:
@@ -2527,6 +2684,12 @@ class QQQLiveTrader:
                 text = self._fmt_partial(**kw)
             elif msg_type == 'alert' and kw:
                 text = self._fmt_alert(**kw)
+            elif msg_type == 'startup':
+                text = self._fmt_startup()
+            elif msg_type == 'shutdown':
+                text = self._fmt_shutdown(**kw)
+            elif msg_type == 'daily_summary':
+                text = self._fmt_daily_summary()
             elif msg_type == 'system' and kw:
                 text = self._fmt_system(**kw)
             else:
@@ -3377,7 +3540,7 @@ def main():
         sig_name = 'Ctrl+C' if sig == signal.SIGINT else 'SIGTERM'
         trader.stop()
         try:
-            trader._notify(f"⚠️ 系统{sig_name}退出\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n今日交易: {len(trader.trades_today)}笔\n盈亏: ${trader.daily_pnl:+,.2f}")
+            trader._notify(f"⏹️ 系统停止", msg_type='shutdown', reason=sig_name)
         except:
             pass
         sys.exit(0)
