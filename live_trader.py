@@ -1573,13 +1573,9 @@ class QQQLiveTrader:
                                     print(f"  ⚠️ 取消订单失败: {cancel_err}")
                                     self._log_order(order_id, opt_symbol, sig['dir'], contracts, 'cancel_failed')
                                 self._notify(
-                                    f"❌ 订单超时取消\n"
-                                    f"期权: {opt_symbol}\n"
-                                    f"原因: {max_retries}次重试后仍未成交"
+                                    f"⏰ 订单超时取消 {opt_symbol}",
+                                    'system', event_type='cancel', symbol=opt_symbol,
                                 )
-                                return
-                    else:
-                        print(f"  ⚠️ 未找到订单: {order_id} (尝试 {attempt + 1}/{max_retries})")
                         if attempt == max_retries - 1:
                             print(f"  ❌ 无法查询订单状态，放弃交易")
                             self._log_order(order_id, opt_symbol, sig['dir'], contracts, 'query_failed')
@@ -1658,12 +1654,14 @@ class QQQLiveTrader:
 
             self._save_state()
             self._notify(
-                f"🎯 {'做多' if sig['dir']=='call' else '做空'} {opt_symbol}\n"
-                f"正股入场: ${float(price):.2f}\n"
-                f"期权入场: ${self.position.get('entry_opt_price', 0):.2f}\n"
-                f"张数: {contracts}张 ({qty}股)\n"
-                f"原因: {sig['reason']}\n"
-                f"状态: ✅已成交"
+                f"🎯 开仓 {opt_symbol}",
+                'entry',
+                sig=sig,
+                opt_symbol=opt_symbol,
+                price=float(price),
+                contracts=int(contracts),
+                qty=int(qty),
+                order_id=order_id,
             )
 
             # ===== 同步验证长桥持仓 =====
@@ -2110,10 +2108,16 @@ class QQQLiveTrader:
             print(f"  {'='*50}\n")
 
             self._notify(
-                f"✂️ 部分平仓: {reason}\n"
-                f"期权: {pos['opt_symbol']}\n"
-                f"平仓: {half}张 | 剩余: {pos['contracts']}张\n"
-                f"本次盈亏: {pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
+                f"✂️ 部分平仓 {pos['opt_symbol']}",
+                'partial',
+                pos=pos,
+                reason=reason,
+                entry_opt=entry_opt,
+                exit_opt=exit_opt,
+                half=int(half),
+                remaining=int(pos['contracts']),
+                pnl_pct=pnl_pct,
+                pnl_usd=pnl_usd,
             )
 
             self._save_state()
@@ -2289,10 +2293,15 @@ class QQQLiveTrader:
             print(f"  {'='*50}\n")
 
             self._notify(
-                f"🏁 平仓: {reason}\n"
-                f"期权: {pos['opt_symbol']}\n"
-                f"{entry_opt:.2f} → {exit_opt:.2f}\n"
-                f"{'盈利' if pnl_pct>0 else '亏损'}: {pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
+                f"🏁 平仓 {pos['opt_symbol']}",
+                'exit',
+                pos=pos,
+                reason=reason,
+                entry_opt=entry_opt,
+                exit_opt=exit_opt,
+                pnl_pct=pnl_pct,
+                pnl_usd=pnl_usd,
+                order_id=order_id,
             )
 
             closed_symbol = pos.get('opt_symbol')
@@ -2396,8 +2405,103 @@ class QQQLiveTrader:
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f'[{datetime.now():%H:%M}] {msg}\n')
 
-    def _notify_telegram(self, msg):
-        """Telegram通知 - 发送消息到用户"""
+    def _fmt_entry(self, sig, opt_symbol, price, contracts, qty, order_id):
+        """格式化开仓通知"""
+        dir_emoji = '🟢' if sig['dir'] == 'call' else '🔴'
+        dir_text = '做多 CALL' if sig['dir'] == 'call' else '做空 PUT'
+        regime = sig.get('regime', '--')
+        reason = sig.get('reason', '--')
+        entry_opt = self.position.get('entry_opt_price', 0) if self.position else 0
+        return (
+            f"<b>🎯 开仓</b>\n"
+            f"───────────\n"
+            f"{dir_emoji} <b>{dir_text}</b>\n"
+            f"<code>{opt_symbol}</code>\n"
+            f"───────────\n"
+            f"正股 <b>${price:.2f}</b> | 期权 <b>${entry_opt:.2f}</b>\n"
+            f"数量 <b>{contracts}</b>张 ({qty}股)\n"
+            f"市场 <b>{regime}</b>\n"
+            f"理由 {reason}\n"
+            f"订单 {order_id}"
+        )
+
+    def _fmt_exit(self, pos, reason, entry_opt, exit_opt, pnl_pct, pnl_usd, order_id='--'):
+        """格式化平仓通知"""
+        emoji = '✅' if pnl_pct > 0 else '❌'
+        dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
+        dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
+        label = '盈利' if pnl_pct > 0 else '亏损'
+        return (
+            f"<b>🏁 平仓</b>\n"
+            f"───────────\n"
+            f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
+            f"原因 <b>{reason}</b>\n"
+            f"───────────\n"
+            f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
+            f"{emoji} {label} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
+            f"订单 {order_id}"
+        )
+
+    def _fmt_partial(self, pos, reason, entry_opt, exit_opt, half, remaining, pnl_pct, pnl_usd):
+        """格式化部分平仓通知"""
+        emoji = '✅' if pnl_pct > 0 else '❌'
+        dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
+        dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
+        return (
+            f"<b>✂️ 部分平仓</b>\n"
+            f"───────────\n"
+            f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
+            f"原因 <b>{reason}</b>\n"
+            f"───────────\n"
+            f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
+            f"{emoji} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
+            f"平掉 <b>{half}</b>张 | 剩余 <b>{remaining}</b>张"
+        )
+
+    def _fmt_alert(self, level, loss_pct, threshold):
+        """格式化熔断/警告通知"""
+        icons = {1: '⚠️', 2: '🔶', 3: '🔴'}
+        labels = {1: '警告', 2: '保守', 3: '熔断'}
+        icon = icons.get(level, '⚠️')
+        desc = ''
+        if level >= 1: desc += ' 仓位减半'
+        if level >= 2: desc += ' | 只做trending'
+        if level >= 3: desc += ' | 停止所有交易'
+        return (
+            f"<b>{icon} 亏损{labels.get(level,'通知')}</b>\n"
+            f"───────────\n"
+            f"当前亏损 <b>{loss_pct:.1f}%</b> (阈值 {threshold:.0f}%)\n"
+            f"{desc}"
+        )
+
+    def _fmt_system(self, event_type, **kw):
+        """格式化系统事件"""
+        if event_type == 'exit':
+            return (
+                f"<b>⚠️ 系统退出</b>\n"
+                f"───────────\n"
+                f"原因 <b>{kw.get('sig_name','')}</b>\n"
+                f"时间 {kw.get('time','')}\n"
+                f"今日交易 <b>{kw.get('trades',0)}</b>笔\n"
+                f"盈亏 <b>{kw.get('pnl',0):+,.2f}</b>"
+            )
+        elif event_type == 'crash':
+            return (
+                f"<b>❌ 系统异常</b>\n"
+                f"───────────\n"
+                f"时间 {kw.get('time','')}\n"
+                f"错误 <code>{kw.get('error','')}</code>"
+            )
+        elif event_type == 'cancel':
+            return (
+                f"<b>⏰ 订单超时取消</b>\n"
+                f"───────────\n"
+                f"期权 <code>{kw.get('symbol','')}</code>"
+            )
+        return ''
+
+    def _notify_telegram(self, msg, msg_type='info', **kw):
+        """Telegram通知 - 支持HTML格式的消息"""
         try:
             import requests
             tg_cfg = self.cfg.get('telegram', {})
@@ -2411,10 +2515,34 @@ class QQQLiveTrader:
                     f.write(f'[{datetime.now():%H:%M}] {msg}\n')
                 return
 
-            text = f"[QQQ Trader]\n{msg}"
+            # 根据消息类型生成格式化文本
+            if msg_type == 'entry' and kw:
+                text = self._fmt_entry(**kw)
+            elif msg_type == 'exit' and kw:
+                text = self._fmt_exit(**kw)
+            elif msg_type == 'partial' and kw:
+                text = self._fmt_partial(**kw)
+            elif msg_type == 'alert' and kw:
+                text = self._fmt_alert(**kw)
+            elif msg_type == 'system' and kw:
+                text = self._fmt_system(**kw)
+            else:
+                # 通用格式：用分隔线和HTML加粗标题
+                lines = msg.split('\n')
+                first = lines[0] if lines else msg
+                rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
+                if 'cancel' in first.lower():
+                    text = f"<b>{first}</b>\n───────────\n{rest}"
+                else:
+                    text = f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
+
+            # 添加页脚
+            footer = f"\n───────────\n<code>QQQ 0DTE v6.5</code>"
+            full_text = text + footer
+
             resp = requests.post(
                 f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                json={'chat_id': chat_id, 'text': text},
+                json={'chat_id': chat_id, 'text': full_text, 'parse_mode': 'HTML'},
                 timeout=10
             )
             result = resp.json()
@@ -2422,6 +2550,13 @@ class QQQLiveTrader:
                 print(f"  ✅ Telegram推送成功")
             else:
                 print(f"  ⚠️ Telegram推送失败: {result}")
+                # 如果HTML解析失败，回退纯文本
+                if 'can\'t parse' in str(result):
+                    resp2 = requests.post(
+                        f'https://api.telegram.org/bot{bot_token}/sendMessage',
+                        json={'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
+                        timeout=10
+                    )
         except Exception as e:
             import traceback
             print(f"  ⚠️ Telegram通知异常: {e}")
@@ -2431,14 +2566,14 @@ class QQQLiveTrader:
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f'[{datetime.now():%H:%M}] {msg}\n')
 
-    def _notify(self, msg):
+    def _notify(self, msg, msg_type='info', **kw):
         """统一通知 - 同时发送飞书和Telegram"""
         tg_cfg = self.cfg.get('telegram', {})
-        print(f"  📨 Telegram配置: enabled={tg_cfg.get('enabled')}, bot_token={'已配置' if tg_cfg.get('bot_token') else '未配置'}")
+        print(f"  📨 Telegram推送: enabled={tg_cfg.get('enabled')}, type={msg_type}")
         if self.cfg.get('feishu', {}).get('enabled', True):
             self._notify_feishu(msg)
         if tg_cfg.get('enabled', False):
-            self._notify_telegram(msg)
+            self._notify_telegram(msg, msg_type=msg_type, **kw)
 
     def _sync_gist(self):
         """实时同步交易记录到Gist（供小程序读取）"""
