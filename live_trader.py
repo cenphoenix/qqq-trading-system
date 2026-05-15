@@ -104,7 +104,7 @@ def _maybe_reload_config():
         new_cfg = _load_config()
         CONFIG.clear()
         CONFIG.update(new_cfg)
-        print(f"⚙️ 配置已热重载 ({datetime.now().strftime('%H:%M:%S')})")
+        print(f"⚙️ 配置已热重载 ({datetime.now(TZ_ET).strftime('%H:%M:%S ET')})")
         return True
     except Exception as e:
         print(f"[Config] 热重载失败: {e}")
@@ -146,7 +146,7 @@ class QQQLiveTrader:
         self._big_loss_dir = None    # 大亏冷却的方向
         self.current_price = 0       # 当前正股价格
         self.actual_capital = self.cfg['capital']  # 实际资金（_execute_trade中更新）
-        self.start_time = datetime.now()  # 启动时间，用于计算运行时间
+        self.start_time = datetime.now(TZ_ET)  # 启动时间（美东），用于计算运行时间
         self.account_info = {}  # 账户资金信息
         self.yesterday_pnl = 0.0   # 昨日盈亏（启动时加载）
         self.yesterday_trades = 0  # 昨日交易笔数
@@ -245,7 +245,7 @@ class QQQLiveTrader:
 
     def _add_event(self, msg, tag='info'):
         """添加实时事件（写入state.json供仪表盘显示）"""
-        ts = datetime.now().strftime('%H:%M:%S')
+        ts = datetime.now(TZ_ET).strftime('%H:%M:%S')
         self.events.append({'time': ts, 'msg': msg, 'tag': tag})
         if len(self.events) > 100:
             self.events = self.events[-100:]
@@ -270,7 +270,7 @@ class QQQLiveTrader:
         """保存状态到state.json（供trader_web.py读取）"""
         try:
             import json
-            uptime = int((datetime.now() - self.start_time).total_seconds())
+            uptime = int((datetime.now(TZ_ET) - self.start_time).total_seconds())
             hours, remainder = divmod(uptime, 3600)
             minutes, seconds = divmod(remainder, 60)
             uptime_str = f"{hours}h {minutes}m {seconds}s"
@@ -287,7 +287,7 @@ class QQQLiveTrader:
                 'session_high': self.session_high,
                 'session_low': self.session_low if self.session_low < 999999 else 0,
                 'candle_count': len(self.one_min_candles),
-                'updated': datetime.now().strftime('%H:%M:%S'),
+                'updated': datetime.now(TZ_ET).strftime('%H:%M:%S'),
                 'events': self.events[-30:],  # 最近30条事件
                 # 运行时间
                 'uptime': uptime_str,
@@ -581,7 +581,7 @@ class QQQLiveTrader:
                                             'tp_pct': self.cfg['tp'],
                                             'contracts': qty,
                                             'quantity': qty * self.cfg['contract_multiplier'],
-                                            'entry_time': datetime.now(),
+                                            'entry_time': datetime.now(TZ_ET),
                                             'entry_bar': len(self.one_min_candles),
                                             'reason': '重启恢复持仓',
                                             'max_pnl_pct': 0,
@@ -612,7 +612,7 @@ class QQQLiveTrader:
                 if hasattr(ts, 'astimezone'):
                     et = ts.astimezone(TZ_ET)
                 else:
-                    et = datetime.now().astimezone(TZ_ET)
+                    et = datetime.now(TZ_ET).astimezone(TZ_ET)
                 cur_min = et.hour * 60 + et.minute
                 print(f"  🔍 回放信号检测（美东{et.strftime('%H:%M')}）...")
                 
@@ -665,7 +665,7 @@ class QQQLiveTrader:
                             'entry_opt_price': cost,          # 期权成本价（显式）
                             'opt_symbol': symbol,
                             # 设为当前时间，防止被误判超时直接平仓
-                            'entry_time': datetime.now(),
+                            'entry_time': datetime.now(TZ_ET),
                             'stock_peak': 0,       # 等待报价更新
                             'stock_valley': 0,
                             'half_closed': False,  # 假设未半仓
@@ -678,8 +678,8 @@ class QQQLiveTrader:
 
                         # 同步到交易记录（防止 Web 端数据丢失）
                         self.trades_today.append({
-                            'time': datetime.now().strftime('%H:%M:%S'),
-                            'entry_time': datetime.now(),
+                            'time': datetime.now(TZ_ET).strftime('%H:%M:%S'),
+                            'entry_time': datetime.now(TZ_ET),
                             'dir': direction,
                             'contracts': qty,
                             'entry_price': cost,
@@ -812,10 +812,10 @@ class QQQLiveTrader:
         if not self.running:
             return
 
-        now = datetime.now()
+        now = datetime.now(TZ_ET)
 
         # 日初重置（检测新交易日，用美东时间）
-        today_str = now.astimezone(TZ_ET).strftime('%Y-%m-%d')
+        today_str = now.strftime('%Y-%m-%d')
         if self.current_date != today_str:
             if self.current_date is not None:
                 print(f"\n📅 新交易日: {today_str} | 重置日内状态")
@@ -907,7 +907,7 @@ class QQQLiveTrader:
         d = "🟢" if one_min['dir'] > 0 else "🔴"
         sma = np.mean(self.close_history[-20:]) if len(self.close_history) >= 20 else 0
         sma_str = f" SMA20:{sma:.2f}" if sma > 0 else ""
-        print(f"  {d} 1min {now.strftime('%H:%M')} "
+        print(f"  {d} 1min {now.astimezone(TZ_ET).strftime('%H:%M ET')} "
               f"O:{one_min['open']:.2f} H:{one_min['high']:.2f} "
               f"L:{one_min['low']:.2f} C:{one_min['close']:.2f} "
               f"Vol:{one_min['volume']:,}{sma_str}")
@@ -939,10 +939,10 @@ class QQQLiveTrader:
             return
         # v6.3: 取消每日交易次数限制
 
-        now = datetime.now()
+        now = datetime.now(TZ_ET)
 
-        # 时间转换：HKT → ET
-        et_now = now.astimezone(TZ_ET)
+        # 时间转换：直接使用美东时间
+        et_now = now
         cur_min_et = et_now.hour * 60 + et_now.minute
 
         # 检查时间窗口
@@ -1644,7 +1644,7 @@ class QQQLiveTrader:
                 'tp_pct': self.cfg['tp'],           # 止盈百分比（旧逻辑保留）
                 'contracts': contracts,             # 张数
                 'quantity': qty,                    # 总股数
-                'entry_time': datetime.now(),
+                'entry_time': datetime.now(TZ_ET),
                 'entry_bar': len(self.one_min_candles),
                 'reason': sig['reason'],
                 'max_pnl_pct': 0,
@@ -1718,10 +1718,10 @@ class QQQLiveTrader:
         try:
             log_dir = os.path.join(_app_dir(), 'logs')
             os.makedirs(log_dir, exist_ok=True)
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
             log_file = os.path.join(log_dir, f'orders_{today}.log')
             
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            timestamp = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
             log_entry = f"{timestamp} | {order_id} | {opt_symbol} | {direction} | {contracts}张 | {status}"
             if executed_qty > 0:
                 log_entry += f" | 成交:{executed_qty}张 @{executed_price}"
@@ -1819,7 +1819,7 @@ class QQQLiveTrader:
                             'tp_pct': self.cfg['tp'],
                             'contracts': qty,
                             'quantity': qty * self.cfg['contract_multiplier'],
-                            'entry_time': datetime.now(),
+                'entry_time': datetime.now(TZ_ET),
                             'entry_bar': len(self.one_min_candles),
                             'reason': '长桥持仓同步',
                             'max_pnl_pct': pnl_pct,
@@ -2307,7 +2307,7 @@ class QQQLiveTrader:
             # 标记盈亏
             pos['win'] = pnl_pct > 0
             pos['exit_opt_price'] = exit_opt
-            pos['exit_time'] = datetime.now()
+            pos['exit_time'] = datetime.now(TZ_ET)
             pos['pnl_pct'] = pnl_pct
             pos['pnl_usd'] = pnl_usd
             pos['exit_reason'] = reason
@@ -2431,7 +2431,7 @@ class QQQLiveTrader:
                 log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, 'a', encoding='utf-8') as f:
-                    f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+                    f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
                 return
 
             # 获取 token
@@ -2471,7 +2471,7 @@ class QQQLiveTrader:
             log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+                f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
 
     def _fmt_entry(self, sig, opt_symbol, price, contracts, qty, order_id):
         """格式化开仓通知"""
@@ -2597,7 +2597,7 @@ class QQQLiveTrader:
 
     def _fmt_shutdown(self, reason='未知'):
         """格式化停止通知"""
-        runtime = datetime.now() - self.start_time
+        runtime = datetime.now(TZ_ET) - self.start_time
         hours = int(runtime.total_seconds() // 3600)
         mins = int((runtime.total_seconds() % 3600) // 60)
         total = len(self.trades_today)
@@ -2672,7 +2672,7 @@ class QQQLiveTrader:
                 log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, 'a', encoding='utf-8') as f:
-                    f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+                    f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
                 return
 
             # 根据消息类型生成格式化文本
@@ -2730,7 +2730,7 @@ class QQQLiveTrader:
             log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(f'[{datetime.now():%H:%M}] {msg}\n')
+                f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
 
     def _notify(self, msg, msg_type='info', **kw):
         """统一通知 - 同时发送飞书和Telegram"""
@@ -2940,7 +2940,7 @@ class QQQLiveTrader:
                     'total': len(orders),
                     'buy_count': sum(1 for o in orders if o['side'] == '买入'),
                     'sell_count': sum(1 for o in orders if o['side'] == '卖出'),
-                    'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
             os.replace(tmp_path, filepath)  # 原子替换
             
@@ -2970,7 +2970,6 @@ class QQQLiveTrader:
         from zoneinfo import ZoneInfo
         TZ_ET = ZoneInfo("America/New_York")
         today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-        today_bj = datetime.now().strftime('%Y-%m-%d')
 
         script_dir = str(_app_dir())
         records_dir = os.path.join(script_dir, 'records')
@@ -2978,12 +2977,11 @@ class QQQLiveTrader:
             print("📥 无 records/ 目录，跳过恢复")
             return
 
-        # 尝试加载今天的 ET 文件和北京文件（0DTE 用 ET 日期更准确，但我们的 records 用 BJ 日期）
-        # 实际记录是用北京时间命名（见 _save_records_snapshot）
-        record_file = os.path.join(records_dir, f'{today_bj}.json')
+        # 记录文件统一用美东时间命名
+        record_file = os.path.join(records_dir, f'{today_et}.json')
 
         if not os.path.exists(record_file):
-            print(f"📥 今日({today_bj}) 无交易记录文件，跳过恢复")
+            print(f"📥 今日({today_et}) 无交易记录文件，跳过恢复")
             return
 
         try:
@@ -3001,14 +2999,16 @@ class QQQLiveTrader:
                 exit_time_str = t.get('exit_time', entry_time_str)
                 try:
                     entry_time = datetime.strptime(entry_time_str, '%H:%M:%S').replace(
-                        year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
+                        year=datetime.now(TZ_ET).year, month=datetime.now(TZ_ET).month, day=datetime.now(TZ_ET).day,
+                        tzinfo=TZ_ET
                     )
                     exit_time = datetime.strptime(exit_time_str, '%H:%M:%S').replace(
-                        year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
+                        year=datetime.now(TZ_ET).year, month=datetime.now(TZ_ET).month, day=datetime.now(TZ_ET).day,
+                        tzinfo=TZ_ET
                     )
                 except Exception:
-                    entry_time = datetime.now()
-                    exit_time = datetime.now()
+                    entry_time = datetime.now(TZ_ET)
+                    exit_time = datetime.now(TZ_ET)
 
                 restored = {
                     'time': entry_time_str,  # web 用的 time 字段
@@ -3262,7 +3262,6 @@ class QQQLiveTrader:
 
         # 获取美东时间的今天日期
         today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-        beijing_now = datetime.now()
 
         reconciled = []
         for sym in sorted(symbol_data.keys()):
@@ -3353,11 +3352,11 @@ class QQQLiveTrader:
             return
 
         try:
-            today_bj = datetime.now().strftime('%Y-%m-%d')
+            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
             script_dir = str(_app_dir())
             records_dir = os.path.join(script_dir, 'records')
             os.makedirs(records_dir, exist_ok=True)
-            filepath = os.path.join(records_dir, f'{today_bj}.json')
+            filepath = os.path.join(records_dir, f'{today_et}.json')
 
             trades = []
             for t in self.trades_today:
@@ -3413,10 +3412,10 @@ class QQQLiveTrader:
                     'wins': wins,
                     'win_rate': round(wins / len(trades) * 100, 1) if trades else 0,
                     'pnl': round(total_pnl, 2),
-                    'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
             os.replace(tmp_path, filepath)
-            print(f"📋 实时记录已覆盖: {today_bj} ({len(trades)}笔, 胜率{wins}/{len(trades)}, ${total_pnl:+,.2f})")
+            print(f"📋 实时记录已覆盖: {today_et} ({len(trades)}笔, 胜率{wins}/{len(trades)}, ${total_pnl:+,.2f})")
         except Exception as e:
             print(f"  ⚠️ 实时记录保存失败: {e}")
 
@@ -3490,8 +3489,8 @@ class QQQLiveTrader:
             return
 
         try:
-            # 用北京时间作为日期（与历史records文件命名一致）
-            today = datetime.now().strftime('%Y-%m-%d')
+            # 统一用美东时间作为日期
+            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
             script_dir = str(_app_dir())
             records_dir = os.path.join(script_dir, 'records')
             os.makedirs(records_dir, exist_ok=True)
@@ -3556,7 +3555,7 @@ def main():
         trader.start()
     except Exception as e:
         try:
-            trader._notify(f"❌ 系统异常崩溃\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n错误: {e}")
+            trader._notify(f"❌ 系统异常崩溃\n时间: {datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S ET')}\n错误: {e}")
         except:
             pass
         raise
