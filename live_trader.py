@@ -757,7 +757,7 @@ class QQQLiveTrader:
                 if now - last_order_sync >= 60:
                     last_order_sync = now
                     self._sync_longbridge_orders()
-                    self._sync_account_state()
+                    self._sync_account_state(silent=True)
                 
                 time.sleep(self.cfg['check_interval'])  # 20秒检测一次
         except KeyboardInterrupt:
@@ -2466,7 +2466,7 @@ class QQQLiveTrader:
         print(f"  累计盈亏: ${self.daily_pnl:+,.2f}")
         print("=" * 60)
 
-    def _sync_account_state(self):
+    def _sync_account_state(self, silent=False):
         """从长桥实时拉取账户资金和期权持仓，写入 state.json 供 Web 显示"""
         try:
             account_info = {}
@@ -2541,8 +2541,9 @@ class QQQLiveTrader:
                         'buying_power': total_buying_power_usd,
                     }
                     
-                    # 打印日志
-                    print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_cash_usd:,.0f} 购买力=${total_buying_power_usd:,.0f}")
+                    # 打印日志（仅首次启动时）
+                    if not silent:
+                        print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_cash_usd:,.0f} 购买力=${total_buying_power_usd:,.0f}")
                     # 兜底
                     if not currencies_list:
                         for attr in ['total_assets', 'net_assets', 'cash', 'market_value']:
@@ -2553,18 +2554,21 @@ class QQQLiveTrader:
 
                     if account_info:
                         # 修复: account_info 值可能是 float (net_assets/cash) 或 dict (_direct)
-                        summary_parts = []
-                        for k, v in account_info.items():
-                            if isinstance(v, dict):
-                                summary_parts.append(f"{k}=${v.get('net_assets',0):,.0f}")
-                            else:
-                                summary_parts.append(f"{k}=${v:,.0f}")
-                        summary = ', '.join(summary_parts)
-                        print(f"💰 账户资金: {summary}")
+                        if not silent:
+                            summary_parts = []
+                            for k, v in account_info.items():
+                                if isinstance(v, dict):
+                                    summary_parts.append(f"{k}=${v.get('net_assets',0):,.0f}")
+                                else:
+                                    summary_parts.append(f"{k}=${v:,.0f}")
+                            summary = ', '.join(summary_parts)
+                            print(f"💰 账户资金: {summary}")
                     else:
-                        print(f"  ⚠️ account_balance 返回空: {type(balance).__name__} {dir(balance)}")
+                        if not silent:
+                            print(f"  ⚠️ account_balance 返回空: {type(balance).__name__} {dir(balance)}")
             except Exception as e:
-                print(f"  ⚠️ 拉取账户资金失败: {e}")
+                if not silent:
+                    print(f"  ⚠️ 拉取账户资金失败: {e}")
 
             # 2. 拉取实际持仓（含期权+正股）
             try:
