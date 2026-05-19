@@ -73,7 +73,9 @@ def _load_config():
             'timeout_stage2_bars': 10, 'timeout_stage2_min': 0.60, 'timeout_stage3_bars': 15,
             'option_offset': 2.0, 'order_pct': 8, 'contract_multiplier': 100,
             'pos_pct': 8, 'max_trades': 999, 'daily_limit': 25,
-            'start_time': '09:40', 'end_time': '14:00',
+            'start_time': '09:40', 'end_time': '14:30',
+            'extended_end_time': '15:00',
+            'extension_order_pct': 5,
             'trail_activate': 0.10, 'trail_drop': 0.05,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -968,9 +970,10 @@ class QQQLiveTrader:
         et_now = now
         cur_min_et = et_now.hour * 60 + et_now.minute
 
-        # 检查时间窗口
+        # 检查时间窗口（动态：盈利守护/亏损反攻）
         s_h, s_m = map(int, self.cfg['start_time'].split(':'))
-        e_h, e_m = map(int, self.cfg['end_time'].split(':'))
+        dyn_end = self._effective_end_time()
+        e_h, e_m = map(int, dyn_end.split(':'))
         if not (s_h*60+s_m <= cur_min_et <= e_h*60+e_m):
             return
 
@@ -1031,9 +1034,10 @@ class QQQLiveTrader:
 
     def _check_breakout(self, bar, cur_min):
         """v6.3 动态过滤突破信号（根据市场状态自适应）"""
-        # 时间窗口
+        # 时间窗口（动态：盈利守护/亏损反攻）
         s_h, s_m = map(int, self.cfg['start_time'].split(':'))
-        e_h, e_m = map(int, self.cfg['end_time'].split(':'))
+        dyn_end = self._effective_end_time()
+        e_h, e_m = map(int, dyn_end.split(':'))
         if not (s_h*60+s_m <= cur_min <= e_h*60+e_m):
             return
         if self.position:
@@ -1269,9 +1273,10 @@ class QQQLiveTrader:
 
     def _check_reversal(self, bar, cur_min_et):
         """衰竭反转信号检测 - 抓超跌反弹/超涨回调"""
-        # 时间窗口
+        # 时间窗口（动态：盈利守护/亏损反攻）
         s_h, s_m = map(int, self.cfg['start_time'].split(':'))
-        e_h, e_m = map(int, self.cfg['end_time'].split(':'))
+        dyn_end = self._effective_end_time()
+        e_h, e_m = map(int, dyn_end.split(':'))
         if not (s_h*60+s_m <= cur_min_et <= e_h*60+e_m):
             return
         if self.position:
@@ -1489,6 +1494,14 @@ class QQQLiveTrader:
         cur_min_et = now_et.hour * 60 + now_et.minute
         time_risk_mult = 1.0
         gamma_warning = False
+
+        # 延长时间窗口(14:30-15:00,仅亏损时)仓位缩减
+        if self._is_extension_window(cur_min_et) and self.daily_pnl <= 0:
+            extension_pct = self.cfg.get('extension_order_pct', 5)
+            normal_pct = self.cfg.get('order_pct', 8)
+            ext_mult = extension_pct / normal_pct
+            time_risk_mult *= ext_mult
+            print(f"  🕐 反攻窗口(14:30-15:00): 仓位缩减({extension_pct}%, {ext_mult:.0%}倍)")
 
         if cur_min_et >= 945:  # 15:45 ET
             gamma_warning = True
@@ -2776,6 +2789,19 @@ class QQQLiveTrader:
             print("  📤 Gist同步完成")
         except Exception as e:
             print(f"  ⚠️ Gist同步失败: {e}")
+
+    def _effective_end_time(self):
+        """根据当日盈亏返回动态交易结束时间"""
+        dyn_end = self.cfg['end_time']
+        if self.daily_pnl <= 0:
+            dyn_end = self.cfg.get('extended_end_time', '15:00')
+        return dyn_end
+
+    def _is_extension_window(self, cur_min):
+        """判断是否在延长时间窗口内(14:30-15:00)"""
+        e_h, e_m = map(int, self.cfg['end_time'].split(':'))
+        ee_h, ee_m = map(int, self.cfg.get('extended_end_time', '15:00').split(':'))
+        return e_h * 60 + e_m <= cur_min < ee_h * 60 + ee_m
 
     def _print_summary(self):
         """打印今日总结"""
