@@ -1246,6 +1246,7 @@ class QQQLiveTrader:
         sig['reason'] += f" [{', '.join(filters_passed)}]"
 
         self.daily_signals += 1
+        self.current_signal = sig
         self._add_event(f"🎯 {direction}突破@${entry_price:.2f} | {filters_str}", "signal")
         self._execute_trade(sig)
 
@@ -1302,6 +1303,7 @@ class QQQLiveTrader:
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做多! 从高点跌{drop_from_high*100:.1f}%")
+                    self.current_signal = sig
                     self._add_event(f"🔄 衰竭反转做多! 跌{drop_from_high*100:.1f}%", "signal")
                     self._execute_trade(sig)
                     return
@@ -1329,6 +1331,7 @@ class QQQLiveTrader:
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做空! 从低点涨{rise_from_low*100:.1f}%")
+                    self.current_signal = sig
                     self._add_event(f"🔄 衰竭反转做空! 涨{rise_from_low*100:.1f}%", "signal")
                     self._execute_trade(sig)
 
@@ -1673,7 +1676,7 @@ class QQQLiveTrader:
             self._subscribe_position_quote(opt_symbol)
             self.trades_today.append(self.position.copy())
             self._add_event(f"📈 开仓: {opt_symbol} x{contracts}张 @${executed_price:.2f}", "trade")
-
+            self.current_signal = None  # 已开仓，清除信号
             # 如果入场价未获取，尝试获取
             if self.position['entry_opt_price'] is None:
                 time.sleep(1)
@@ -2486,11 +2489,12 @@ class QQQLiveTrader:
         regime = sig.get('regime', '--')
         reason = sig.get('reason', '--')
         entry_opt = self.position.get('entry_opt_price', 0) if self.position else 0
-        total = len(self.trades_today)
-        wins = sum(1 for t in self.trades_today if t.get('win'))
+        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
+        total = len(closed_trades)
+        wins = sum(1 for t in closed_trades if t.get('win'))
         wr = wins/total*100 if total > 0 else 0
         return (
-            f"<b>🎯 开仓 #{total+1}</b>\n"
+            f"<b>🎯 开仓 #{len(self.trades_today)}</b>\n"
             f"───────────\n"
             f"{dir_emoji} <b>{dir_text}</b>\n"
             f"<code>{opt_symbol}</code>\n"
@@ -2512,11 +2516,12 @@ class QQQLiveTrader:
         dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
         dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
         label = '盈利' if pnl_pct > 0 else '亏损'
-        total = len(self.trades_today)
-        wins = sum(1 for t in self.trades_today if t.get('win'))
+        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
+        total = len(closed_trades)
+        wins = sum(1 for t in closed_trades if t.get('win'))
         wr = wins/total*100 if total > 0 else 0
         return (
-            f"<b>🏁 平仓 #{total}</b>\n"
+            f"<b>🏁 平仓 #{len(self.trades_today)}</b>\n"
             f"───────────\n"
             f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
             f"原因 <b>{reason}</b>\n"
@@ -2621,14 +2626,15 @@ class QQQLiveTrader:
 
     def _fmt_daily_summary(self):
         """格式化日终总结通知"""
-        total = len(self.trades_today)
-        wins = sum(1 for t in self.trades_today if t.get('win'))
+        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
+        total = len(closed_trades)
+        wins = sum(1 for t in closed_trades if t.get('win'))
         wr = wins/total*100 if total > 0 else 0
         
-        call_cnt = sum(1 for t in self.trades_today if t.get('dir')=='call')
+        call_cnt = sum(1 for t in closed_trades if t.get('dir')=='call')
         put_cnt = total - call_cnt
-        call_win = sum(1 for t in self.trades_today if t.get('dir')=='call' and t.get('win'))
-        put_win = sum(1 for t in self.trades_today if t.get('dir')=='put' and t.get('win'))
+        call_win = sum(1 for t in closed_trades if t.get('dir')=='call' and t.get('win'))
+        put_win = sum(1 for t in closed_trades if t.get('dir')=='put' and t.get('win'))
         call_wr = call_win/call_cnt*100 if call_cnt > 0 else 0
         put_wr = put_win/put_cnt*100 if put_cnt > 0 else 0
         
@@ -2656,8 +2662,9 @@ class QQQLiveTrader:
 
     def _get_today_stats_html(self):
         """获取今日统计HTML片段（用于开仓/平仓通知底部）"""
-        total = len(self.trades_today)
-        wins = sum(1 for t in self.trades_today if t.get('win'))
+        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
+        total = len(closed_trades)
+        wins = sum(1 for t in closed_trades if t.get('win'))
         wr = wins/total*100 if total > 0 else 0
         
         return (
