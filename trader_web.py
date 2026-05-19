@@ -131,7 +131,9 @@ class StateReader:
                 time_part = raw_time.split('T')[1].split('.')[0] if '.' in raw_time.split('T')[-1] else raw_time.split('T')[-1]
                 time_str = time_part[:8]
             else:
-                time_str = raw_time[:8] if len(str(raw_time)) >= 8 else str(raw_time)
+                # 日期字符串 YYYY-MM-DD 直接显示，时间字符串 HH:MM:SS 截取前8位
+                raw = str(raw_time)
+                time_str = raw if '-' in raw else (raw[:8] if len(raw) >= 8 else raw)
 
             trades.append({
                 'id': len(trades) + 1,

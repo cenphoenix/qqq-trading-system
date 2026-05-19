@@ -710,7 +710,7 @@ class QQQLiveTrader:
     def start(self):
         """启动交易系统"""
         self.running = True
-        print(f"🚀 QQQ 0DTE v6.3 动态过滤策略启动")
+        print(f"🚀 QQQ 0DTE v6.5 动态过滤策略启动")
         print(f"📊 市场状态自适应: 趋势(顺势)/中性(标准)/震荡(快进快出)")
         print(f"💰 资金: 实时查询 | 下单: {self.cfg['order_pct']}%资金/笔")
         print(f"📈 标的: {self.cfg['symbol']}")
@@ -761,6 +761,23 @@ class QQQLiveTrader:
 
         # 📥 恢复今日已平仓交易记录（从 records/ 文件，避免重启后数据丢失）
         self._load_today_records()
+
+        # 📊 加载昨日交易记录（用于启动通知）
+        try:
+            from zoneinfo import ZoneInfo
+            TZ_ET = ZoneInfo("America/New_York")
+            yesterday_et = (datetime.now(TZ_ET) - timedelta(days=1)).strftime('%Y-%m-%d')
+            y_file = os.path.join(_app_dir(), 'records', f'{yesterday_et}.json')
+            if os.path.exists(y_file):
+                with open(y_file, encoding='utf-8') as f:
+                    y_data = json.load(f)
+                self.yesterday_pnl = float(y_data.get('pnl', 0))
+                self.yesterday_trades = int(y_data.get('total', 0))
+                wins = int(y_data.get('wins', 0))
+                total = self.yesterday_trades
+                self.yesterday_wr = round(wins / total * 100, 1) if total > 0 else 0.0
+        except Exception as e:
+            print(f"  ⚠️ 加载昨日记录失败: {e}")
 
         # 启动立即同步一次长桥订单（覆盖为今天的）
         try:
@@ -1433,8 +1450,8 @@ class QQQLiveTrader:
             
             self.account_info = {
                 'equity': equity,           # 已转 USD
-                'cash': cash_usd,            # 统一转 USD
-                'buying_power': buying_power if buying_power > 0 else capital  # 已转 USD
+                'cash': buying_power,       # 实际可用现金
+                'buying_power': cash_usd,   # 总购买力（含杠杆）
             }
         except Exception as e:
             print(f"  ⚠️ 获取余额失败: {e}，使用默认资金: ${self.cfg['capital']:,}")
@@ -2601,9 +2618,7 @@ class QQQLiveTrader:
             f"版本 <code>v6.5 Regime-Adaptive</code>\n"
             f"时间 <code>{datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M ET')}</code>\n"
             f"账户 <b>${self.actual_capital:,.2f}</b>\n"
-            f"昨日盈亏 <b>${self.yesterday_pnl:+,.2f}</b> ({self.yesterday_trades}笔, 胜率{self.yesterday_wr:.0f}%)\n"
-            f"───────────\n"
-            f"<code>QQQ 0DTE v6.5</code>"
+            f"昨日盈亏 <b>${self.yesterday_pnl:+,.2f}</b> ({self.yesterday_trades}笔, 胜率{self.yesterday_wr:.0f}%)"
         )
 
     def _fmt_shutdown(self, reason='未知'):
@@ -2619,9 +2634,7 @@ class QQQLiveTrader:
             f"原因 <b>{reason}</b>\n"
             f"运行时长 <b>{hours}h {mins}m</b>\n"
             f"今日交易 <b>{total}</b>笔 | 盈利<b>{wins}</b> | 亏损<b>{total-wins}</b>\n"
-            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>\n"
-            f"───────────\n"
-            f"<code>QQQ 0DTE v6.5</code>"
+            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>"
         )
 
     def _fmt_daily_summary(self):
@@ -2655,9 +2668,7 @@ class QQQLiveTrader:
             f"───────────\n"
             f"单笔最佳\n"
             f"✅ 最大盈利 <b>+${self.largest_win_usd:,.2f}</b> ({self.largest_win_pct:+.1f}%)\n"
-            f"❌ 最大亏损 <b>-${abs(self.largest_loss_usd):,.2f}</b> ({self.largest_loss_pct:+.1f}%)\n"
-            f"───────────\n"
-            f"<code>QQQ 0DTE v6.5</code>"
+            f"❌ 最大亏损 <b>-${abs(self.largest_loss_usd):,.2f}</b> ({self.largest_loss_pct:+.1f}%)"
         )
 
     def _get_today_stats_html(self):
@@ -2847,13 +2858,13 @@ class QQQLiveTrader:
                     # 保存合并后的扁平结构（Web 用）
                     account_info = {
                         'net_assets': total_net_assets_usd,
-                        'cash': total_cash_usd,
-                        'buying_power': total_buying_power_usd,
+                        'cash': total_buying_power_usd,
+                        'buying_power': total_cash_usd,
                     }
                     
                     # 打印日志（仅首次启动时）
                     if not silent:
-                        print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_cash_usd:,.0f} 购买力=${total_buying_power_usd:,.0f}")
+                        print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_buying_power_usd:,.0f} 购买力=${total_cash_usd:,.0f}")
                     # 兜底
                     if not currencies_list:
                         for attr in ['total_assets', 'net_assets', 'cash', 'market_value']:
@@ -2863,6 +2874,9 @@ class QQQLiveTrader:
                                 account_info['_direct'][attr] = float(val or 0)
 
                     if account_info:
+                        # 更新实际资金（用于通知/风控计算）
+                        if total_net_assets_usd > 0:
+                            self.actual_capital = total_net_assets_usd
                         # 修复: account_info 值可能是 float (net_assets/cash) 或 dict (_direct)
                         if not silent:
                             summary_parts = []

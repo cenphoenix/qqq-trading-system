@@ -63,8 +63,8 @@ def load_account_info():
 
         return {
             'total_assets': round(total_assets, 2),
-            'cash': round(total_cash, 2),
-            'buy_power': round(buy_power, 2),
+            'cash': round(buy_power, 2),
+            'buy_power': round(total_cash, 2),
         }
     except Exception as e:
         print(f"  ⚠️ 获取账户信息失败: {e}")
