@@ -3020,6 +3020,12 @@ class QQQLiveTrader:
                 print(f"📥 今日记录文件存在但无交易，跳过恢复")
                 return
 
+            # 过滤：只加载 date 字段匹配今天的交易（防止跨天错误写入）
+            trades = [t for t in trades if t.get('date', today_et) == today_et]
+            if not trades:
+                print(f"📥 今日记录文件中无今日交易，跳过恢复")
+                return
+
             # 恢复 trades_today 和 daily_pnl
             for t in trades:
                 entry_time_str = t.get('entry_time', '00:00:00')
@@ -3510,8 +3516,10 @@ class QQQLiveTrader:
             return
 
         try:
-            # 统一用美东时间作为日期
-            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+            # 从交易数据推断日期（broker对账的用期权到期日，internal的用当前ET）
+            from collections import Counter
+            dates_from_trades = [t.get('date', '') for t in all_trades if t.get('date')]
+            today = Counter(dates_from_trades).most_common(1)[0][0] if dates_from_trades else datetime.now(TZ_ET).strftime('%Y-%m-%d')
             script_dir = str(_app_dir())
             records_dir = os.path.join(script_dir, 'records')
             os.makedirs(records_dir, exist_ok=True)
