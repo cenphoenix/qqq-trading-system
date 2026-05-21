@@ -80,8 +80,6 @@ def main():
 
     load_env()
 
-    notify_telegram("🚀 系统启动")
-
     # 启动Web仪表盘（阻塞）
     web_thread = threading.Thread(target=start_web, daemon=True)
     web_thread.start()

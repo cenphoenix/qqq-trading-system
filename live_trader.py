@@ -142,7 +142,7 @@ class QQQLiveTrader:
         self.put_wins = 0            # PUT方向盈利数
         self.call_pnl = 0.0          # CALL方向累计盈亏
         self.put_pnl = 0.0           # PUT方向累计盈亏
-        self.cooldown_remaining = 0  # 冷却剩余次数
+        self.loss_cooldown_until = None  # 时间戳冷却：下次允许同向交易的时间
         self.last_loss_dir = None    # 最近一次亏损的方向（'call'或'put'），冷却期间允许反向
         self.big_loss_cooldown = 0   # 大亏(>20%)后同方向冷却剩余K线数
         self._big_loss_dir = None    # 大亏冷却的方向
@@ -869,7 +869,7 @@ class QQQLiveTrader:
             self.put_wins = 0
             self.call_pnl = 0.0
             self.put_pnl = 0.0
-            self.cooldown_remaining = 0  # 新交易日重置冷却
+            self.loss_cooldown_until = None  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
@@ -1182,6 +1182,9 @@ class QQQLiveTrader:
         # ===== 预加载滤镜（动态阈值）=====
         pre_ok, pre_filters, bonus_count = self.engine.check_preloaded(sig_dir, regime=regime)
         preloaded_pass = regime_params['preloaded_pass']
+        # P1 #7 下午交易量少，提高滤镜要求
+        if cur_min >= 720:  # 12:00 ET
+            preloaded_pass += 1
         if bonus_count < preloaded_pass:
             fails = [k for k, v in pre_filters.items() if not v.get('ok')]
             print(f"  🔍 {sig_dir}(regime={regime}) 预加载滤镜不足({bonus_count}/{preloaded_pass}): {', '.join(fails)}")
@@ -1210,20 +1213,18 @@ class QQQLiveTrader:
             'all_ok': True,
         }
 
-        # ===== 冷却检查 =====
-        # E. 大亏冷却：每根K线递减
-        if self.big_loss_cooldown > 0:
-            self.big_loss_cooldown -= 1
-            if sig_dir == getattr(self, '_big_loss_dir', None):
-                print(f"  ⏳ 大亏冷却中({sig_dir}方向)，剩余{self.big_loss_cooldown}根K线")
-                return
-        if self.cooldown_remaining > 0 and self.last_loss_dir is not None:
-            self.cooldown_remaining -= 1  # 任何信号都递减冷却（防止无限卡住）
-            if sig_dir == self.last_loss_dir:
-                print(f"  ⏳ 冷却中({self.last_loss_dir}方向)，跳过有效信号，剩余{self.cooldown_remaining}次")
-                return
+        # ===== 冷却检查（时间戳方式）=====
+        if self.loss_cooldown_until is not None:
+            now = datetime.now(TZ_ET)
+            if now < self.loss_cooldown_until:
+                if sig_dir == self.last_loss_dir:
+                    remaining = int((self.loss_cooldown_until - now).total_seconds() / 60)
+                    print(f"  ⏳ 冷却中({self.last_loss_dir}方向)，跳过有效信号，剩余{remaining}分钟")
+                    return
+                else:
+                    print(f"  ⏳ 冷却中但方向相反({sig_dir}≠{self.last_loss_dir})，允许交易，冷却到{self.loss_cooldown_until.strftime('%H:%M')}")
             else:
-                print(f"  ⏳ 冷却中但方向相反({sig_dir}≠{self.last_loss_dir})，允许交易，冷却剩余{self.cooldown_remaining}次")
+                self.loss_cooldown_until = None  # 过期自动清除
 
         # ===== 构建信号（使用regime动态参数）=====
         gap_pct = gap_up if sig_dir == 'call' else gap_dn
@@ -1300,10 +1301,23 @@ class QQQLiveTrader:
         prev = cs[-2] if len(cs) >= 2 else cs[-1]  # 前一根K线（用于确认反弹，不是当前K线）
         entry = bar['close']
 
-        # ===== 超跌反弹（做多） =====
+        # ===== 超跌反弹（做多）=====
         if self.session_high > 0:
             drop_from_high = (self.session_high - entry) / self.session_high
             if drop_from_high >= self.cfg['reversal_drop']:
+                # 开盘1小时内绝对禁止逆势反转信号
+                if cur_min_et < 635:  # 09:35-10:35 ET
+                    return
+                # RSI超卖确认：必须RSI < 20（极端超卖）
+                rsi = self._calc_rsi(self.cfg['rsi_period'])
+                if rsi >= 20:
+                    return
+                # 结构确认：价格必须突破前3根K线的高点
+                if len(cs) < 4:
+                    return
+                high_3 = max(b['high'] for b in cs[-4:-1])
+                if entry <= high_3:
+                    return
                 # 确认反弹：前一根K线收阳 + 实体足够大（用cs[-2]不是bar）
                 bounce_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] >= prev['open'] and bounce_body >= self.cfg['reversal_bounce']:
@@ -1311,17 +1325,21 @@ class QQQLiveTrader:
                     # 量能不限制（地量反弹也是信号）
                     sig = {
                         'dir': 'call',
-                        'reason': f'超跌反弹|从{self.session_high:.2f}跌{drop_from_high*100:.1f}%',
+                        'reason': f'超跌反弹|从{self.session_high:.2f}跌{drop_from_high*100:.1f}% RSI{rsi:.0f}突破{high_3:.2f}',
                         'price': entry,
                         'sl': entry * (1 - self.cfg['sl']),
                         'tp': entry * (1 + self.cfg['tp']),
                     }
-                    # 亏损冷却：任何信号都递减，同向才跳过
-                    if self.cooldown_remaining > 0:
-                        self.cooldown_remaining -= 1
-                        if self.last_loss_dir == 'call':
-                            print(f"  ⏳ 冷却中(call方向)，剩余{self.cooldown_remaining}次，跳过同向信号")
-                            return
+                    # 冷却检查（时间戳方式）
+                    if self.loss_cooldown_until is not None:
+                        now = datetime.now(TZ_ET)
+                        if now < self.loss_cooldown_until:
+                            if self.last_loss_dir == 'call':
+                                remaining = int((self.loss_cooldown_until - now).total_seconds() / 60)
+                                print(f"  ⏳ 冷却中(call方向)，剩余{remaining}分钟，跳过超跌反弹信号")
+                                return
+                        else:
+                            self.loss_cooldown_until = None
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做多! 从高点跌{drop_from_high*100:.1f}%")
@@ -1330,26 +1348,43 @@ class QQQLiveTrader:
                     self._execute_trade(sig)
                     return
 
-        # ===== 超涨回调（做空） =====
+        # ===== 超涨回调（做空）=====
         if self.session_low < 999999:
             rise_from_low = (entry - self.session_low) / self.session_low
             if rise_from_low >= self.cfg['reversal_drop']:
+                # 开盘1小时内绝对禁止逆势反转信号
+                if cur_min_et < 635:
+                    return
+                # RSI超买确认：必须RSI > 80（极端超买）
+                rsi = self._calc_rsi(self.cfg['rsi_period'])
+                if rsi <= 80:
+                    return
+                # 结构确认：价格必须跌破前3根K线的低点
+                if len(cs) < 4:
+                    return
+                low_3 = min(b['low'] for b in cs[-4:-1])
+                if entry >= low_3:
+                    return
                 # 确认回调：前一根K线收阴 + 实体足够大（用cs[-2]不是bar）
                 drop_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] <= prev['open'] and drop_body >= self.cfg['reversal_bounce']:
                     sig = {
                         'dir': 'put',
-                        'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}%',
+                        'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}% RSI{rsi:.0f}跌破{low_3:.2f}',
                         'price': entry,
                         'sl': entry * (1 + self.cfg['sl']),
                         'tp': entry * (1 - self.cfg['tp']),
                     }
-                    # 亏损冷却：任何信号都递减，同向才跳过
-                    if self.cooldown_remaining > 0:
-                        self.cooldown_remaining -= 1
-                        if self.last_loss_dir == 'put':
-                            print(f"  ⏳ 冷却中(put方向)，剩余{self.cooldown_remaining}次，跳过同向信号")
-                            return
+                    # 冷却检查（时间戳方式）
+                    if self.loss_cooldown_until is not None:
+                        now = datetime.now(TZ_ET)
+                        if now < self.loss_cooldown_until:
+                            if self.last_loss_dir == 'put':
+                                remaining = int((self.loss_cooldown_until - now).total_seconds() / 60)
+                                print(f"  ⏳ 冷却中(put方向)，剩余{remaining}分钟，跳过超涨回调信号")
+                                return
+                        else:
+                            self.loss_cooldown_until = None
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做空! 从低点涨{rise_from_low*100:.1f}%")
@@ -1523,8 +1558,20 @@ class QQQLiveTrader:
             pos_mult *= 0.25
             print(f"  🛡️ 保守级熔断生效: 仓位降至25%")
 
-        combined_mult = pos_mult * vol_mult_factor * time_risk_mult
-        order_amount = capital * self.cfg['order_pct'] / 100 * combined_mult
+        # P1 #4 连亏强制降仓（连亏3笔以上仓位降至80%）
+        if self.consecutive_losses >= 3:
+            loss_penalty = 0.8
+            print(f"  🛡 连亏{self.consecutive_losses}笔 → 仓位降至80%")
+        else:
+            loss_penalty = 1.0
+
+        combined_mult = pos_mult * vol_mult_factor * time_risk_mult * loss_penalty
+        # 12:00 ET后降低单笔比例，防下午Gamma风险
+        if cur_min_et >= 720:
+            effective_pct = min(self.cfg['order_pct'], 5.0)
+        else:
+            effective_pct = self.cfg['order_pct']
+        order_amount = capital * effective_pct / 100 * combined_mult
         contracts = max(1, int(order_amount / (opt_price * self.cfg['contract_multiplier'])))
         if gamma_warning:  # 15:45+ 直接禁止
             contracts = 0
@@ -2000,11 +2047,20 @@ class QQQLiveTrader:
 
         # --- 2. 分阶段超时（v6.3: 使用动态timeout_bars）---
         if not ex and not pos['half_closed']:
+            dynamic_timeout = pos.get('timeout_bars', 10)
+
+            # P1 #3 SMA5动量延长超时：盈利+正股未破SMA5 → 放宽到15分钟
+            if pnl_pct > 0 and len(self.close_history) >= 5:
+                sma5 = sum(self.close_history[-5:]) / 5
+                if (pos['dir'] == 'call' and current_stock > sma5) or \
+                   (pos['dir'] == 'put' and current_stock < sma5):
+                    dynamic_timeout = 15
+                    print(f"  🚀 动量未破(SMA5={sma5:.2f}): 超时延长至{dynamic_timeout}分钟")
+
             # Timeout — 放宽：1分钟K线下给足时间让行情发展
             # Stage 1: 前4根K线，不看盈亏，只看止损（让交易有呼吸空间）
             # Stage 2: 7根K线，盈利<5%才超时（不再要求30%）
             # Stage 3: 动态bars，硬超时
-            dynamic_timeout = pos.get('timeout_bars', 10)
             s1_bars = max(dynamic_timeout // 2, 4)    # stage1至少4根
             s2_bars = max(dynamic_timeout * 3 // 4, 7) # stage2至少7根
             s2_min = 5.0  # 盈利≥5%就不超时（从60%大幅下调）
@@ -2159,6 +2215,11 @@ class QQQLiveTrader:
             pnl_pct = (exit_opt - entry_opt) / entry_opt * 100
             pnl_usd = half * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
             self.daily_pnl += pnl_usd
+            # 方向累计盈亏（半仓也要算）
+            if pos['dir'] == 'call':
+                self.call_pnl += pnl_usd
+            else:
+                self.put_pnl += pnl_usd
 
             # 计算整体持仓在平仓时的盈亏（用于设置半仓后的跟踪止损基准）
             try:
@@ -2395,6 +2456,16 @@ class QQQLiveTrader:
             self.position = None  # 成功后才清空
             self._unsubscribe_quotes([closed_symbol])
             
+            # 更新方向累计盈亏（所有单，不分盈亏）
+            if pos['dir'] == 'call':
+                self.call_pnl += pnl_usd
+                if pnl_pct > 0:
+                    self.call_wins += 1
+            else:
+                self.put_pnl += pnl_usd
+                if pnl_pct > 0:
+                    self.put_wins += 1
+
             # 更新连续统计
             if pnl_pct > 0:
                 self.consecutive_wins += 1
@@ -2403,12 +2474,6 @@ class QQQLiveTrader:
                 if pnl_usd > self.largest_win_usd:
                     self.largest_win_usd = pnl_usd
                     self.largest_win_pct = pnl_pct
-                if pos['dir'] == 'call':
-                    self.call_wins += 1
-                    self.call_pnl += pnl_usd
-                else:
-                    self.put_wins += 1
-                    self.put_pnl += pnl_usd
             else:
                 self.consecutive_losses += 1
                 self.consecutive_wins = 0
@@ -2417,29 +2482,26 @@ class QQQLiveTrader:
                     self.largest_loss_usd = pnl_usd
                     self.largest_loss_pct = pnl_pct
 
-            # P1 #10 简化冷却：根据单笔亏损幅度 + 连亏次数
+            # P1 #10 冷却：时间戳方式（替代 tick 计数，防止20s循环烧完冷却）
             if pnl_pct < 0:
                 self.last_loss_dir = pos['dir']
 
                 abs_loss = abs(pnl_pct)
                 cons_limit = self.cfg.get('loss_consecutive_limit', 3)
-                cons_cd = self.cfg.get('loss_consecutive_cooldown', 6) 
 
                 if abs_loss >= 15 or self.consecutive_losses >= cons_limit:
-                    # 大亏(>=15%) 或连亏>=3笔：冷却6次
-                    self.cooldown_remaining = cons_cd
-                    print(f"  ⏳ 亏损{abs_loss:.1f}%，连亏{self.consecutive_losses}次 -> 冷却{self.cooldown_remaining}次({self.last_loss_dir})")
+                    # 大亏(>=15%) 或连亏>=3笔：冷却5分钟
+                    cd_minutes = 5
                 else:
-                    # 小亏：冷却2次
-                    self.cooldown_remaining = 2
-                    print(f"  ⏳ 小亏{abs_loss:.1f}%，冷却2次({self.last_loss_dir})")
+                    # 小亏：冷却2分钟
+                    cd_minutes = 2
+                self.loss_cooldown_until = datetime.now(TZ_ET) + timedelta(minutes=cd_minutes)
+                print(f"  ⏳ 亏损{abs_loss:.1f}%，连亏{self.consecutive_losses}次 -> 冷却{cd_minutes}分钟({self.last_loss_dir}) 到{self.loss_cooldown_until.strftime('%H:%M')}")
 
                 # 半仓后连续亏损：止损收紧
                 if pos['half_closed']:
                     tighten = self.cfg.get('half_close_sl_tighten', 0.15)
                     print(f"  🛡 半仓后亏损，下次止损收紧至{tighten*100:.0f}%")
-
-                # ⏸ 冷却逻辑已暂时移除，等今晚交易数据后再加
 
             # 每次平仓后实时写入 records 文件（独立于 Gist 的安全备份）
             self._save_records_snapshot()
@@ -3094,6 +3156,11 @@ class QQQLiveTrader:
                 }
                 self.trades_today.append(restored)
                 self.daily_pnl += t.get('pnl_usd', 0)
+                # 恢复方向累计盈亏
+                if t.get('dir') == 'call':
+                    self.call_pnl += t.get('pnl_usd', 0)
+                elif t.get('dir') == 'put':
+                    self.put_pnl += t.get('pnl_usd', 0)
 
             wins = sum(1 for t in trades if t.get('result') == 'win')
             total = len(trades)
