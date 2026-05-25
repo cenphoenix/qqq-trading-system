@@ -426,7 +426,7 @@ class FilterEngine:
             return {
                 'regime': 'neutral',
                 'detail': detail,
-                'lookback': 3,
+                'lookback': 8,  # P1 #8 横盘市拉长lookback，减少假突破
                 'pullback': False,
                 'vol_mult': 0.8,
                 'min_body': 0.0003,

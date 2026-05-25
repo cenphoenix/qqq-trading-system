@@ -1040,6 +1040,10 @@ class QQQLiveTrader:
         e_h, e_m = map(int, dyn_end.split(':'))
         if not (s_h*60+s_m <= cur_min <= e_h*60+e_m):
             return
+        # ===== P1 #8 午盘软断路器：12:00-13:00 ET 禁止开新仓 =====
+        # 只禁止新开仓信号，已有持仓的退出逻辑不受影响
+        if 720 <= cur_min < 780:
+            return
         if self.position:
             return
         # 双重检查：查长桥实际持仓
@@ -1066,7 +1070,7 @@ class QQQLiveTrader:
         regime = regime_params['regime']
 
         cs = self.one_min_candles
-        # 动态lookback：趋势市3根，震荡市2根，中性3根
+        # 动态lookback：趋势市3根，震荡市2根，中性市8根
         lb = regime_params['lookback']
         if len(cs) < lb + 1:
             self._update_filters_current(bar)
@@ -1092,6 +1096,19 @@ class QQQLiveTrader:
 
         if not sig_dir:
             return
+
+        # ===== P1 #8 Neutral状态空间安全垫(Buffer) =====
+        # 横盘市需要超越突破线至少0.03%才入场，防止刚越线就缩回
+        if regime == 'neutral':
+            buffer_pct = 0.0003  # 0.03%
+            if sig_dir == 'call' and entry_price <= upper * (1 + buffer_pct):
+                if self.cfg.get('debug', False):
+                    print(f"  ⛔ Neutral Buffer: 价格${entry_price:.2f}未达8根高点${upper:.2f}+{buffer_pct*100:.2f}%(${upper*(1+buffer_pct):.2f})")
+                return
+            if sig_dir == 'put' and entry_price >= lower * (1 - buffer_pct):
+                if self.cfg.get('debug', False):
+                    print(f"  ⛔ Neutral Buffer: 价格${entry_price:.2f}未达8根低点${lower:.2f}-{buffer_pct*100:.2f}%(${lower*(1-buffer_pct):.2f})")
+                return
 
         # ===== B. 趋势方向过滤：禁止逆势交易 =====
         ch = self.close_history
@@ -1272,6 +1289,23 @@ class QQQLiveTrader:
         self._add_event(f"🎯 {direction}突破@${entry_price:.2f} | {filters_str}", "signal")
         self._execute_trade(sig)
 
+    def _calc_rsi_from_closes(self, closes, period=14):
+        """从价格数组计算RSI（Wilder平滑法）"""
+        if len(closes) < period + 1:
+            return 50
+        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        gains = [max(d, 0) for d in deltas[:period]]
+        losses = [max(-d, 0) for d in deltas[:period]]
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        for d in deltas[period:]:
+            avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
+            avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - 100 / (1 + rs)
+
     def _check_reversal(self, bar, cur_min_et):
         """衰竭反转信号检测 - 抓超跌反弹/超涨回调"""
         # 时间窗口（动态：盈利守护/亏损反攻）
@@ -1279,6 +1313,9 @@ class QQQLiveTrader:
         dyn_end = self._effective_end_time()
         e_h, e_m = map(int, dyn_end.split(':'))
         if not (s_h*60+s_m <= cur_min_et <= e_h*60+e_m):
+            return
+        # ===== P1 #8 午盘软断路器：12:00-13:00 ET 禁止开新仓 =====
+        if 720 <= cur_min_et < 780:
             return
         if self.position:
             return
@@ -1308,24 +1345,33 @@ class QQQLiveTrader:
                 # 开盘1小时内绝对禁止逆势反转信号
                 if cur_min_et < 635:  # 09:35-10:35 ET
                     return
-                # RSI超卖确认：必须RSI < 20（极端超卖）
-                rsi = self._calc_rsi(self.cfg['rsi_period'])
-                if rsi >= 20:
+                # 三乘三硬锁 (1) 多周期RSI共振
+                rsi_1m = self._calc_rsi(self.cfg['rsi_period'])
+                if rsi_1m >= 18:  # 1-min RSI < 18 极端超卖
                     return
-                # 结构确认：价格必须突破前3根K线的高点
+                rsi_5m = 50
+                closes_5m = self.close_history[-(5*14+1)::5] if len(self.close_history) >= 5*14+5 else []
+                if len(closes_5m) >= 15:
+                    rsi_5m = self._calc_rsi_from_closes(closes_5m, 14)
+                    if rsi_5m >= 25:  # 5-min RSI < 25
+                        return
+                # 三乘三硬锁 (2) 结构确认：突破前3根高点
                 if len(cs) < 4:
                     return
                 high_3 = max(b['high'] for b in cs[-4:-1])
                 if entry <= high_3:
                     return
-                # 确认反弹：前一根K线收阳 + 实体足够大（用cs[-2]不是bar）
+                # 三乘三硬锁 (3) 量能确认
+                bar_vol = bar.get('volume', 0)
+                vol_avg = sum(self.volume_history[-5:]) / 5 if len(self.volume_history) >= 5 else 0
+                if vol_avg > 0 and bar_vol < vol_avg * 1.5:
+                    return
+                # 确认反弹：前一根K线收阳 + 实体足够大
                 bounce_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] >= prev['open'] and bounce_body >= self.cfg['reversal_bounce']:
-                    # SMA20不限制（反转策略逆势入场）
-                    # 量能不限制（地量反弹也是信号）
                     sig = {
                         'dir': 'call',
-                        'reason': f'超跌反弹|从{self.session_high:.2f}跌{drop_from_high*100:.1f}% RSI{rsi:.0f}突破{high_3:.2f}',
+                        'reason': f'超跌反弹|从{self.session_high:.2f}跌{drop_from_high*100:.1f}% RSI1m{rsi_1m:.0f} RSI5m{rsi_5m:.0f}',
                         'price': entry,
                         'sl': entry * (1 - self.cfg['sl']),
                         'tp': entry * (1 + self.cfg['tp']),
@@ -1355,24 +1401,36 @@ class QQQLiveTrader:
                 # 开盘1小时内绝对禁止逆势反转信号
                 if cur_min_et < 635:
                     return
-                # RSI超买确认：必须RSI > 80（极端超买）
-                rsi = self._calc_rsi(self.cfg['rsi_period'])
-                if rsi <= 80:
+                # 三乘三硬锁 (1) 多周期RSI共振
+                rsi_1m = self._calc_rsi(self.cfg['rsi_period'])
+                if rsi_1m <= 82:  # 1-min RSI > 82 极端超买
                     return
-                # 结构确认：价格必须跌破前3根K线的低点
+                rsi_5m = 50
+                closes_5m = self.close_history[-(5*14+1)::5] if len(self.close_history) >= 5*14+5 else []
+                if len(closes_5m) >= 15:
+                    rsi_5m = self._calc_rsi_from_closes(closes_5m, 14)
+                    if rsi_5m <= 75:  # 5-min RSI > 75
+                        return
+                # 三乘三硬锁 (2) 结构确认：跌破前3根低点
                 if len(cs) < 4:
                     return
                 low_3 = min(b['low'] for b in cs[-4:-1])
                 if entry >= low_3:
                     return
-                # 确认回调：前一根K线收阴 + 实体足够大（用cs[-2]不是bar）
+                # 三乘三硬锁 (3) 量能确认
+                bar_vol = bar.get('volume', 0)
+                vol_avg = sum(self.volume_history[-5:]) / 5 if len(self.volume_history) >= 5 else 0
+                if vol_avg > 0 and bar_vol < vol_avg * 1.5:
+                    return
+                # 确认回调：前一根K线收阴 + 实体足够大
                 drop_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] <= prev['open'] and drop_body >= self.cfg['reversal_bounce']:
                     sig = {
                         'dir': 'put',
-                        'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}% RSI{rsi:.0f}跌破{low_3:.2f}',
+                        'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}% RSI1m{rsi_1m:.0f} RSI5m{rsi_5m:.0f}',
                         'price': entry,
-                        'sl': entry * (1 + self.cfg['sl']),
+                        'sl_pct': 0.18,  # PUT止损18%
+                        'sl': entry * (1 + 0.18),
                         'tp': entry * (1 - self.cfg['tp']),
                     }
                     # 冷却检查（时间戳方式）
@@ -1426,6 +1484,10 @@ class QQQLiveTrader:
 
     def _execute_trade(self, sig):
         """执行期权交易 - 增强版订单验证"""
+        # ===== PUT每日上限3笔 =====
+        if sig.get('dir') == 'put' and self.put_trades >= 3:
+            print(f"  ⛔ PUT已达每日上限({self.put_trades}/3)，跳过")
+            return
         # ===== 防重入锁：防止下单等待期间重复开仓 =====
         if self._trading_lock:
             print(f"  ⛔ 开仓锁定中，跳过")
@@ -1566,8 +1628,10 @@ class QQQLiveTrader:
             loss_penalty = 1.0
 
         combined_mult = pos_mult * vol_mult_factor * time_risk_mult * loss_penalty
-        # 12:00 ET后降低单笔比例，防下午Gamma风险
-        if cur_min_et >= 720:
+        # PUT单独仓位5%，CALL下午5%
+        if sig['dir'] == 'put':
+            effective_pct = min(self.cfg['order_pct'], 5.0)
+        elif cur_min_et >= 720:
             effective_pct = min(self.cfg['order_pct'], 5.0)
         else:
             effective_pct = self.cfg['order_pct']
@@ -2045,6 +2109,11 @@ class QQQLiveTrader:
         if pnl_pct <= -sl_pct:
             ex = f"止损({pnl_pct:.1f}%≤-{sl_pct:.0f}%)"
 
+        # --- 1.5 PUT时间止损：3分钟不盈利就平 ---
+        if not ex and pos['dir'] == 'put' and not pos.get('half_closed'):
+            if bars_held >= 3 and pnl_pct <= 0:
+                ex = f"PUT时间止损({bars_held}min无盈利)"
+
         # --- 2. 分阶段超时（v6.3: 使用动态timeout_bars）---
         if not ex and not pos['half_closed']:
             dynamic_timeout = pos.get('timeout_bars', 10)
@@ -2055,7 +2124,6 @@ class QQQLiveTrader:
                 if (pos['dir'] == 'call' and current_stock > sma5) or \
                    (pos['dir'] == 'put' and current_stock < sma5):
                     dynamic_timeout = 15
-                    print(f"  🚀 动量未破(SMA5={sma5:.2f}): 超时延长至{dynamic_timeout}分钟")
 
             # Timeout — 放宽：1分钟K线下给足时间让行情发展
             # Stage 1: 前4根K线，不看盈亏，只看止损（让交易有呼吸空间）
