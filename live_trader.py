@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-QQQ 0DTE 动态过滤突破策略 - 实盘交易系统 v6.5
+QQQ 0DTE 动态过滤突破策略 - 实盘交易系统 v7
 Regime-adaptive 市场状态检测 (trending/neutral/choppy)
 预加载滤镜(SMA20+SMA50+位置+趋势+VWAP+MACD) + 核心过滤(量能+动量+实体)
 RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
@@ -45,6 +45,7 @@ def _json_default(obj):
 
 # ===== 策略模块 =====
 from strategy import get_option_symbol, FilterEngine
+from v7_integration import V7Integration
 
 # ===== 长桥SDK =====
 from longbridge.openapi import (
@@ -160,6 +161,9 @@ class QQQLiveTrader:
 
         # v6.5 FilterEngine
         self.engine = FilterEngine(self.cfg)
+
+        # v7 多引擎信号系统
+        self.v7 = V7Integration(self.cfg)
 
         # 初始化长桥连接
         self._init_api()
@@ -337,7 +341,16 @@ class QQQLiveTrader:
             tmp_path = self.state_path + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(state, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, self.state_path)  # 原子替换
+            # Windows文件锁定重试机制
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, self.state_path)  # 原子替换
+                    break
+                except OSError as e:
+                    if attempt < 4:
+                        time.sleep(0.2)  # 等待200ms后重试
+                    else:
+                        raise
 
             # 保存持仓快照
             if self.position:
@@ -434,6 +447,8 @@ class QQQLiveTrader:
             print(f"📡 已订阅报价推送: {', '.join(symbols)}")
         except Exception as e:
             print(f"⚠️ 报价订阅失败 {symbols}: {e}")
+            # 发送网络/API错误通知
+            self._handle_error_with_notification(e, "订阅报价")
 
     def _unsubscribe_quotes(self, symbols):
         """取消不再需要的报价推送"""
@@ -488,6 +503,12 @@ class QQQLiveTrader:
             return
 
         self.latest_quote_prices[symbol] = price
+        
+        # VIX指数更新（v7波动率过滤）
+        if symbol == 'VIX.US':
+            self.v7.update_vix(price)
+            return
+        
         if symbol == self.cfg['symbol']:
             self.current_price = price
             return
@@ -712,7 +733,7 @@ class QQQLiveTrader:
     def start(self):
         """启动交易系统"""
         self.running = True
-        print(f"🚀 QQQ 0DTE v6.5 动态过滤策略启动")
+        print(f"🚀 QQQ 0DTE v7 多引擎策略启动")
         print(f"📊 市场状态自适应: 趋势(顺势)/中性(标准)/震荡(快进快出)")
         print(f"💰 资金: 实时查询 | 下单: {self.cfg['order_pct']}%资金/笔")
         print(f"📈 标的: {self.cfg['symbol']}")
@@ -738,6 +759,43 @@ class QQQLiveTrader:
         )
         self.quote_ctx.set_on_candlestick(self._on_candlestick)
         self._subscribe_quotes([self.cfg['symbol']])
+        
+        # 订阅VIX指数（用于v7波动率过滤）
+        try:
+            self._subscribe_quotes(['VIX.US'])
+            print("📡 已订阅VIX指数")
+        except Exception as e:
+            print(f"⚠️ VIX订阅失败: {e}")
+        
+        # 初始化v7 Dashboard
+        try:
+            import dashboard_v7
+            dashboard_v7.set_signal_manager(self.v7.signal_manager)
+            
+            # 在新线程启动Dashboard
+            import threading
+            def run_dashboard():
+                try:
+                    dashboard_v7.run_dashboard("0.0.0.0", 8080)
+                except Exception as e:
+                    print(f"⚠️ Dashboard运行失败: {e}")
+            
+            dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
+            dashboard_thread.start()
+            
+            print("📊 v7 Dashboard已启动: http://localhost:8080")
+            self._add_event("📊 v7 Dashboard已启动", "engine")
+            
+            # 初始化Dashboard状态
+            dashboard_v7.set_running(True)
+            dashboard_v7.set_connected(True)
+            dashboard_v7.add_event("🚀 系统启动", "info")
+        except ImportError as e:
+            print(f"⚠️ Dashboard导入失败(需要安装fastapi): {e}")
+            self._add_event(f"⚠️ Dashboard导入失败: {e}", "error")
+        except Exception as e:
+            print(f"⚠️ Dashboard连接失败: {e}")
+            self._add_event(f"⚠️ Dashboard连接失败: {e}", "error")
 
         # 🔍 从长桥同步实际持仓，接管被手动关闭后遗留的仓位
         self._recover_broker_position()
@@ -808,6 +866,12 @@ class QQQLiveTrader:
                     last_order_sync = now
                     self._sync_longbridge_orders()
                     self._sync_account_state(silent=True)
+                
+                # 检查是否需要发送周报（每周五收盘后）
+                try:
+                    self._check_and_send_weekly_summary()
+                except Exception:
+                    pass
                 
                 time.sleep(self.cfg['check_interval'])  # 20秒检测一次
         except KeyboardInterrupt:
@@ -916,6 +980,14 @@ class QQQLiveTrader:
         # 写入today.csv（供cron监控读取）
         self._write_csv(one_min)
         self.current_price = one_min['close']
+        
+        # 更新Dashboard
+        try:
+            import dashboard_v7
+            dashboard_v7.update_price(self.current_price)
+            dashboard_v7.update_candle_count(len(self.one_min_candles))
+        except Exception:
+            pass
 
         # 更新指标历史
         self.close_history.append(one_min['close'])
@@ -926,6 +998,12 @@ class QQQLiveTrader:
 
         # FilterEngine 计算 ATR/VWAP/SMA 等技术指标（供信号检测用）
         self.engine.update(one_min)
+        
+        # v7 多引擎更新
+        et_now = now.astimezone(TZ_ET)
+        cur_min_et = et_now.hour * 60 + et_now.minute
+        self.v7.update(one_min, cur_min_et)
+        
         self._save_state()
 
         # 打印1分钟K线
@@ -943,13 +1021,55 @@ class QQQLiveTrader:
             et_now = now.astimezone(TZ_ET)
             cur_min_et = et_now.hour * 60 + et_now.minute
 
-            # 直接用1分钟K线检测
+            # v6.5 信号检测
             self._check_breakout(one_min, cur_min_et)
 
             # 衰竭反转检测（突破未触发时检查反转）
             if not self.position:
                 self._check_reversal(one_min, cur_min_et)
+            
+            # v7 多引擎信号检测（如果v6.5未触发）
+            if not self.position:
+                self._check_v7_signal(cur_min_et)
 
+    def _check_v7_signal(self, cur_min_et: int):
+        """v7 多引擎信号检测"""
+        # 时间窗口检查
+        s_h, s_m = map(int, self.cfg['start_time'].split(':'))
+        dyn_end = self._effective_end_time()
+        e_h, e_m = map(int, dyn_end.split(':'))
+        if not (s_h*60+s_m <= cur_min_et <= e_h*60+e_m):
+            return
+            
+        # 午盘软断路器
+        if 720 <= cur_min_et < 780:
+            return
+            
+        if self.position:
+            return
+            
+        # 双重检查：查长桥实际持仓
+        try:
+            if self._check_longbridge_position() > 0:
+                return
+        except:
+            return
+            
+        # 冷却检查
+        if self.loss_cooldown_until is not None:
+            now = datetime.now(TZ_ET)
+            if now < self.loss_cooldown_until:
+                return
+                
+        # 检查v7信号
+        sig = self.v7.check_signal()
+        if sig is None:
+            return
+            
+        # 执行交易
+        print(f"  🎯 v7信号: {sig['engine']} {sig['dir']} @ ${sig['price']:.2f} (强度:{sig['strength']:.0f})")
+        self._execute_trade(sig)
+        
     def _check_signal_20s(self):
         """每20秒主动检测信号（不依赖K线回调）"""
         if not self.running:
@@ -1018,6 +1138,10 @@ class QQQLiveTrader:
         # 检测衰竭反转
         if not self.position:
             self._check_reversal(fake_bar, cur_min_et)
+            
+        # v7 多引擎信号检测（如果v6.5未触发）
+        if not self.position:
+            self._check_v7_signal(cur_min_et)
 
     def _update_filters_current(self, bar):
         """更新过滤器状态供 Web 显示（简化版）"""
@@ -1098,9 +1222,9 @@ class QQQLiveTrader:
             return
 
         # ===== P1 #8 Neutral状态空间安全垫(Buffer) =====
-        # 横盘市需要超越突破线至少0.03%才入场，防止刚越线就缩回
+        # 横盘市需要超越突破线至少0.01%才入场
         if regime == 'neutral':
-            buffer_pct = 0.0003  # 0.03%
+            buffer_pct = 0.0001  # 0.01%
             if sig_dir == 'call' and entry_price <= upper * (1 + buffer_pct):
                 if self.cfg.get('debug', False):
                     print(f"  ⛔ Neutral Buffer: 价格${entry_price:.2f}未达8根高点${upper:.2f}+{buffer_pct*100:.2f}%(${upper*(1+buffer_pct):.2f})")
@@ -1126,11 +1250,11 @@ class QQQLiveTrader:
 
         # ===== C. RSI 方向确认 =====
         rsi_val = self._calc_rsi(self.cfg['rsi_period'])
-        if sig_dir == 'call' and (rsi_val < 40 or rsi_val > 70):
-            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做多要求40-70")
+        if sig_dir == 'call' and (rsi_val < 25 or rsi_val > 75):
+            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做多要求25-75")
             return
-        if sig_dir == 'put' and (rsi_val < 30 or rsi_val > 60):
-            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做空要求30-60")
+        if sig_dir == 'put' and (rsi_val < 25 or rsi_val > 75):
+            print(f"  ⛔ RSI过滤: RSI={rsi_val:.1f}，做空要求25-75")
             return
 
         # ===== 动量确认：当前K线同向 =====
@@ -1342,8 +1466,8 @@ class QQQLiveTrader:
         if self.session_high > 0:
             drop_from_high = (self.session_high - entry) / self.session_high
             if drop_from_high >= self.cfg['reversal_drop']:
-                # 开盘1小时内绝对禁止逆势反转信号
-                if cur_min_et < 635:  # 09:35-10:35 ET
+                # 开盘40分钟内禁止逆势反转信号
+                if cur_min_et < 615:  # 09:35-10:15 ET
                     return
                 # 三乘三硬锁 (1) 多周期RSI共振
                 rsi_1m = self._calc_rsi(self.cfg['rsi_period'])
@@ -1398,8 +1522,8 @@ class QQQLiveTrader:
         if self.session_low < 999999:
             rise_from_low = (entry - self.session_low) / self.session_low
             if rise_from_low >= self.cfg['reversal_drop']:
-                # 开盘1小时内绝对禁止逆势反转信号
-                if cur_min_et < 635:
+                # 开盘40分钟内禁止逆势反转信号
+                if cur_min_et < 615:
                     return
                 # 三乘三硬锁 (1) 多周期RSI共振
                 rsi_1m = self._calc_rsi(self.cfg['rsi_period'])
@@ -1480,6 +1604,8 @@ class QQQLiveTrader:
             return total_contracts
         except Exception as e:
             print(f"  ⚠️ 检查长桥持仓异常: {e}")
+            # 发送网络/API错误通知
+            self._handle_error_with_notification(e, "查询持仓")
             return self._lb_pos_cache  # 异常时返回缓存值
 
     def _execute_trade(self, sig):
@@ -1818,6 +1944,23 @@ class QQQLiveTrader:
             self.trades_today.append(self.position.copy())
             self._add_event(f"📈 开仓: {opt_symbol} x{contracts}张 @${executed_price:.2f}", "trade")
             self.current_signal = None  # 已开仓，清除信号
+            
+            # 更新v7 Dashboard
+            try:
+                import dashboard_v7
+                dashboard_v7.add_trade({
+                    'timestamp': datetime.now(TZ_ET).strftime('%H:%M:%S'),
+                    'engine': sig.get('engine', 'v6.5'),
+                    'direction': sig['dir'],
+                    'strength': sig.get('strength', 0),
+                    'entry_price': float(price),
+                    'reason': sig['reason'],
+                })
+                dashboard_v7.update_position(self.position)
+                dashboard_v7.update_trades(self.trades_today)
+                dashboard_v7.add_event(f"📈 开仓: {opt_symbol} x{contracts}张", "trade")
+            except Exception:
+                pass
             # 如果入场价未获取，尝试获取
             if self.position['entry_opt_price'] is None:
                 time.sleep(1)
@@ -1862,6 +2005,8 @@ class QQQLiveTrader:
             print(f"  ❌ 下单失败: {e}")
             import traceback
             traceback.print_exc()
+            # 发送网络/API错误通知
+            self._handle_error_with_notification(e, "提交订单")
 
     def _log_order(self, order_id, opt_symbol, direction, contracts, status, executed_qty=0, executed_price=0):
         """记录订单日志（用于追踪所有提交的订单）"""
@@ -1909,6 +2054,13 @@ class QQQLiveTrader:
                                         self.position['contracts'] = done_qty
                                         self.position['quantity'] = done_qty * self.cfg['contract_multiplier']
                                         print(f"  📝 已更新持仓数量为: {done_qty}张")
+                                    # 发送持仓不一致通知
+                                    self._notify(
+                                        "⚠️ 持仓数量不一致",
+                                        'position_anomaly',
+                                        anomaly_type='mismatch',
+                                        details=f"期权 <code>{opt_symbol}</code>\n期望 <b>{expected_qty}</b>张\n实际 <b>{done_qty}</b>张",
+                                    )
                                     return True
             
             # 如果没找到，尝试查询所有持仓
@@ -1921,11 +2073,25 @@ class QQQLiveTrader:
                                 print(f"  📊 持仓: {pos.symbol} x {getattr(pos, 'quantity', 0)}")
             
             print(f"  ⚠️ 持仓验证未找到匹配项，但订单已确认成交")
+            # 发送持仓丢失通知
+            self._notify(
+                "❌ 持仓验证失败",
+                'position_anomaly',
+                anomaly_type='verify_failed',
+                details=f"期权 <code>{opt_symbol}</code>\n期望 <b>{expected_qty}</b>张\n长桥未找到匹配持仓",
+            )
             return False
             
         except Exception as e:
             print(f"  ⚠️ 持仓验证失败: {e}")
             print(f"  📝 继续执行（订单已确认成交）")
+            # 发送持仓验证失败通知
+            self._notify(
+                "❗ 持仓验证异常",
+                'position_anomaly',
+                anomaly_type='verify_failed',
+                details=f"期权 <code>{opt_symbol}</code>\n错误 <code>{str(e)[:80]}</code>",
+            )
             return False
 
     def _sync_position_from_longbridge(self):
@@ -2218,6 +2384,21 @@ class QQQLiveTrader:
                                         self._unsubscribe_quotes([pos.get('opt_symbol')])
                                         self.position = None
                                         self._save_state()
+                                        # 发送持仓被清空通知
+                                        self._notify(
+                                            "🔴 持仓被清空",
+                                            'position_anomaly',
+                                            anomaly_type='cleared',
+                                            details=f"期权 <code>{opt_symbol}</code>\n系统持仓已被清空\n可能是被强平或异常操作",
+                                        )
+                                    else:
+                                        # 发送持仓不一致通知
+                                        self._notify(
+                                            "⚠️ 持仓数量不一致",
+                                            'position_anomaly',
+                                            anomaly_type='mismatch',
+                                            details=f"期权 <code>{opt_symbol}</code>\n内部 <b>{expected_qty}</b>张\n长桥 <b>{actual_qty}</b>张",
+                                        )
                                     return
                                 else:
                                     # 数量一致，持仓正常
@@ -2238,6 +2419,13 @@ class QQQLiveTrader:
                     self._save_state()
                     self._missing_position_count = 0
                     print(f"  📝 已清除内部持仓")
+                    # 发送持仓丢失通知
+                    self._notify(
+                        "❌ 持仓丢失",
+                        'position_anomaly',
+                        anomaly_type='missing',
+                        details=f"期权 <code>{opt_symbol}</code>\n连续{3}次未找到持仓\n已自动清除内部持仓",
+                    )
                 else:
                     print(f"  ⏳ 第{self._missing_position_count}/3次未找到，继续保留持仓")
         except Exception as e:
@@ -2283,6 +2471,15 @@ class QQQLiveTrader:
             pnl_pct = (exit_opt - entry_opt) / entry_opt * 100
             pnl_usd = half * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
             self.daily_pnl += pnl_usd
+            
+            # 更新Dashboard
+            try:
+                import dashboard_v7
+                dashboard_v7.update_pnl(self.daily_pnl, len(self.trades_today))
+                dashboard_v7.add_event(f"📉 半仓平仓: {pnl_usd:+.2f}", "trade")
+            except Exception:
+                pass
+            
             # 方向累计盈亏（半仓也要算）
             if pos['dir'] == 'call':
                 self.call_pnl += pnl_usd
@@ -2471,6 +2668,16 @@ class QQQLiveTrader:
             pnl_usd = pos['contracts'] * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
 
             self.daily_pnl += pnl_usd
+            
+            # 更新Dashboard
+            try:
+                import dashboard_v7
+                dashboard_v7.update_pnl(self.daily_pnl, len(self.trades_today))
+                dashboard_v7.update_trades(self.trades_today)
+                dashboard_v7.update_position(None)
+                dashboard_v7.add_event(f"{'🟢' if pnl_pct > 0 else '🔴'} 平仓: {pnl_usd:+.2f} ({pnl_pct:+.1f}%)", "trade")
+            except Exception:
+                pass
 
             # 标记盈亏
             pos['win'] = pnl_pct > 0
@@ -2758,7 +2965,7 @@ class QQQLiveTrader:
         return (
             f"<b>🚀 系统启动</b>\n"
             f"───────────\n"
-            f"版本 <code>v6.5 Regime-Adaptive</code>\n"
+            f"版本 <code>v7 Multi-Engine</code>\n"
             f"时间 <code>{datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M ET')}</code>\n"
             f"账户 <b>${self.actual_capital:,.2f}</b>\n"
             f"昨日盈亏 <b>${self.yesterday_pnl:+,.2f}</b> ({self.yesterday_trades}笔, 胜率{self.yesterday_wr:.0f}%)"
@@ -2827,6 +3034,170 @@ class QQQLiveTrader:
             f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
         )
 
+    def _fmt_weekly_summary(self):
+        """格式化周度收益汇总通知"""
+        from datetime import timedelta
+        import json
+        
+        today = datetime.now(TZ_ET).date()
+        # 计算本周一
+        monday = today - timedelta(days=today.weekday())
+        
+        weekly_trades = []
+        weekly_pnl = 0
+        weekly_wins = 0
+        weekly_total = 0
+        daily_summaries = []
+        
+        # 读取本周所有交易记录
+        records_dir = os.path.join(_app_dir(), 'records')
+        for i in range(5):  # 周一到周五
+            day = monday + timedelta(days=i)
+            filepath = os.path.join(records_dir, f'{day.strftime("%Y-%m-%d")}.json')
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    day_trades = data.get('trades', [])
+                    day_pnl = data.get('pnl', 0)
+                    day_wins = data.get('wins', 0)
+                    day_total = data.get('total', 0)
+                    
+                    weekly_trades.extend(day_trades)
+                    weekly_pnl += day_pnl
+                    weekly_wins += day_wins
+                    weekly_total += day_total
+                    
+                    daily_summaries.append({
+                        'date': day.strftime('%m/%d'),
+                        'trades': day_total,
+                        'wins': day_wins,
+                        'pnl': day_pnl,
+                    })
+                except Exception:
+                    pass
+        
+        if weekly_total == 0:
+            return "<b>📊 周度总结</b>\n───────────\n本周无交易记录"
+        
+        weekly_wr = weekly_wins / weekly_total * 100 if weekly_total > 0 else 0
+        
+        # 计算方向分布
+        call_cnt = sum(1 for t in weekly_trades if t.get('dir') == 'call')
+        put_cnt = weekly_total - call_cnt
+        call_win = sum(1 for t in weekly_trades if t.get('dir') == 'call' and t.get('result') == 'win')
+        put_win = sum(1 for t in weekly_trades if t.get('dir') == 'put' and t.get('result') == 'win')
+        call_wr = call_win / call_cnt * 100 if call_cnt > 0 else 0
+        put_wr = put_win / put_cnt * 100 if put_cnt > 0 else 0
+        call_pnl = sum(t.get('pnl_usd', 0) for t in weekly_trades if t.get('dir') == 'call')
+        put_pnl = sum(t.get('pnl_usd', 0) for t in weekly_trades if t.get('dir') == 'put')
+        
+        # 找出最佳/最差交易
+        best_trade = max(weekly_trades, key=lambda t: t.get('pnl_usd', 0))
+        worst_trade = min(weekly_trades, key=lambda t: t.get('pnl_usd', 0))
+        
+        # 每日明细
+        daily_detail = ""
+        for d in daily_summaries:
+            emoji = "✅" if d['pnl'] > 0 else "❌" if d['pnl'] < 0 else "➖"
+            daily_detail += f"{emoji} {d['date']} {d['trades']}笔 {d['wins']}胜 ${d['pnl']:+,.2f}\n"
+        
+        return (
+            f"<b>📊 周度总结 {monday.strftime('%m/%d')}~{today.strftime('%m/%d')}</b>\n"
+            f"───────────\n"
+            f"总交易 <b>{weekly_total}</b>笔 | 盈利<b>{weekly_wins}</b> | 亏损<b>{weekly_total - weekly_wins}</b>\n"
+            f"胜率 <b>{weekly_wr:.1f}%</b>\n"
+            f"盈亏 <b>${weekly_pnl:+,.2f}</b>\n"
+            f"───────────\n"
+            f"方向分布\n"
+            f"🟢 CALL <b>{call_cnt}</b>笔 (胜率{call_wr:.0f}%, ${call_pnl:+,.2f})\n"
+            f"🔴 PUT  <b>{put_cnt}</b>笔 (胜率{put_wr:.0f}%, ${put_pnl:+,.2f})\n"
+            f"───────────\n"
+            f"每日明细\n"
+            f"{daily_detail}"
+            f"───────────\n"
+            f"最佳交易\n"
+            f"✅ <code>{best_trade.get('opt_symbol', '--')}</code> ${best_trade.get('pnl_usd', 0):+,.2f}\n"
+            f"最差交易\n"
+            f"❌ <code>{worst_trade.get('opt_symbol', '--')}</code> ${worst_trade.get('pnl_usd', 0):+,.2f}"
+        )
+
+    def _fmt_network_alert(self, error_msg, retry_count=0):
+        """格式化网络断连告警"""
+        return (
+            f"<b>🌐 网络异常</b>\n"
+            f"───────────\n"
+            f"错误 <code>{error_msg[:100]}</code>\n"
+            f"重试次数 <b>{retry_count}</b>\n"
+            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
+            f"───────────\n"
+            f"系统将自动重连，请关注后续通知"
+        )
+
+    def _fmt_api_rate_limit(self, api_name, wait_seconds):
+        """格式化API限流告警"""
+        return (
+            f"<b>⏱️ API限流</b>\n"
+            f"───────────\n"
+            f"接口 <b>{api_name}</b>\n"
+            f"等待 <b>{wait_seconds}</b>秒后重试\n"
+            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
+            f"───────────\n"
+            f"交易暂停，等待限流解除"
+        )
+
+    def _fmt_position_anomaly(self, anomaly_type, details):
+        """格式化持仓异常告警"""
+        icons = {
+            'mismatch': '⚠️',
+            'missing': '❌',
+            'cleared': '🔴',
+            'verify_failed': '❗',
+        }
+        labels = {
+            'mismatch': '持仓数量不一致',
+            'missing': '持仓丢失',
+            'cleared': '持仓被清空',
+            'verify_failed': '持仓验证失败',
+        }
+        icon = icons.get(anomaly_type, '⚠️')
+        label = labels.get(anomaly_type, '持仓异常')
+        
+        return (
+            f"<b>{icon} {label}</b>\n"
+            f"───────────\n"
+            f"{details}\n"
+            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
+            f"───────────\n"
+            f"请检查账户状态"
+        )
+
+    def _check_and_send_weekly_summary(self):
+        """检查是否需要发送周报（每周五收盘后）"""
+        now = datetime.now(TZ_ET)
+        # 周五 (weekday=4) 且在16:00-16:30之间
+        if now.weekday() == 4 and 16 <= now.hour < 17 and now.minute < 30:
+            # 检查今天是否已发送过周报
+            weekly_sent_file = os.path.join(_app_dir(), 'weekly_sent.flag')
+            if os.path.exists(weekly_sent_file):
+                try:
+                    with open(weekly_sent_file, 'r') as f:
+                        sent_date = f.read().strip()
+                    if sent_date == now.strftime('%Y-%m-%d'):
+                        return  # 今天已发送
+                except Exception:
+                    pass
+            
+            # 发送周报
+            self._notify("📊 周度总结", msg_type='weekly_summary')
+            
+            # 标记已发送
+            try:
+                with open(weekly_sent_file, 'w') as f:
+                    f.write(now.strftime('%Y-%m-%d'))
+            except Exception:
+                pass
+
     def _notify_telegram(self, msg, msg_type='info', **kw):
         """Telegram通知 - 支持HTML格式的消息"""
         try:
@@ -2857,6 +3228,14 @@ class QQQLiveTrader:
                 text = self._fmt_shutdown(**kw)
             elif msg_type == 'daily_summary':
                 text = self._fmt_daily_summary()
+            elif msg_type == 'weekly_summary':
+                text = self._fmt_weekly_summary()
+            elif msg_type == 'network' and kw:
+                text = self._fmt_network_alert(**kw)
+            elif msg_type == 'rate_limit' and kw:
+                text = self._fmt_api_rate_limit(**kw)
+            elif msg_type == 'position_anomaly' and kw:
+                text = self._fmt_position_anomaly(**kw)
             elif msg_type == 'system' and kw:
                 text = self._fmt_system(**kw)
             else:
@@ -2870,13 +3249,20 @@ class QQQLiveTrader:
                     text = f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
 
             # 添加页脚
-            footer = f"\n───────────\n<code>QQQ 0DTE v6.5</code>"
+            footer = f"\n───────────\n<code>QQQ 0DTE v7</code>"
             full_text = text + footer
+
+            # 代理配置
+            proxies = {}
+            proxy_url = tg_cfg.get('proxy', '')
+            if proxy_url:
+                proxies = {'https': proxy_url, 'http': proxy_url}
 
             resp = requests.post(
                 f'https://api.telegram.org/bot{bot_token}/sendMessage',
                 json={'chat_id': chat_id, 'text': full_text, 'parse_mode': 'HTML'},
-                timeout=10
+                timeout=15,
+                proxies=proxies
             )
             result = resp.json()
             if result.get('ok'):
@@ -2888,7 +3274,8 @@ class QQQLiveTrader:
                     resp2 = requests.post(
                         f'https://api.telegram.org/bot{bot_token}/sendMessage',
                         json={'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
-                        timeout=10
+                        timeout=15,
+                        proxies=proxies
                     )
         except Exception as e:
             import traceback
@@ -2907,6 +3294,57 @@ class QQQLiveTrader:
             self._notify_feishu(msg)
         if tg_cfg.get('enabled', False):
             self._notify_telegram(msg, msg_type=msg_type, **kw)
+
+    def _handle_error_with_notification(self, error, context="", notify_type=None):
+        """处理错误并发送通知（避免重复通知）"""
+        error_str = str(error).lower()
+        now = time.time()
+        
+        # 网络错误检测
+        network_keywords = ['connection', 'timeout', 'network', 'socket', 'http', 'ssl', 'dns']
+        is_network_error = any(kw in error_str for kw in network_keywords)
+        
+        # API限流检测
+        rate_limit_keywords = ['429', 'rate limit', 'too many', 'throttle', 'limit']
+        is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
+        
+        # 避免重复通知（5分钟内相同错误只通知一次）
+        error_key = f"{context}_{type(error).__name__}"
+        if hasattr(self, '_last_error_notify'):
+            if error_key in self._last_error_notify:
+                if now - self._last_error_notify[error_key] < 300:
+                    return  # 5分钟内已通知过
+        else:
+            self._last_error_notify = {}
+        
+        # 发送通知
+        if is_network_error:
+            self._notify(
+                "🌐 网络异常",
+                'network',
+                error_msg=str(error)[:100],
+                retry_count=getattr(self, '_network_retry_count', 0),
+            )
+            self._last_error_notify[error_key] = now
+        elif is_rate_limit:
+            # 从错误信息中提取等待时间
+            wait_seconds = 60  # 默认60秒
+            import re
+            wait_match = re.search(r'(\d+)\s*(?:second|sec|s)', error_str)
+            if wait_match:
+                wait_seconds = int(wait_match.group(1))
+            
+            self._notify(
+                "⏱️ API限流",
+                'rate_limit',
+                api_name=context or "Longbridge API",
+                wait_seconds=wait_seconds,
+            )
+            self._last_error_notify[error_key] = now
+        elif notify_type:
+            # 其他指定类型的通知
+            self._notify(str(error)[:200], notify_type)
+            self._last_error_notify[error_key] = now
 
     def _sync_gist(self):
         """实时同步交易记录到Gist（供小程序读取）"""
@@ -2940,7 +3378,7 @@ class QQQLiveTrader:
         print("\n" + "=" * 60)
         print("📊 今日交易总结")
         print("=" * 60)
-        print(f"  策略版本: v6.5 Regime-Adaptive | 09:35-15:50美东")
+        print(f"  策略版本: v7 Multi-Engine | 09:35-15:50美东")
         print(f"  交易次数: {total} (做多: {sum(1 for t in self.trades_today if t.get('dir')=='call')}, "
               f"做空: {sum(1 for t in self.trades_today if t.get('dir')=='put')})")
         print(f"  胜率: {wins}/{total} ({wins/total*100:.0f}%)" if total > 0 else "  胜率: N/A")
@@ -3079,6 +3517,23 @@ class QQQLiveTrader:
             self._account_state = account_info
             self._broker_positions = positions
             self._save_state()  # _save_state 会把这些字段打包进 state
+            
+            # 更新v7 Dashboard
+            try:
+                import dashboard_v7
+                dashboard_v7.update_account(account_info)
+                dashboard_v7.update_position(self.position)
+                dashboard_v7.update_broker_positions(positions)
+                dashboard_v7.update_pnl(self.daily_pnl, len(self.trades_today))
+                dashboard_v7.update_trades(self.trades_today)
+                dashboard_v7.update_vix(self.v7.get_vix_state())
+                dashboard_v7.update_price(self.current_price)
+                dashboard_v7.update_candle_count(len(self.one_min_candles))
+                dashboard_v7.set_connected(True)
+                dashboard_v7.set_running(self.running)
+                dashboard_v7.update_filter_status(self.filter_status)
+            except Exception:
+                pass
 
         except Exception as e:
             print(f"  ⚠️ 同步账户状态失败: {e}")
@@ -3125,7 +3580,16 @@ class QQQLiveTrader:
                     'sell_count': sum(1 for o in orders if o['side'] == '卖出'),
                     'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, filepath)  # 原子替换
+            # Windows文件锁定重试机制
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, filepath)  # 原子替换
+                    break
+                except OSError as e:
+                    if attempt < 4:
+                        time.sleep(0.2)
+                    else:
+                        raise
             
             print(f"  📤 长桥订单已同步: {len(orders)}笔 (买入:{sum(1 for o in orders if o['side']=='买入')}, 卖出:{sum(1 for o in orders if o['side']=='卖出')})")
             
@@ -3411,7 +3875,16 @@ class QQQLiveTrader:
                 'wins': sum(1 for t in formatted_trades if t.get('result') == 'win'),
                 'pnl': round(total_pnl, 2),
             }, f, ensure_ascii=False, indent=2, default=_json_default)
-        os.replace(tmp_path, filepath)
+        # Windows文件锁定重试机制
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, filepath)
+                break
+            except OSError as e:
+                if attempt < 4:
+                    time.sleep(0.2)
+                else:
+                    raise
         print(f"💾 启动对账完成: {filepath} ({len(formatted_trades)}笔, PnL=${total_pnl:+,.2f})")
 
     def _reconcile_trades_from_broker(self):
@@ -3602,7 +4075,16 @@ class QQQLiveTrader:
                     'pnl': round(total_pnl, 2),
                     'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, filepath)
+            # Windows文件锁定重试机制
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, filepath)
+                    break
+                except OSError as e:
+                    if attempt < 4:
+                        time.sleep(0.2)
+                    else:
+                        raise
             print(f"📋 实时记录已覆盖: {today_et} ({len(trades)}笔, 胜率{wins}/{len(trades)}, ${total_pnl:+,.2f})")
         except Exception as e:
             print(f"  ⚠️ 实时记录保存失败: {e}")
@@ -3703,7 +4185,16 @@ class QQQLiveTrader:
                     'wins': sum(1 for t in formatted_trades if t.get('result') == 'win'),
                     'pnl': round(total_pnl, 2),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, filepath)  # 原子替换
+            # Windows文件锁定重试机制
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, filepath)  # 原子替换
+                    break
+                except OSError as e:
+                    if attempt < 4:
+                        time.sleep(0.2)
+                    else:
+                        raise
 
             broker_count = sum(1 for t in formatted_trades if t.get('_source') == 'broker_reconcile')
             internal_count = sum(1 for t in formatted_trades if t.get('_source') == 'internal')

@@ -221,20 +221,16 @@ class FilterEngine:
         }
 
     def check_preloaded(self, dir: str, regime: str = None) -> tuple:
-        """检查预加载滤镜（SMA20, SMA50, price_pos, trend, VWAP, MACD）"""
+        """检查预加载滤镜（SMA50, price_pos, trend, VWAP缓冲, MACD）"""
         ch = self.closes
         cs = self.bars
         price = ch[-1] if ch else 0
 
+        # v7: SMA20不再作为过滤条件（1分钟噪音太大）
         sma20 = np.mean(ch[-20:]) if len(ch) >= 20 else None
         sma20_prev = np.mean(ch[-21:-1]) if len(ch) >= 21 else None
         sma20_rising = sma20 > sma20_prev if sma20 is not None and sma20_prev is not None else True
-        sma20_ok = True
-        if sma20 is not None:
-            if dir == 'call' and (price < sma20 or not sma20_rising):
-                sma20_ok = False
-            if dir == 'put' and (price > sma20 or sma20_rising):
-                sma20_ok = False
+        sma20_ok = True  # v7: 始终为True，不参与过滤
 
         sma50 = np.mean(ch[-50:]) if len(ch) >= 50 else None
         sma50_ok = True
@@ -266,11 +262,13 @@ class FilterEngine:
             if dir == 'put' and bear < 3:
                 trend_ok = False
 
+        # v7: VWAP增加±0.1%缓冲区
         vwap_ok = True
         if self.vwap > 0:
-            if dir == 'call' and price < self.vwap:
+            vwap_buffer = self.vwap * 0.001  # 0.1%缓冲
+            if dir == 'call' and price < (self.vwap - vwap_buffer):
                 vwap_ok = False
-            if dir == 'put' and price > self.vwap:
+            if dir == 'put' and price > (self.vwap + vwap_buffer):
                 vwap_ok = False
 
         macd_ok = True
@@ -280,12 +278,14 @@ class FilterEngine:
             if dir == 'put' and self.macd_hist >= 0:
                 macd_ok = False
 
+        # v7: 只计算SMA50+pos+trend+VWAP+MACD（SMA20不参与）
         if regime == 'trending':
-            bonus_passed = sum([sma20_ok, sma50_ok, pos_ok, trend_ok, vwap_ok])
-            all_ok = bonus_passed >= 4
+            bonus_passed = sum([sma50_ok, pos_ok, trend_ok, vwap_ok])
         else:
-            bonus_passed = sum([sma20_ok, sma50_ok, pos_ok, trend_ok, vwap_ok, macd_ok])
-            all_ok = bonus_passed >= 4
+            bonus_passed = sum([sma50_ok, pos_ok, trend_ok, vwap_ok, macd_ok])
+        
+        # v7: preloaded_pass已在get_regime_params中设为2
+        all_ok = bonus_passed >= 2
 
         return all_ok, {
             'sma20': {'ok': sma20_ok, 'val': f'{sma20:.2f}' if sma20 else '--',
@@ -393,11 +393,11 @@ class FilterEngine:
             return {
                 'regime': 'trending',
                 'detail': detail,
-                'lookback': 3,
+                'lookback': 2,          # v7: 3→2, 快速捕捉
                 'pullback': True,
-                'vol_mult': 0.7,
-                'min_body': 0.0002,
-                'preloaded_pass': 3,
+                'vol_mult': 0.5,        # v7: 0.7→0.5, 放宽量能
+                'min_body': 0.0001,     # v7: 0.0002→0.0001, 接受小实体
+                'preloaded_pass': 2,    # v7: 3→2, 降低共识要求
                 'gap_mult': 1.5,
                 'tp_partial_pct': 1.00,
                 'sl_pct': 0.25,
@@ -411,9 +411,9 @@ class FilterEngine:
                 'detail': detail,
                 'lookback': 2,
                 'pullback': False,
-                'vol_mult': 0.6,
+                'vol_mult': 0.5,        # v7: 0.6→0.5
                 'min_body': 0.0001,
-                'preloaded_pass': 2,
+                'preloaded_pass': 2,    # v7: 2 不变
                 'gap_mult': 2.0,
                 'tp_partial_pct': 0.50,
                 'sl_pct': 0.30,
@@ -426,15 +426,15 @@ class FilterEngine:
             return {
                 'regime': 'neutral',
                 'detail': detail,
-                'lookback': 8,  # P1 #8 横盘市拉长lookback，减少假突破
+                'lookback': 2,          # v7: 5→2, 快速捕捉
                 'pullback': False,
-                'vol_mult': 0.8,
-                'min_body': 0.0003,
-                'preloaded_pass': 3,
+                'vol_mult': 0.5,        # v7: 0.8→0.5
+                'min_body': 0.0001,     # v7: 0.0003→0.0001
+                'preloaded_pass': 2,    # v7: 3→2
                 'gap_mult': 1.0,
                 'tp_partial_pct': 0.80,
                 'sl_pct': 0.25,
-                'timeout_bars': 4,
+                'timeout_bars': 8,
                 'pos_mult': 0.4,
                 'is_opening_period': is_open,
             }
