@@ -877,12 +877,35 @@ class QQQLiveTrader:
         except KeyboardInterrupt:
             self.stop()
 
+    def _is_today_expiry(self, opt_symbol: str) -> bool:
+        """检查期权合约是否是当天到期"""
+        try:
+            # 期权代码格式: QQQ{YYMMDD}{C/P}{strike}.US
+            # 例如: QQQ260528C721000.US
+            if not opt_symbol or not opt_symbol.startswith('QQQ'):
+                return False
+            # 提取YYMMDD部分 (位置3-8)
+            date_str = opt_symbol[3:9]
+            # 转换为完整日期
+            year = 2000 + int(date_str[:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+            expiry_date = datetime(year, month, day).strftime('%Y-%m-%d')
+            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+            return expiry_date == today
+        except:
+            return False
+
     def stop(self, close_on_exit=True):
         """停止交易系统"""
         self.running = False
         print("\n🛑 交易系统停止")
         if close_on_exit and self.position:
-            self._close_position("系统停止")
+            # 只平掉当天到期的期权
+            if self._is_today_expiry(self.position.get('opt_symbol', '')):
+                self._close_position("系统停止")
+            else:
+                print(f"  ⏸ 非当天到期期权，保留持仓: {self.position['opt_symbol']}")
         elif self.position:
             self._sync_longbridge_orders()
             self._save_state()
@@ -1493,6 +1516,12 @@ class QQQLiveTrader:
                 # 确认反弹：前一根K线收阳 + 实体足够大
                 bounce_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] >= prev['open'] and bounce_body >= self.cfg['reversal_bounce']:
+                    # 如果有持仓且是PUT，先平仓再反向开仓
+                    if self.position and self.position.get('dir') == 'put':
+                        print(f"  🔄 反转信号：平掉PUT仓位，反向开CALL")
+                        self._close_position("反转信号-平PUT")
+                        self.position = None
+                    
                     sig = {
                         'dir': 'call',
                         'reason': f'超跌反弹|从{self.session_high:.2f}跌{drop_from_high*100:.1f}% RSI1m{rsi_1m:.0f} RSI5m{rsi_5m:.0f}',
@@ -1549,6 +1578,12 @@ class QQQLiveTrader:
                 # 确认回调：前一根K线收阴 + 实体足够大
                 drop_body = abs(prev['close'] - prev['open']) / prev['open'] if prev['open'] else 0
                 if prev['close'] <= prev['open'] and drop_body >= self.cfg['reversal_bounce']:
+                    # 如果有持仓且是CALL，先平仓再反向开仓
+                    if self.position and self.position.get('dir') == 'call':
+                        print(f"  🔄 反转信号：平掉CALL仓位，反向开PUT")
+                        self._close_position("反转信号-平CALL")
+                        self.position = None
+                    
                     sig = {
                         'dir': 'put',
                         'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}% RSI1m{rsi_1m:.0f} RSI5m{rsi_5m:.0f}',
@@ -1684,6 +1719,7 @@ class QQQLiveTrader:
         except Exception as e:
             print(f"  ⚠️ 获取余额失败: {e}，使用默认资金: ${self.cfg['capital']:,}")
             capital = self.cfg['capital']
+            buying_power = capital  # 默认购买力等于资金
             self.account_info = {'equity': capital, 'cash': capital, 'buying_power': capital}
 
         # ===== 生成期权合约代码 =====
@@ -2270,6 +2306,15 @@ class QQQLiveTrader:
         sl_pct = pos.get('sl_pct', self.cfg['sl']) * 100    # 动态止损（震荡30%/趋势25%）
         tp_partial = pos.get('tp_partial_pct', 1.00) * 100  # 动态止盈（震荡50%/趋势100%）
         tp_trail_drop = self.cfg['tp_trail_drop'] * 100  # 30%
+        
+        # 优化6: 开盘入场的仓位，止损放宽到35%（开盘波动大）
+        entry_bar = pos.get('entry_bar', 0)
+        if entry_bar > 0 and len(self.one_min_candles) > 0:
+            # 计算入场时的ET分钟数
+            entry_candle_idx = min(entry_bar, len(self.one_min_candles) - 1)
+            # 简化：如果持仓在开盘30分钟内，放宽止损
+            if bars_held <= 30 and sl_pct < 35:
+                sl_pct = 35.0
 
         # --- 1. 止损（期权价格，最高优先）---
         if pnl_pct <= -sl_pct:
@@ -2470,6 +2515,14 @@ class QQQLiveTrader:
 
             pnl_pct = (exit_opt - entry_opt) / entry_opt * 100
             pnl_usd = half * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
+            
+            # 扣除半仓手续费（长桥美股期权：平台费$0.65/张 + 监管费$0.02/张）
+            # 半仓平仓只收平仓手续费，不开仓手续费
+            option_fee_per_contract = 0.67  # $0.65平台费 + $0.02监管费
+            half_fee = half * option_fee_per_contract  # 只收平仓手续费
+            pnl_usd -= half_fee
+            pos['option_fee'] = pos.get('option_fee', 0) + half_fee  # 累计手续费
+            
             self.daily_pnl += pnl_usd
             
             # 更新Dashboard
@@ -2666,6 +2719,13 @@ class QQQLiveTrader:
 
             # 计算盈亏金额（张数 × 100股 × 权利金变动）
             pnl_usd = pos['contracts'] * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
+            
+            # 扣除期权手续费（长桥美股期权：平台费$0.65/张 + 监管费$0.02/张）
+            # 开仓和平仓各收一次，总手续费 = 张数 × $0.67 × 2
+            option_fee_per_contract = 0.67  # $0.65平台费 + $0.02监管费
+            total_fee = pos['contracts'] * option_fee_per_contract * 2  # 开仓+平仓
+            pnl_usd -= total_fee
+            pos['option_fee'] = total_fee  # 记录手续费
 
             self.daily_pnl += pnl_usd
             
@@ -3696,6 +3756,18 @@ class QQQLiveTrader:
 
             wins = sum(1 for t in trades if t.get('result') == 'win')
             total = len(trades)
+            
+            # 恢复最大盈亏统计
+            for t in trades:
+                pnl_usd = t.get('pnl_usd', 0)
+                pnl_pct = t.get('pnl_pct', 0)
+                if pnl_usd > self.largest_win_usd:
+                    self.largest_win_usd = pnl_usd
+                    self.largest_win_pct = pnl_pct
+                if pnl_usd < self.largest_loss_usd:
+                    self.largest_loss_usd = pnl_usd
+                    self.largest_loss_pct = pnl_pct
+            
             print(f"📥 恢复今日交易记录: {total}笔 (胜{wins}/负{total-wins}) 盈亏${self.daily_pnl:+,.2f}")
 
         except Exception as e:

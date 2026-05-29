@@ -30,7 +30,7 @@
     "stock_trail_pct": 0.003,
     "trail_activate": 0.1,
     "trail_drop": 0.05,
-    "timeout_stage1_bars": 5,
+    "timeout_stage1_bars": 8,
     "timeout_stage1_min": 0.3,
     "timeout_stage2_bars": 10,
     "timeout_stage2_min": 0.6,

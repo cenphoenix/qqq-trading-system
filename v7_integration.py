@@ -80,7 +80,15 @@ class V7Integration:
         self.last_signal = signal
         
         # 转换为v6.5格式
-        return self._convert_signal(signal)
+        result = self._convert_signal(signal)
+        
+        # 优化3+4: PUT入场门槛（neutral需强度>80，其他>70）
+        if result['dir'] == 'put':
+            min_strength = 80 if result['regime'] == 'neutral' else 70
+            if signal.strength < min_strength:
+                return None
+        
+        return result
         
     def _convert_signal(self, sig: Signal) -> Dict:
         """

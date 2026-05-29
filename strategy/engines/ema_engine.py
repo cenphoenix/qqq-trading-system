@@ -45,9 +45,13 @@ class EMAEngine(BaseEngine):
         self._minus_dm = []
         self.adx = 0.0
         
+        # ET时间
+        self._et_minute = 0
+        
     def update(self, bar: dict, et_minute: int = 0) -> None:
         """更新数据并计算EMA"""
         super().update(bar, et_minute)
+        self._et_minute = et_minute
         
         price = bar['close']
         
@@ -141,6 +145,10 @@ class EMAEngine(BaseEngine):
         if self.ema9 is None or self.ema21 is None or self.ema50 is None:
             return None
         if self.ema9_prev is None or self.ema21_prev is None:
+            return None
+            
+        # 开盘前10分钟禁止EMA信号（09:35-09:45容易假突破）
+        if 575 <= self._et_minute < 585:
             return None
             
         price = self.closes[-1]

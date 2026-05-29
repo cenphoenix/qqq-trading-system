@@ -36,6 +36,12 @@ def get_option_symbol(stock_price: float, direction: str, offset: float = 2.0) -
     elif direction == 'put' and strike >= stock_price:
         strike = int(stock_price) - 1
 
-    expiry = now_et.strftime('%y%m%d')
+    # 14:00 ET 之后使用第二天到期的期权（避免当天末日高波动率和保证金）
+    from datetime import timedelta
+    if now_et.hour >= 14:
+        expiry_date = now_et + timedelta(days=1)
+    else:
+        expiry_date = now_et
+    expiry = expiry_date.strftime('%y%m%d')
     symbol = f"QQQ{expiry}{option_type}{strike * 1000:06d}.US"
     return symbol

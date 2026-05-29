@@ -426,7 +426,7 @@ class FilterEngine:
             return {
                 'regime': 'neutral',
                 'detail': detail,
-                'lookback': 2,          # v7: 5→2, 快速捕捉
+                'lookback': 3,          # v7: 2→3, 减少假突破
                 'pullback': False,
                 'vol_mult': 0.5,        # v7: 0.8→0.5
                 'min_body': 0.0001,     # v7: 0.0003→0.0001
