@@ -6,7 +6,8 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -17,6 +18,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 app = FastAPI(title="QQQ 0DTE v7 Dashboard")
+
+
+def _json_safe(value: Any):
+    """Convert dashboard state into values FastAPI/WebSocket JSON can serialize."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "value"):
+        return _json_safe(value.value)
+    return str(value)
 
 
 class DashboardState:
@@ -120,7 +140,7 @@ class DashboardState:
                 'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
             })
             
-        return {
+        data = {
             'timestamp': datetime.now().isoformat(),
             'connected': self.connected,
             'running': self.running,
@@ -159,10 +179,12 @@ class DashboardState:
             # 事件
             'events': self.events[-30:],
         }
+        return _json_safe(data)
 
 
 state = DashboardState()
 _broadcast_task = None
+_server_started = False
 
 
 async def _broadcast_loop():
@@ -269,6 +291,12 @@ def set_connected(connected: bool):
 def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
     import time
     import socket
+    global _server_started
+
+    if _server_started:
+        print(f"📊 Dashboard已在当前进程启动，跳过重复启动: http://localhost:{port}")
+        return
+    _server_started = True
     
     # 等待端口释放（Windows Ctrl+C后端口可能还在TIME_WAIT）
     for attempt in range(15):
@@ -285,6 +313,7 @@ def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
                 print(f"⏳ 端口{port}占用，等待2秒... ({attempt+1}/15)")
                 time.sleep(2)
             else:
+                _server_started = False
                 print(f"❌ 端口{port}持续占用，请手动关闭占用进程")
                 return
     

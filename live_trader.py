@@ -406,6 +406,60 @@ class QQQLiveTrader:
             })
         return rows
 
+    def _trade_notify_key(self, trade, source='exit'):
+        """生成交易通知指纹，避免同一笔平仓重复通知，也避免同合约多次交易被误去重。"""
+        try:
+            sym = str(trade.get('opt_symbol', ''))
+            direction = str(trade.get('dir', ''))
+            contracts = int(float(trade.get('closed_contracts') or trade.get('contracts') or 0))
+            entry = round(float(trade.get('entry_opt_price') or trade.get('entry_price') or 0), 4)
+            exit_price = round(float(trade.get('exit_opt_price') or trade.get('exit_price') or 0), 4)
+            pnl = round(float(trade.get('pnl_usd') or 0), 2)
+            reason = str(trade.get('exit_reason') or trade.get('reason') or '')[:80]
+            return f"{source}|{sym}|{direction}|{contracts}|{entry}|{exit_price}|{pnl}|{reason}"
+        except Exception:
+            return f"{source}|{time.time()}"
+
+    def _notification_log_path(self):
+        today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+        log_dir = os.path.join(_app_dir(), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f'notifications_{today_et}.json')
+
+    def _load_notification_keys(self):
+        try:
+            path = self._notification_log_path()
+            if not os.path.exists(path):
+                return set()
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            return {str(item.get('key')) for item in data.get('items', []) if item.get('key')}
+        except Exception:
+            return set()
+
+    def _mark_notification_sent(self, key, msg_type, title=''):
+        try:
+            path = self._notification_log_path()
+            data = {'items': []}
+            if os.path.exists(path):
+                with open(path, encoding='utf-8') as f:
+                    data = json.load(f)
+            items = data.setdefault('items', [])
+            if any(str(item.get('key')) == str(key) for item in items):
+                return
+            items.append({
+                'key': key,
+                'type': msg_type,
+                'title': title,
+                'time': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            print(f"  ⚠️ 通知记录写入失败: {e}")
+
     def _save_state(self):
         """保存状态到state.json（供 Web 仪表盘读取）"""
         try:
@@ -918,19 +972,22 @@ class QQQLiveTrader:
             import dashboard_v7
             dashboard_v7.set_signal_manager(self.v7.signal_manager)
             
-            # 在新线程启动Dashboard
-            import threading
-            def run_dashboard():
-                try:
-                    dashboard_v7.run_dashboard("0.0.0.0", 8080)
-                except Exception as e:
-                    print(f"⚠️ Dashboard运行失败: {e}")
-            
-            dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
-            dashboard_thread.start()
-            
-            print("📊 v7 Dashboard已启动: http://localhost:8080")
-            self._add_event("📊 v7 Dashboard已启动", "engine")
+            if os.environ.get('QQQ_DASHBOARD_STARTED') == '1':
+                print("📊 v7 Dashboard已由 run_web.py 启动，交易引擎仅接入状态")
+            else:
+                # 直接运行 live_trader.py 时才启动 Dashboard
+                import threading
+                def run_dashboard():
+                    try:
+                        os.environ['QQQ_DASHBOARD_STARTED'] = '1'
+                        dashboard_v7.run_dashboard("0.0.0.0", 8080)
+                    except Exception as e:
+                        print(f"⚠️ Dashboard运行失败: {e}")
+
+                dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
+                dashboard_thread.start()
+                print("📊 v7 Dashboard已启动: http://localhost:8080")
+            self._add_event("📊 v7 Dashboard已连接", "engine")
             
             # 初始化Dashboard状态
             dashboard_v7.set_running(True)
@@ -2834,7 +2891,7 @@ class QQQLiveTrader:
             print(f"  📋 订单: {order_id}")
             print(f"  {'='*50}\n")
 
-            self._notify(
+            notified = self._notify(
                 f"✂️ 部分平仓 {pos['opt_symbol']}",
                 'partial',
                 pos=pos,
@@ -2846,6 +2903,15 @@ class QQQLiveTrader:
                 pnl_pct=pnl_pct,
                 pnl_usd=pnl_usd,
             )
+            partial_key_trade = {
+                **pos,
+                'closed_contracts': half,
+                'exit_opt_price': exit_opt,
+                'pnl_usd': pnl_usd,
+                'exit_reason': reason,
+            }
+            if notified:
+                self._mark_notification_sent(self._trade_notify_key(partial_key_trade, 'partial'), 'partial', pos.get('opt_symbol', ''))
 
             self._save_state()
             self._sync_gist()  # 实时同步到小程序
@@ -3054,7 +3120,7 @@ class QQQLiveTrader:
             print(f"  📋 订单: {order_id}")
             print(f"  {'='*50}\n")
 
-            self._notify(
+            notified = self._notify(
                 f"🏁 平仓 {pos['opt_symbol']}",
                 'exit',
                 pos=closed_pos,
@@ -3065,6 +3131,8 @@ class QQQLiveTrader:
                 pnl_usd=pnl_usd,
                 order_id=order_id,
             )
+            if notified:
+                self._mark_notification_sent(self._trade_notify_key(closed_pos, 'exit'), 'exit', pos.get('opt_symbol', ''))
 
             closed_symbol = pos.get('opt_symbol')
             if closing_full:
@@ -3557,7 +3625,7 @@ class QQQLiveTrader:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, 'a', encoding='utf-8') as f:
                     f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
-                return
+                return False
 
             # 根据消息类型生成格式化文本
             if msg_type == 'entry' and kw:
@@ -3604,42 +3672,76 @@ class QQQLiveTrader:
             if proxy_url:
                 proxies = {'https': proxy_url, 'http': proxy_url}
 
-            resp = requests.post(
-                f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                json={'chat_id': chat_id, 'text': full_text, 'parse_mode': 'HTML'},
-                timeout=15,
-                proxies=proxies
+            api_url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+
+            def _post_telegram(payload, label):
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        return requests.post(
+                            api_url,
+                            json=payload,
+                            timeout=15,
+                            proxies=proxies,
+                        )
+                    except requests.RequestException as err:
+                        last_error = err
+                        safe_err = str(err).replace(bot_token, '***TOKEN***')
+                        print(f"  ⚠️ Telegram{label}网络异常({attempt + 1}/3): {safe_err[:220]}")
+                        if attempt < 2:
+                            time.sleep(2 * (attempt + 1))
+                raise last_error
+
+            resp = _post_telegram(
+                {'chat_id': chat_id, 'text': full_text, 'parse_mode': 'HTML'},
+                '推送',
             )
             result = resp.json()
             if result.get('ok'):
                 print(f"  ✅ Telegram推送成功")
+                return True
             else:
                 print(f"  ⚠️ Telegram推送失败: {result}")
                 # 如果HTML解析失败，回退纯文本
                 if 'can\'t parse' in str(result):
-                    resp2 = requests.post(
-                        f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                        json={'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
-                        timeout=15,
-                        proxies=proxies
+                    resp2 = _post_telegram(
+                        {'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
+                        '纯文本回退',
                     )
+                    try:
+                        fallback = resp2.json()
+                        if fallback.get('ok'):
+                            print(f"  ✅ Telegram纯文本回退成功")
+                            return True
+                        print(f"  ⚠️ Telegram纯文本回退失败: {fallback}")
+                    except Exception:
+                        print(f"  ⚠️ Telegram纯文本回退响应异常: {resp2.text[:200]}")
+                return False
         except Exception as e:
-            import traceback
-            print(f"  ⚠️ Telegram通知异常: {e}")
-            traceback.print_exc()
+            safe_err = str(e)
+            try:
+                bot_token = self.cfg.get('telegram', {}).get('bot_token', '')
+                if bot_token:
+                    safe_err = safe_err.replace(bot_token, '***TOKEN***')
+            except Exception:
+                pass
+            print(f"  ⚠️ Telegram通知失败，已记录到本地，后续会重试: {safe_err[:260]}")
             log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
+            return False
 
     def _notify(self, msg, msg_type='info', **kw):
         """统一通知 - 同时发送飞书和Telegram"""
         tg_cfg = self.cfg.get('telegram', {})
         print(f"  📨 Telegram推送: enabled={tg_cfg.get('enabled')}, type={msg_type}")
+        sent = False
         if self.cfg.get('feishu', {}).get('enabled', True):
             self._notify_feishu(msg)
         if tg_cfg.get('enabled', False):
-            self._notify_telegram(msg, msg_type=msg_type, **kw)
+            sent = bool(self._notify_telegram(msg, msg_type=msg_type, **kw))
+        return sent
 
     def _handle_error_with_notification(self, error, context="", notify_type=None):
         """处理错误并发送通知（避免重复通知）"""
@@ -4511,20 +4613,21 @@ class QQQLiveTrader:
         # 从broker对账重建交易记录（即使trades_today为空也能记录）
         broker_trades = self._reconcile_trades_from_broker()
 
-        # 检查是否有新发现的broker对账平仓，发送通知
-        existing_symbols = {t.get('opt_symbol') for t in (self.trades_today or [])}
+        # 检查是否有新发现的broker对账平仓，发送通知。
+        # 不能只按 opt_symbol 去重：同一天同一合约会反复开平，按合约去重会漏发前几单。
+        notified_keys = self._load_notification_keys()
         for bt in broker_trades:
             sym = bt.get('opt_symbol', '')
             pnl = bt.get('pnl_usd', 0)
-            # 如果这笔交易不在trades_today中，说明是新发现的平仓
-            if sym and sym not in existing_symbols and pnl != 0:
+            notify_key = self._trade_notify_key(bt, 'broker_exit')
+            if sym and pnl != 0 and notify_key not in notified_keys:
                 direction = bt.get('dir', '').upper()
                 entry_price = bt.get('entry_price', 0)
                 exit_price = bt.get('exit_price', 0)
                 contracts = bt.get('contracts', 0)
                 pnl_pct = bt.get('pnl_pct', 0)
                 emoji = '🟢' if pnl > 0 else '🔴'
-                self._notify(
+                notified = self._notify(
                     f"🏁 平仓 {sym}",
                     'exit',
                     pos={
@@ -4542,7 +4645,12 @@ class QQQLiveTrader:
                     pnl_pct=pnl_pct,
                     pnl_usd=pnl,
                 )
-                print(f"  {emoji} broker对账平仓通知: {sym} {direction} {contracts}张 ${pnl:+,.2f}")
+                if notified:
+                    self._mark_notification_sent(notify_key, 'broker_exit', sym)
+                    notified_keys.add(notify_key)
+                    print(f"  {emoji} broker对账平仓通知: {sym} {direction} {contracts}张 ${pnl:+,.2f}")
+                else:
+                    print(f"  ⚠️ broker对账平仓通知发送失败，稍后会重试: {sym} {direction} {contracts}张 ${pnl:+,.2f}")
 
         # 合并：broker对账数据 + 内部trades_today（去重）
         # broker数据更可靠，作为主源；trades_today补充未平仓的
