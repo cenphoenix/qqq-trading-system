@@ -16,6 +16,8 @@ import uvicorn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from signal_names import display_signal_name
+
 
 app = FastAPI(title="QQQ 0DTE v7 Dashboard")
 
@@ -78,13 +80,22 @@ class DashboardState:
         engine_states = []
         if self.signal_manager:
             engine_states = self.signal_manager.get_engine_states()
+            engine_states = [
+                {
+                    **engine,
+                    'raw_name': engine.get('name'),
+                    'name': display_signal_name(engine.get('name')),
+                }
+                for engine in engine_states
+            ]
             
         # 最新信号
         last_signal = None
         if self.signal_manager and self.signal_manager.last_signal:
             sig = self.signal_manager.last_signal
             last_signal = {
-                'engine': sig.engine,
+                'engine': display_signal_name(sig.engine),
+                'raw_engine': sig.engine,
                 'direction': sig.direction.value,
                 'strength': sig.strength,
                 'entry_price': sig.entry_price,

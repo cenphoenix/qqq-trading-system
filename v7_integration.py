@@ -1,163 +1,131 @@
-"""
-v7引擎集成层
-桥接新信号引擎与现有live_trader.py
-"""
-import sys
+"""v7 signal integration layer for live_trader.py."""
 import os
-from typing import Optional, Dict
-from datetime import datetime
+import sys
+from typing import Dict, Optional
 
-# 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from strategy.engines import (
-    SignalManager, Signal, SignalDirection,
-    OpeningRangeEngine, VWAPEngine, BollingerEngine,
-    EMAEngine, RSIDivergenceEngine, VIXFilter
+    SignalManager,
+    Signal,
+    OpeningRangeEngine,
+    VWAPEngine,
+    BollingerEngine,
+    EMAEngine,
+    RSIDivergenceEngine,
+    KlinePatternEngine,
+    GranvillePullbackEngine,
+    ChanFirstBuyEngine,
+    RSIOverboughtEngine,
+    MomentumDeathEngine,
+    VIXFilter,
 )
+from signal_names import display_signal_name
 
 
 class V7Integration:
-    """
-    v7引擎集成层
-    
-    职责:
-    1. 初始化并管理所有引擎
-    2. 将K线数据分发到引擎
-    3. 将v7 Signal转换为v6.5信号格式
-    4. 集成VIX过滤
-    """
-    
+    """Bridge new v7 engines into the signal format expected by live_trader."""
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        
-        # 初始化信号管理器
         self.signal_manager = SignalManager(cfg)
-        
-        # 注册5个引擎
+
         self.signal_manager.register(OpeningRangeEngine(cfg))
         self.signal_manager.register(VWAPEngine(cfg))
         self.signal_manager.register(BollingerEngine(cfg))
         self.signal_manager.register(EMAEngine(cfg))
         self.signal_manager.register(RSIDivergenceEngine(cfg))
-        
-        # VIX过滤器
+        self.signal_manager.register(KlinePatternEngine(cfg))
+        self.signal_manager.register(GranvillePullbackEngine(cfg))
+        self.signal_manager.register(ChanFirstBuyEngine(cfg))
+        self.signal_manager.register(RSIOverboughtEngine(cfg))
+        self.signal_manager.register(MomentumDeathEngine(cfg))
+
         self.vix_filter = VIXFilter(cfg)
-        
-        # 状态
         self.last_signal: Optional[Signal] = None
-        
+
     def update(self, bar: dict, et_minute: int = 0) -> None:
-        """
-        更新所有引擎
-        
-        Args:
-            bar: K线数据 {'open', 'high', 'low', 'close', 'volume', ...}
-            et_minute: 当前ET时间(分钟)
-        """
+        """Update all registered engines with the latest bar."""
         self.signal_manager.update(bar, et_minute)
-        
+
     def update_vix(self, vix: float) -> None:
-        """更新VIX值"""
+        """Update VIX filter value."""
         self.vix_filter.update(vix)
-        
+
     def check_signal(self) -> Optional[Dict]:
-        """
-        检查信号并转换为v6.5格式
-        
-        Returns:
-            v6.5格式的信号字典，或None
-        """
-        # VIX过滤
+        """Check all engines and return the live_trader-compatible signal."""
         if not self.vix_filter.should_trade():
             return None
-            
-        # 检查所有引擎
+
         signal = self.signal_manager.check()
         if signal is None:
             return None
-            
+
         self.last_signal = signal
-        
-        # 转换为v6.5格式
         result = self._convert_signal(signal)
-        
-        # 优化3+4: PUT入场门槛（neutral需强度>80，其他>70）
+
         if result['dir'] == 'put':
             min_strength = 80 if result['regime'] == 'neutral' else 70
             if signal.strength < min_strength:
                 return None
-        
+
         return result
-        
+
     def _convert_signal(self, sig: Signal) -> Dict:
-        """
-        将v7 Signal转换为v6.5信号格式
-        
-        v6.5格式:
-        {
-            'dir': 'call'/'put',
-            'reason': str,
-            'price': float,
-            'sl': float,
-            'tp': float,
-            'sl_pct': float,
-            'tp_partial_pct': float,
-            'timeout_bars': int,
-            'pos_mult': float,
-            'regime': str,
-            'engine': str,  # v7新增
-            'strength': float,  # v7新增
-        }
-        """
+        """Convert v7 Signal to the signal dict consumed by live_trader."""
         price = sig.entry_price
         dir_str = sig.direction.value
-        
-        # 从配置获取默认参数
+        display_engine = display_signal_name(sig.engine)
+
         sl_pct = self.cfg.get('sl', 0.25)
         tp_pct = self.cfg.get('tp', 0.30)
         tp_partial = self.cfg.get('tp_partial_pct', 1.0)
         timeout_bars = self.cfg.get('timeout_stage1_bars', 5)
-        
-        # 根据引擎调整参数
+
         pos_mult = 1.0
         regime = 'neutral'
-        
-        # VIX调整
-        vix_mult = self.vix_filter.get_position_mult()
-        pos_mult *= vix_mult
-        
-        # 引擎特定调整
+
+        pos_mult *= self.vix_filter.get_position_mult()
+
         if sig.engine == 'opening_range':
-            # 开盘区间突破：较高置信度
             pos_mult *= 1.1
             regime = 'trending'
         elif sig.engine == 'vwap':
-            # VWAP突破：标准参数
             regime = 'trending'
         elif sig.engine == 'bollinger':
-            # 布林带挤压：波动率高，收紧止损
             sl_pct *= 0.9
             regime = 'trending'
         elif sig.engine == 'ema':
-            # EMA交叉：趋势跟踪
             regime = 'trending'
         elif sig.engine == 'rsi_divergence':
-            # RSI背离：逆势信号，降低仓位
             pos_mult *= 0.8
             regime = 'neutral'
-            
-        # 计算止损止盈价格
+        elif sig.engine == 'kline_pattern':
+            pos_mult *= 0.8
+            regime = 'neutral'
+        elif sig.engine == 'granville_pullback':
+            pos_mult *= 0.9
+            regime = 'trending'
+        elif sig.engine == 'chan_first_buy':
+            pos_mult *= 0.7
+            regime = 'neutral'
+        elif sig.engine == 'rsi_overbought':
+            pos_mult *= 0.7
+            regime = 'neutral'
+        elif sig.engine == 'momentum_death':
+            pos_mult *= 0.8
+            regime = 'trending'
+
         if dir_str == 'call':
             sl_price = price * (1 - sl_pct)
             tp_price = price * (1 + tp_pct)
         else:
             sl_price = price * (1 + sl_pct)
             tp_price = price * (1 - tp_pct)
-            
+
         return {
             'dir': dir_str,
-            'reason': f'{sig.engine}: {sig.reason}',
+            'reason': f'{display_engine}: {sig.reason}',
             'price': price,
             'sl': sl_price,
             'tp': tp_price,
@@ -166,22 +134,23 @@ class V7Integration:
             'timeout_bars': timeout_bars,
             'pos_mult': pos_mult,
             'regime': regime,
-            # v7新增字段
-            'engine': sig.engine,
+            'engine': display_engine,
+            'raw_engine': sig.engine,
+            'display_engine': display_engine,
             'strength': sig.strength,
             'metadata': sig.metadata,
         }
-        
+
     def get_engine_states(self) -> list:
-        """获取所有引擎状态(用于dashboard)"""
+        """Return engine states for dashboard."""
         return self.signal_manager.get_engine_states()
-        
+
     def get_vix_state(self) -> Dict:
-        """获取VIX状态"""
+        """Return VIX state for dashboard."""
         return self.vix_filter.get_state()
-        
+
     def reset(self) -> None:
-        """重置所有引擎(新交易日)"""
+        """Reset all engines for a new trading day."""
         self.signal_manager.reset()
         self.vix_filter.reset()
         self.last_signal = None

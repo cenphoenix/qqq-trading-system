@@ -8,6 +8,13 @@ from .vwap_engine import VWAPEngine
 from .bollinger_engine import BollingerEngine
 from .ema_engine import EMAEngine
 from .rsi_engine import RSIDivergenceEngine
+from .pattern_engines import (
+    KlinePatternEngine,
+    GranvillePullbackEngine,
+    ChanFirstBuyEngine,
+    RSIOverboughtEngine,
+    MomentumDeathEngine,
+)
 from .vix_filter import VIXFilter, VIXRegime
 
 __all__ = [
@@ -20,6 +27,11 @@ __all__ = [
     'BollingerEngine',
     'EMAEngine',
     'RSIDivergenceEngine',
+    'KlinePatternEngine',
+    'GranvillePullbackEngine',
+    'ChanFirstBuyEngine',
+    'RSIOverboughtEngine',
+    'MomentumDeathEngine',
     'VIXFilter',
     'VIXRegime',
 ]

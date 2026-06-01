@@ -45,6 +45,7 @@ def _json_default(obj):
 
 # ===== 策略模块 =====
 from strategy import get_option_symbol, FilterEngine
+from signal_names import display_signal_name
 from v7_integration import V7Integration
 
 # ===== 长桥SDK =====
@@ -289,7 +290,8 @@ class QQQLiveTrader:
         try:
             self._signal_probe_seq += 1
             entry_time = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
-            signal_name = sig.get('engine') or sig.get('regime') or 'QQQ_Breakout'
+            raw_signal = sig.get('display_engine') or sig.get('engine') or sig.get('regime') or 'breakout'
+            signal_name = display_signal_name(raw_signal)
             probe = {
                 'id': self._signal_probe_seq,
                 'entry_time': entry_time,
@@ -1622,6 +1624,8 @@ class QQQLiveTrader:
             'timeout_bars': regime_params['timeout_bars'],
             'pos_mult': regime_params['pos_mult'],
             'regime': regime,
+            'engine': 'breakout',
+            'display_engine': 'Kline_Pattern',
         }
 
         self._save_state()
@@ -1745,6 +1749,8 @@ class QQQLiveTrader:
                         'price': entry,
                         'sl': entry * (1 - self.cfg['sl']),
                         'tp': entry * (1 + self.cfg['tp']),
+                        'engine': 'reversal',
+                        'display_engine': 'RSI_Reversal',
                     }
                     # 冷却检查（时间戳方式）
                     if self.loss_cooldown_until is not None:
@@ -1813,6 +1819,8 @@ class QQQLiveTrader:
                         'sl_pct': 0.18,  # PUT止损18%
                         'sl': entry * (1 + 0.18),
                         'tp': entry * (1 - self.cfg['tp']),
+                        'engine': 'reversal',
+                        'display_engine': 'RSI_Reversal',
                     }
                     # 冷却检查（时间戳方式）
                     if self.loss_cooldown_until is not None:
@@ -2209,7 +2217,7 @@ class QQQLiveTrader:
                 import dashboard_v7
                 dashboard_v7.add_trade({
                     'timestamp': datetime.now(TZ_ET).strftime('%H:%M:%S'),
-                    'engine': sig.get('engine', 'v6.5'),
+                    'engine': sig.get('display_engine') or display_signal_name(sig.get('engine', 'v6.5')),
                     'direction': sig['dir'],
                     'strength': sig.get('strength', 0),
                     'entry_price': float(price),

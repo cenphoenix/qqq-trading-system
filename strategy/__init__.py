@@ -14,6 +14,11 @@ from .engines import (
     BollingerEngine,
     EMAEngine,
     RSIDivergenceEngine,
+    KlinePatternEngine,
+    GranvillePullbackEngine,
+    ChanFirstBuyEngine,
+    RSIOverboughtEngine,
+    MomentumDeathEngine,
     VIXFilter,
     VIXRegime,
 )
@@ -31,6 +36,11 @@ __all__ = [
     'BollingerEngine',
     'EMAEngine',
     'RSIDivergenceEngine',
+    'KlinePatternEngine',
+    'GranvillePullbackEngine',
+    'ChanFirstBuyEngine',
+    'RSIOverboughtEngine',
+    'MomentumDeathEngine',
     'VIXFilter',
     'VIXRegime',
 ]
