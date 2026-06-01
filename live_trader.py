@@ -396,15 +396,16 @@ class QQQLiveTrader:
                             if line and '=' in line and not line.startswith('#'):
                                 k, v = line.split('=', 1)
                                 v = v.strip('"').strip("'")
-                                if 'LONGPORT' in k or 'MINIMAX' in k:
+                                if 'LONGPORT' in k or 'LONGBRIDGE' in k or 'MINIMAX' in k:
                                     os.environ[k] = v
                     print(f"Loaded env from: {env_file}")
                     break
 
-            # 使用环境变量中的 ACCESS_TOKEN（模拟盘静态 Token）
             # OAuth 2.0 认证（自动管理 token）
             import os
-            client_id = os.environ.get('LONGBRIDGE_CLIENT_ID', '555390a4-1348-49f4-9283-a300713bf50f')
+            client_id = os.environ.get('LONGBRIDGE_CLIENT_ID')
+            if not client_id:
+                raise RuntimeError("缺少 LONGBRIDGE_CLIENT_ID，请在 .env 中配置长桥 OAuth Client ID")
             
             # 首次运行会打印授权链接，完成后 token 自动缓存
             oauth = OAuthBuilder(client_id).build(
@@ -1759,7 +1760,7 @@ class QQQLiveTrader:
         vol_mult_factor = 1.0
         if self.cfg.get('vol_adjusted_sizing', True) and self.engine.atr > 0:
             base_atr = self.cfg.get('base_atr', 0.35) if 'base_atr' in self.cfg else 0.35
-            vol_mult_factor = base_atr / self.engine.atr * 100  # baseATR / currentATR
+            vol_mult_factor = base_atr / self.engine.atr  # baseATR / currentATR
             vol_mult_factor = max(0.4, min(vol_mult_factor, 1.6))  # 封顶 0.4x~1.6x
             print(f"  📈 波动率调整: ATR=${self.engine.atr:.2f} vs base=${base_atr} → coef={vol_mult_factor:.2f}")
 
@@ -2514,15 +2515,87 @@ class QQQLiveTrader:
                 remark=f"v6_partial_close",
             )
 
+            order_id = resp.order_id
+            print(f"  📋 半仓平仓订单已提交: {order_id}")
+
+            partial_filled = False
+            executed_qty = 0
+            executed_price = 0
+            max_retries = 5
+            retry_interval = 3
+
+            for attempt in range(max_retries):
+                time.sleep(retry_interval)
+                try:
+                    order_info = None
+                    try:
+                        orders = self.trade_ctx.today_orders(order_id=order_id)
+                        if orders:
+                            order_info = orders[0]
+                    except Exception as e1:
+                        print(f"  ⚠️ 半仓查询失败(方式1): {e1}")
+
+                    if not order_info:
+                        try:
+                            all_orders = self.trade_ctx.today_orders()
+                            for o in all_orders:
+                                if str(getattr(o, 'order_id', None)) == str(order_id):
+                                    order_info = o
+                                    break
+                        except Exception as e2:
+                            print(f"  ⚠️ 半仓查询失败(方式2): {e2}")
+
+                    if not order_info:
+                        print(f"  ⚠️ 未找到半仓订单: {order_id} ({attempt + 1}/{max_retries})")
+                        continue
+
+                    order_status = getattr(order_info, 'status', None)
+                    executed_qty = float(getattr(order_info, 'executed_quantity', 0) or 0)
+                    executed_price = float(getattr(order_info, 'executed_price', 0) or 0)
+                    print(f"  📊 半仓状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
+
+                    if str(order_status) == 'OrderStatus.Rejected':
+                        print(f"  ❌ 半仓平仓订单被拒，保留原持仓")
+                        self._notify(
+                            f"❌ 半仓平仓被拒 {pos['opt_symbol']}",
+                            'position_anomaly',
+                            anomaly_type='partial_rejected',
+                            details=f"订单 <code>{order_id}</code>\n持仓保留，等待下次风控重试",
+                        )
+                        self._save_state()
+                        return
+
+                    if executed_qty > 0:
+                        partial_filled = True
+                        break
+
+                    if attempt == max_retries - 1:
+                        try:
+                            self.trade_ctx.cancel_order(order_id)
+                            print(f"  🚫 半仓订单超时未成交，已尝试取消")
+                        except Exception as cancel_err:
+                            print(f"  ⚠️ 半仓订单取消失败: {cancel_err}")
+                except Exception as query_err:
+                    print(f"  ⚠️ 半仓查询异常: {query_err}")
+
+            if not partial_filled:
+                print(f"  ⏳ 半仓平仓未成交，保留原持仓")
+                self._save_state()
+                return
+
+            half = min(int(executed_qty), half)
+
             # 获取平仓时的期权价格
-            try:
-                opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
-                if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
-                    exit_opt = float(opt_quotes[0].last_done)
-                else:
+            exit_opt = float(executed_price) if executed_price > 0 else 0
+            if exit_opt <= 0:
+                try:
+                    opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
+                    if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
+                        exit_opt = float(opt_quotes[0].last_done)
+                    else:
+                        exit_opt = pos.get('entry_opt_price') or 1.0
+                except:
                     exit_opt = pos.get('entry_opt_price') or 1.0
-            except:
-                exit_opt = pos.get('entry_opt_price') or 1.0
 
             entry_opt = pos.get('entry_opt_price') or exit_opt
             if entry_opt <= 0:
@@ -2585,7 +2658,7 @@ class QQQLiveTrader:
             print(f"  💰 入场: ${entry_opt:.2f} → 平仓: ${exit_opt:.2f}")
             print(f"  📊 平仓: {half}张 | 剩余: {pos['contracts']}张")
             print(f"  💵 本次盈亏: {pnl_pct:+.2f}% (${pnl_usd:+,.2f})")
-            print(f"  📋 订单: {resp.order_id}")
+            print(f"  📋 订单: {order_id}")
             print(f"  {'='*50}\n")
 
             self._notify(
@@ -2634,6 +2707,8 @@ class QQQLiveTrader:
             max_retries = 5
             retry_interval = 3
             exit_opt = 0
+            close_qty = 0
+            requested_qty = int(pos['contracts'])
 
             for attempt in range(max_retries):
                 time.sleep(retry_interval)
@@ -2667,24 +2742,29 @@ class QQQLiveTrader:
                         
                         print(f"  📊 平仓状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
                         
-                        # ⚠️ 订单被拒：立即清除持仓，不再重试
                         if str(order_status) == 'OrderStatus.Rejected':
-                            print(f"  ❌ 平仓订单被拒! 清除内部持仓")
-                            self._unsubscribe_quotes([pos.get('opt_symbol')])
-                            self.position = None
+                            print(f"  ❌ 平仓订单被拒，保留持仓等待下次重试")
+                            self._notify(
+                                f"❌ 平仓被拒 {pos['opt_symbol']}",
+                                'position_anomaly',
+                                anomaly_type='close_rejected',
+                                details=f"订单 <code>{order_id}</code>\n持仓保留，等待下次风控重试",
+                            )
                             self._save_state()
                             return
-                        
-                        if executed_qty >= pos['contracts']:
+                         
+                        if executed_qty >= requested_qty:
                             close_filled = True
+                            close_qty = requested_qty
                             exit_opt = float(executed_price) if executed_price > 0 else 0
                             print(f"  ✅ 平仓完全成交!")
                             break
                         elif executed_qty > 0:
                             # 部分成交
-                            print(f"  ⚠️ 平仓部分成交: {executed_qty}/{pos['contracts']}张")
+                            print(f"  ⚠️ 平仓部分成交: {executed_qty}/{requested_qty}张")
                             if attempt == max_retries - 1:
                                 close_filled = True
+                                close_qty = int(executed_qty)
                                 exit_opt = float(executed_price) if executed_price > 0 else 0
                                 break
                         else:
@@ -2725,6 +2805,10 @@ class QQQLiveTrader:
                 print(f"  ⏳ 保留持仓，等待下次平仓重试")
                 self._save_state()
                 return
+            if close_qty <= 0:
+                print(f"  ⚠️ 平仓成交数量异常，保留持仓")
+                self._save_state()
+                return
 
             entry_opt = pos.get('entry_opt_price') or exit_opt
             if entry_opt <= 0:
@@ -2733,53 +2817,60 @@ class QQQLiveTrader:
             pnl_pct = (exit_opt - entry_opt) / entry_opt * 100
 
             # 计算盈亏金额（张数 × 100股 × 权利金变动）
-            pnl_usd = pos['contracts'] * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
+            pnl_usd = close_qty * self.cfg['contract_multiplier'] * (exit_opt - entry_opt)
             
             # 扣除期权手续费（长桥美股期权：平台费$0.65/张 + 监管费$0.02/张）
             # 开仓和平仓各收一次，总手续费 = 张数 × $0.67 × 2
             option_fee_per_contract = 0.67  # $0.65平台费 + $0.02监管费
-            total_fee = pos['contracts'] * option_fee_per_contract * 2  # 开仓+平仓
+            total_fee = close_qty * option_fee_per_contract * 2  # 开仓+平仓
             pnl_usd -= total_fee
-            pos['option_fee'] = total_fee  # 记录手续费
+            pos['option_fee'] = pos.get('option_fee', 0) + total_fee  # 记录手续费
 
             self.daily_pnl += pnl_usd
+            closing_full = close_qty >= requested_qty
+            closed_pos = pos.copy()
+            closed_pos.update({
+                'win': pnl_pct > 0,
+                'exit_opt_price': exit_opt,
+                'exit_time': datetime.now(TZ_ET),
+                'pnl_pct': pnl_pct,
+                'pnl_usd': pnl_usd,
+                'exit_reason': reason,
+                'closed_contracts': close_qty,
+            })
             
             # 更新Dashboard
             try:
                 import dashboard_v7
                 dashboard_v7.update_pnl(self.daily_pnl, len(self.trades_today))
                 dashboard_v7.update_trades(self.trades_today)
-                dashboard_v7.update_position(None)
+                dashboard_v7.update_position(None if closing_full else pos)
                 dashboard_v7.add_event(f"{'🟢' if pnl_pct > 0 else '🔴'} 平仓: {pnl_usd:+.2f} ({pnl_pct:+.1f}%)", "trade")
             except Exception:
                 pass
 
-            # 标记盈亏
-            pos['win'] = pnl_pct > 0
-            pos['exit_opt_price'] = exit_opt
-            pos['exit_time'] = datetime.now(TZ_ET)
-            pos['pnl_pct'] = pnl_pct
-            pos['pnl_usd'] = pnl_usd
-            pos['exit_reason'] = reason
+            if closing_full:
+                # 标记盈亏
+                pos.update(closed_pos)
 
-            # 同步更新 trades_today 中的记录
-            for t in self.trades_today:
-                if t.get('opt_symbol') == pos['opt_symbol'] and t.get('exit_opt_price') is None:
-                    t.update({
-                        'win': pos['win'],
-                        'exit_opt_price': exit_opt,
-                        'exit_time': pos['exit_time'],
-                        'pnl_pct': pnl_pct,
-                        'pnl_usd': pnl_usd,
-                        'exit_reason': reason,
-                        # 市场上下文（从入场快照继承，已存在position中）
-                        'atr_at_entry': pos.get('atr_at_entry', 0),
-                        'macd_hist_entry': pos.get('macd_hist_entry', 0),
-                        'vwap_entry': pos.get('vwap_entry', 0),
-                        'sma20_entry': pos.get('sma20_entry', 0),
-                        'regime': pos.get('regime', 'neutral'),
-                    })
-                    break
+                # 同步更新 trades_today 中的记录
+                for t in self.trades_today:
+                    if t.get('opt_symbol') == pos['opt_symbol'] and t.get('exit_opt_price') is None:
+                        t.update({
+                            'win': closed_pos['win'],
+                            'exit_opt_price': exit_opt,
+                            'exit_time': closed_pos['exit_time'],
+                            'pnl_pct': pnl_pct,
+                            'pnl_usd': pnl_usd,
+                            'exit_reason': reason,
+                            # 市场上下文（从入场快照继承，已存在position中）
+                            'atr_at_entry': pos.get('atr_at_entry', 0),
+                            'macd_hist_entry': pos.get('macd_hist_entry', 0),
+                            'vwap_entry': pos.get('vwap_entry', 0),
+                            'sma20_entry': pos.get('sma20_entry', 0),
+                            'regime': pos.get('regime', 'neutral'),
+                        })
+                        break
 
             d = "✅盈利" if pnl_pct > 0 else "❌亏损"
             print(f"\n  {'='*50}")
@@ -2793,7 +2884,7 @@ class QQQLiveTrader:
             self._notify(
                 f"🏁 平仓 {pos['opt_symbol']}",
                 'exit',
-                pos=pos,
+                pos=closed_pos,
                 reason=reason,
                 entry_opt=entry_opt,
                 exit_opt=exit_opt,
@@ -2803,8 +2894,15 @@ class QQQLiveTrader:
             )
 
             closed_symbol = pos.get('opt_symbol')
-            self.position = None  # 成功后才清空
-            self._unsubscribe_quotes([closed_symbol])
+            if closing_full:
+                self.position = None  # 全部成交后才清空
+                self._unsubscribe_quotes([closed_symbol])
+            else:
+                pos['contracts'] = requested_qty - close_qty
+                pos['quantity'] = pos['contracts'] * self.cfg['contract_multiplier']
+                pos['half_closed'] = True
+                pos['half_closed_max_pct'] = max(pos.get('half_closed_max_pct', 0), pnl_pct)
+                print(f"  ⚠️ 平仓只成交 {close_qty}/{requested_qty}张，剩余 {pos['contracts']}张继续风控")
             
             # 更新方向累计盈亏（所有单，不分盈亏）
             if pos['dir'] == 'call':

@@ -22,10 +22,16 @@ logs/
 
 # 运行时数据
 state.json
+position_snapshot.json
 longbridge_orders.json
 today.csv
 data/
 records/
+weekly_sent.flag
+
+# 本地备份
+*.backup
+*_backup
 
 # IDE
 .vscode/
