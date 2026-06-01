@@ -61,6 +61,13 @@ DEFAULT_CONFIG = {
         "stock_trail_pct": 0.003,   # 正股从高点回撤0.3%
         "trail_activate": 0.10,     # 跟踪止损激活 10%
         "trail_drop": 0.05,         # 跟踪止损回撤 5%
+        # 正股盈亏风控（按回测 v6.3 口径，优先于期权报价噪声）
+        "stock_exit_enabled": True,
+        "stock_sl_pct": 0.0025,     # 正股反向0.25%止损
+        "stock_tp_pct": 0.0040,     # 正股顺向0.40%止盈
+        "stock_trail_activate": 0.0030, # 正股顺向0.30%后启用跟踪
+        "stock_trail_drop": 0.0015,     # 从正股峰值回撤0.15%退出
+        "put_time_stop_bars": 0,    # 0=关闭 PUT 专属时间止损
         # 超时退出
         "timeout_stage1_bars": 5,
         "timeout_stage1_min": 0.30,
@@ -121,6 +128,12 @@ PARAM_TYPES = {
     "risk.stock_trail_pct": {"type": "float", "min": 0.001, "max": 0.02, "label": "正股跟踪止损(%)", "display_pct": True},
     "risk.trail_activate": {"type": "float", "min": 0.05, "max": 0.30, "label": "跟踪止损激活(%)", "display_pct": True},
     "risk.trail_drop": {"type": "float", "min": 0.01, "max": 0.15, "label": "跟踪止损回撤(%)", "display_pct": True},
+    "risk.stock_exit_enabled": {"type": "bool", "label": "正股风控"},
+    "risk.stock_sl_pct": {"type": "float", "min": 0.001, "max": 0.02, "label": "正股止损(%)", "display_pct": True},
+    "risk.stock_tp_pct": {"type": "float", "min": 0.001, "max": 0.03, "label": "正股止盈(%)", "display_pct": True},
+    "risk.stock_trail_activate": {"type": "float", "min": 0.001, "max": 0.03, "label": "正股跟踪激活(%)", "display_pct": True},
+    "risk.stock_trail_drop": {"type": "float", "min": 0.0005, "max": 0.02, "label": "正股跟踪回撤(%)", "display_pct": True},
+    "risk.put_time_stop_bars": {"type": "int", "min": 0, "max": 30, "label": "PUT时间止损"},
     "risk.timeout_stage1_bars": {"type": "int", "min": 2, "max": 15, "label": "超时1(分钟)"},
     "risk.timeout_stage1_min": {"type": "float", "min": 0.05, "max": 0.50, "label": "超时1目标(%)", "display_pct": True},
     "risk.timeout_stage2_bars": {"type": "int", "min": 5, "max": 30, "label": "超时2(分钟)"},

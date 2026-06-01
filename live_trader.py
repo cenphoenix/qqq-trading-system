@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 TZ_ET = ZoneInfo("America/New_York")    # 美东（自动EDT/EST切换）
 
 
-# stdout兜底（打包后console=False时为None，由入口main_app.py统一处理）
+# stdout兜底（打包后 console=False 时可能为 None）
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 if sys.stderr is None:
@@ -78,6 +78,9 @@ def _load_config():
             'extended_end_time': '15:00',
             'extension_order_pct': 5,
             'trail_activate': 0.10, 'trail_drop': 0.05,
+            'stock_exit_enabled': True, 'stock_sl_pct': 0.0025, 'stock_tp_pct': 0.0040,
+            'stock_trail_activate': 0.0030, 'stock_trail_drop': 0.0015,
+            'put_time_stop_bars': 0,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
             'check_interval': 20, 'capital': 100000,
@@ -212,7 +215,7 @@ class QQQLiveTrader:
         os.makedirs(self.csv_dir, exist_ok=True)
         self._last_position_verify = 0  # 上次持仓验证时间戳
 
-        # 共享状态文件（供trader_web.py读取）
+        # 共享状态文件（供 Web 仪表盘读取）
         self.state_path = os.path.join(script_dir, 'state.json')
 
         # 信号过滤状态（实时同步给Web）
@@ -245,6 +248,8 @@ class QQQLiveTrader:
         # Web 显示用的实时账户/持仓
         self._account_state = {}
         self._broker_positions = []
+        self.signal_probes = []
+        self._signal_probe_seq = 0
 
         # 实时事件日志（供仪表盘读取）
         self.events = []  # [{'time': 'HH:MM:SS', 'msg': '...', 'tag': 'info/signal/trade/error'}]
@@ -279,8 +284,130 @@ class QQQLiveTrader:
         except Exception as e:
             print(f"  ⚠️ CSV写入失败: {e}")
 
+    def _start_signal_probe(self, sig, opt_symbol, contracts, entry_price, entry_bar):
+        """记录入场后5/10/20根K线的正股方向收益，用于分析信号质量。"""
+        try:
+            self._signal_probe_seq += 1
+            entry_time = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
+            signal_name = sig.get('engine') or sig.get('regime') or 'QQQ_Breakout'
+            probe = {
+                'id': self._signal_probe_seq,
+                'entry_time': entry_time,
+                'entry_bar': int(entry_bar),
+                'signal': signal_name,
+                'dir': sig.get('dir', ''),
+                'entry_price': float(entry_price),
+                'opt_symbol': opt_symbol,
+                'contracts': int(contracts),
+                'reason': sig.get('reason', ''),
+                'regime': sig.get('regime', ''),
+                'milestones': {5: None, 10: None, 20: None},
+                'completed': False,
+            }
+            self.signal_probes.append(probe)
+            if len(self.signal_probes) > 500:
+                self.signal_probes = self.signal_probes[-500:]
+            self._save_signal_probes_snapshot()
+        except Exception as e:
+            print(f"  ⚠️ 信号追踪初始化失败: {e}")
+
+    def _update_signal_probes(self, candle):
+        """每根已完成K线更新未完成的信号追踪记录。"""
+        if not self.signal_probes:
+            return
+        changed = False
+        current_bar = len(self.one_min_candles)
+        current_price = float(candle.get('close', 0) or 0)
+        if current_price <= 0:
+            return
+
+        for probe in self.signal_probes:
+            if probe.get('completed'):
+                continue
+            entry_price = float(probe.get('entry_price', 0) or 0)
+            if entry_price <= 0:
+                continue
+            bars_elapsed = current_bar - int(probe.get('entry_bar', current_bar))
+            milestones = probe.setdefault('milestones', {5: None, 10: None, 20: None})
+            for target in (5, 10, 20):
+                if bars_elapsed < target or milestones.get(target) is not None:
+                    continue
+                pct = (current_price - entry_price) / entry_price * 100
+                if probe.get('dir') == 'put':
+                    pct = -pct
+                ts = candle.get('time')
+                if isinstance(ts, datetime):
+                    ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+                milestones[target] = {
+                    'bars': target,
+                    'time': ts,
+                    'price': current_price,
+                    'pct': round(pct, 4),
+                }
+                probe[f'm{target}_pct'] = round(pct, 4)
+                probe[f'm{target}_price'] = current_price
+                changed = True
+            probe['completed'] = all(milestones.get(t) is not None for t in (5, 10, 20))
+
+        if changed:
+            self._save_signal_probes_snapshot()
+            try:
+                import dashboard_v7
+                dashboard_v7.update_signal_probes(self._serialize_signal_probes())
+            except Exception:
+                pass
+
+    def _save_signal_probes_snapshot(self):
+        """把信号追踪单独落盘，避免依赖平仓记录。"""
+        try:
+            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+            records_dir = os.path.join(_app_dir(), 'records')
+            os.makedirs(records_dir, exist_ok=True)
+            filepath = os.path.join(records_dir, f'signal_probes_{today_et}.json')
+            rows = self._serialize_signal_probes()
+            tmp_path = filepath + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'date': today_et,
+                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
+                    'probes': rows,
+                }, f, ensure_ascii=False, indent=2, default=_json_default)
+            os.replace(tmp_path, filepath)
+            try:
+                import dashboard_v7
+                dashboard_v7.update_signal_probes(rows)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"  ⚠️ 信号追踪保存失败: {e}")
+
+    def _serialize_signal_probes(self):
+        rows = []
+        for p in self.signal_probes:
+            rows.append({
+                'id': p.get('id'),
+                'entry_time': p.get('entry_time', ''),
+                'entry_bar': p.get('entry_bar', 0),
+                'signal': p.get('signal', ''),
+                'dir': p.get('dir', ''),
+                'entry_price': p.get('entry_price', 0),
+                'opt_symbol': p.get('opt_symbol', ''),
+                'contracts': p.get('contracts', 0),
+                'reason': p.get('reason', ''),
+                'regime': p.get('regime', ''),
+                'm5_pct': p.get('m5_pct'),
+                'm10_pct': p.get('m10_pct'),
+                'm20_pct': p.get('m20_pct'),
+                'm5_price': p.get('m5_price'),
+                'm10_price': p.get('m10_price'),
+                'm20_price': p.get('m20_price'),
+                'completed': p.get('completed', False),
+                'milestones': p.get('milestones', {}),
+            })
+        return rows
+
     def _save_state(self):
-        """保存状态到state.json（供trader_web.py读取）"""
+        """保存状态到state.json（供 Web 仪表盘读取）"""
         try:
             import json
             uptime = int((datetime.now(TZ_ET) - self.start_time).total_seconds())
@@ -294,6 +421,7 @@ class QQQLiveTrader:
                 'current_price': self.current_price,
                 'position': None,
                 'trades_today': [],
+                'signal_probes': [],
                 'daily_pnl': self.daily_pnl,
                 'filter_status': self.filter_status,
                 'current_signal': self.current_signal,
@@ -337,6 +465,24 @@ class QQQLiveTrader:
                     'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
                     'opt_symbol': t.get('opt_symbol', ''),
                     'regime': t.get('regime', 'neutral'),
+                })
+            for p in self.signal_probes[-200:]:
+                state['signal_probes'].append({
+                    'id': p.get('id'),
+                    'time': p.get('entry_time', ''),
+                    'entry_bar': p.get('entry_bar', 0),
+                    'signal': p.get('signal', ''),
+                    'dir': p.get('dir', ''),
+                    'entry_price': p.get('entry_price', 0),
+                    'reason': p.get('reason', ''),
+                    'regime': p.get('regime', ''),
+                    'm5_pct': p.get('m5_pct'),
+                    'm10_pct': p.get('m10_pct'),
+                    'm20_pct': p.get('m20_pct'),
+                    'm5_price': p.get('m5_price'),
+                    'm10_price': p.get('m10_price'),
+                    'm20_price': p.get('m20_price'),
+                    'completed': p.get('completed', False),
                 })
             tmp_path = self.state_path + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -386,7 +532,6 @@ class QQQLiveTrader:
                 os.path.join(script_dir, '.env'),
                 os.path.expanduser('~/.hermes/.env'),
                 os.path.expanduser('~\\.hermes\\.env'),
-                r'C:\Users\Admin\.hermes\.env',
             ]
             for env_file in env_paths:
                 if os.path.exists(env_file):
@@ -822,6 +967,7 @@ class QQQLiveTrader:
 
         # 📥 恢复今日已平仓交易记录（从 records/ 文件，避免重启后数据丢失）
         self._load_today_records()
+        self._load_today_signal_probes()
 
         # 📊 加载昨日交易记录（用于启动通知）
         try:
@@ -957,6 +1103,8 @@ class QQQLiveTrader:
             self.put_wins = 0
             self.call_pnl = 0.0
             self.put_pnl = 0.0
+            self.signal_probes = []
+            self._signal_probe_seq = 0
             self.loss_cooldown_until = None  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
@@ -1000,6 +1148,7 @@ class QQQLiveTrader:
         one_min['dir'] = 1 if one_min['close'] >= one_min['open'] else -1
 
         self.one_min_candles.append(one_min)
+        self._update_signal_probes(one_min)
 
         # 写入today.csv（供cron监控读取）
         self._write_csv(one_min)
@@ -1994,6 +2143,7 @@ class QQQLiveTrader:
             }
             self._subscribe_position_quote(opt_symbol)
             self.trades_today.append(self.position.copy())
+            self._start_signal_probe(sig, opt_symbol, contracts, float(price), len(self.one_min_candles))
             self._add_event(f"📈 开仓: {opt_symbol} x{contracts}张 @${executed_price:.2f}", "trade")
             self.current_signal = None  # 已开仓，清除信号
             
@@ -2314,6 +2464,12 @@ class QQQLiveTrader:
         else:  # put
             pos['stock_peak'] = min(pos.get('stock_peak', entry_stock), current_stock)
 
+        stock_pnl = (current_stock - entry_stock) / entry_stock if entry_stock else 0
+        if pos['dir'] == 'put':
+            stock_pnl = -stock_pnl
+        stock_pnl_pct = stock_pnl * 100
+        pos['max_stock_pnl_pct'] = max(pos.get('max_stock_pnl_pct', 0), stock_pnl_pct)
+
         # 持仓K线数
         bars_held = len(self.one_min_candles) - pos['entry_bar']
 
@@ -2336,9 +2492,26 @@ class QQQLiveTrader:
         if pnl_pct <= -sl_pct:
             ex = f"止损({pnl_pct:.1f}%≤-{sl_pct:.0f}%)"
 
+        # --- 1.2 正股风控（回测v6.3口径，降低期权报价噪声影响）---
+        if not ex and self.cfg.get('stock_exit_enabled', True):
+            stock_sl = self.cfg.get('stock_sl_pct', 0.0025)
+            stock_tp = self.cfg.get('stock_tp_pct', 0.0040)
+            stock_trail_activate = self.cfg.get('stock_trail_activate', 0.0030)
+            stock_trail_drop = self.cfg.get('stock_trail_drop', 0.0015)
+
+            if stock_pnl <= -stock_sl:
+                ex = f"正股止损({stock_pnl_pct:.2f}%≤-{stock_sl*100:.2f}%)"
+            elif stock_pnl >= stock_tp:
+                ex = f"正股止盈({stock_pnl_pct:.2f}%≥{stock_tp*100:.2f}%)"
+            elif pos.get('max_stock_pnl_pct', 0) >= stock_trail_activate * 100:
+                stock_pullback = (pos.get('max_stock_pnl_pct', 0) - stock_pnl_pct) / 100
+                if stock_pullback >= stock_trail_drop:
+                    ex = f"正股跟踪止盈(峰值{pos.get('max_stock_pnl_pct', 0):.2f}%→{stock_pnl_pct:.2f}%,回撤{stock_pullback*100:.2f}%)"
+
         # --- 1.5 PUT时间止损：3分钟不盈利就平 ---
-        if not ex and pos['dir'] == 'put' and not pos.get('half_closed'):
-            if bars_held >= 3 and pnl_pct <= 0:
+        put_time_stop_bars = int(self.cfg.get('put_time_stop_bars', 0) or 0)
+        if not ex and put_time_stop_bars > 0 and pos['dir'] == 'put' and not pos.get('half_closed'):
+            if bars_held >= put_time_stop_bars and pnl_pct <= 0:
                 ex = f"PUT时间止损({bars_held}min无盈利)"
 
         # --- 2. 分阶段超时（v6.3: 使用动态timeout_bars）---
@@ -3888,6 +4061,58 @@ class QQQLiveTrader:
             import traceback
             traceback.print_exc()
 
+    def _load_today_signal_probes(self):
+        """恢复今日信号追踪记录，重启后继续补齐5/10/20根K线。"""
+        try:
+            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+            filepath = os.path.join(_app_dir(), 'records', f'signal_probes_{today_et}.json')
+            if not os.path.exists(filepath):
+                return
+            with open(filepath, encoding='utf-8') as f:
+                data = json.load(f)
+            probes = data.get('probes', [])
+            if not probes:
+                return
+            self.signal_probes = []
+            for p in probes:
+                milestones = p.get('milestones') or {5: None, 10: None, 20: None}
+                norm_milestones = {}
+                for k, v in milestones.items():
+                    try:
+                        norm_milestones[int(k)] = v
+                    except Exception:
+                        pass
+                restored = {
+                    'id': int(p.get('id', len(self.signal_probes) + 1)),
+                    'entry_time': p.get('entry_time', ''),
+                    'entry_bar': int(p.get('entry_bar', len(self.one_min_candles))),
+                    'signal': p.get('signal', ''),
+                    'dir': p.get('dir', ''),
+                    'entry_price': float(p.get('entry_price', 0) or 0),
+                    'opt_symbol': p.get('opt_symbol', ''),
+                    'contracts': int(p.get('contracts', 0) or 0),
+                    'reason': p.get('reason', ''),
+                    'regime': p.get('regime', ''),
+                    'm5_pct': p.get('m5_pct'),
+                    'm10_pct': p.get('m10_pct'),
+                    'm20_pct': p.get('m20_pct'),
+                    'm5_price': p.get('m5_price'),
+                    'm10_price': p.get('m10_price'),
+                    'm20_price': p.get('m20_price'),
+                    'milestones': norm_milestones or {5: None, 10: None, 20: None},
+                    'completed': bool(p.get('completed', False)),
+                }
+                self.signal_probes.append(restored)
+            self._signal_probe_seq = max((p.get('id', 0) for p in self.signal_probes), default=0)
+            print(f"📥 恢复今日信号追踪: {len(self.signal_probes)}条")
+            try:
+                import dashboard_v7
+                dashboard_v7.update_signal_probes(self._serialize_signal_probes())
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"⚠️ 恢复信号追踪失败: {e}")
+
     def _save_pending_records(self):
         """启动时保存上次未写入的交易记录（进程被kill -9不会调stop()）"""
         import json
@@ -4258,6 +4483,7 @@ class QQQLiveTrader:
                     'wins': wins,
                     'win_rate': round(wins / len(trades) * 100, 1) if trades else 0,
                     'pnl': round(total_pnl, 2),
+                    'signal_probes': self._serialize_signal_probes(),
                     'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
             # Windows文件锁定重试机制
@@ -4402,6 +4628,7 @@ class QQQLiveTrader:
                     'total': len(formatted_trades),
                     'wins': sum(1 for t in formatted_trades if t.get('result') == 'win'),
                     'pnl': round(total_pnl, 2),
+                    'signal_probes': self._serialize_signal_probes(),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
             # Windows文件锁定重试机制
             for attempt in range(5):

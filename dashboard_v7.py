@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -15,15 +15,13 @@ import uvicorn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from strategy.engines import SignalManager, Signal
-
 
 app = FastAPI(title="QQQ 0DTE v7 Dashboard")
 
 
 class DashboardState:
     def __init__(self):
-        self.signal_manager: Optional[SignalManager] = None
+        self.signal_manager: Optional[Any] = None
         self.connected_clients: List[WebSocket] = []
         
         # 账户信息
@@ -33,6 +31,7 @@ class DashboardState:
         self.daily_pnl: float = 0.0
         self.daily_trades: int = 0
         self.trades_today: List[Dict] = []
+        self.signal_probes: List[Dict] = []
         
         # 行情
         self.current_price: float = 0.0
@@ -141,6 +140,7 @@ class DashboardState:
             
             # 交易
             'trades': trades,
+            'signal_probes': self.signal_probes[-50:],
             'daily_pnl': self.daily_pnl,
             'daily_trades': self.daily_trades,
             
@@ -214,7 +214,7 @@ async def root():
 
 
 # 外部调用接口
-def set_signal_manager(manager: SignalManager):
+def set_signal_manager(manager: Any):
     state.signal_manager = manager
 
 def update_account(info: Dict):
@@ -232,6 +232,9 @@ def update_pnl(pnl: float, trades: int):
 
 def update_trades(trades: List[Dict]):
     state.trades_today = trades
+
+def update_signal_probes(probes: List[Dict]):
+    state.signal_probes = probes or []
 
 def add_trade(trade: Dict):
     state.trades_today.append(trade)
@@ -416,6 +419,11 @@ tr:hover{background:var(--surface-2)}
     </div>
   </div>
 
+  <div class="card" style="margin-bottom:12px"><div class="card-title">💹 信号后5/10/20根K线</div>
+    <table><thead><tr><th>#</th><th>时间</th><th>信号</th><th>方向</th><th>入场价</th><th>+5根</th><th>+10根</th><th>+20根</th></tr></thead>
+    <tbody id="tb-probes"></tbody></table>
+  </div>
+
   <div class="card"><div class="card-title">📋 实时事件</div><div class="log-box" id="log-box"></div></div>
 </div>
 
@@ -544,6 +552,28 @@ function update(d){
       <td class="${t.pnl_usd>=0?'t-up':'t-down'}">${t.pnl_usd>=0?'+':''}$${t.pnl_usd.toFixed(2)}</td>
     </tr>
   `).join('')||'<tr><td colspan="7" class="dim">无交易记录</td></tr>';
+
+  const probesBody=$('tb-probes');
+  const fmtPct=v=>{
+    if(v===null||v===undefined||v==='')return '--';
+    const n=Number(v);
+    if(!Number.isFinite(n))return '--';
+    return (n>=0?'+':'')+n.toFixed(2)+'%';
+  };
+  probesBody.innerHTML=(d.signal_probes||[]).slice(-20).reverse().map(p=>{
+    const rawTime=p.time||p.entry_time||'';
+    const time=rawTime.includes(' ')?rawTime.split(' ').pop().slice(0,8):String(rawTime).slice(0,8);
+    const dirUp=p.dir==='call';
+    const cell=v=>`<td class="${Number(v)>0?'t-up':Number(v)<0?'t-down':''}">${fmtPct(v)}</td>`;
+    return `<tr>
+      <td>${p.id||''}</td>
+      <td>${time||'--:--:--'}</td>
+      <td>${p.signal||p.regime||'QQQ_Breakout'}</td>
+      <td class="${dirUp?'t-up':'t-down'}">${dirUp?'多':'空'}</td>
+      <td>${p.entry_price?'$'+Number(p.entry_price).toFixed(2):'--'}</td>
+      ${cell(p.m5_pct)}${cell(p.m10_pct)}${cell(p.m20_pct)}
+    </tr>`;
+  }).join('')||'<tr><td colspan="8" class="dim">暂无信号追踪</td></tr>';
   
   // 事件日志
   const logBox=$('log-box');

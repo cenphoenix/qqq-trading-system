@@ -1,14 +1,17 @@
 @echo off
-title Stop Trading System
+setlocal
+title Stop QQQ Trading System
 
 echo ============================================
-echo   Stopping all Python processes...
+echo   Stopping QQQ Trading System...
 echo ============================================
 
-taskkill /F /IM python.exe /T >nul 2>&1
-taskkill /F /IM python3.exe /T >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$root=(Resolve-Path '%~dp0').Path.TrimEnd('\');" ^
+  "Get-CimInstance Win32_Process | Where-Object { ($_.Name -in @('python.exe','python3.exe')) -and ($_.CommandLine -like '*qqq-trading-system*' -or $_.CommandLine -like '*run_web.py*' -or $_.CommandLine -like '*live_trader.py*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
 
 timeout /t 2 /nobreak >nul
-echo   All stopped.
+echo   Done.
 echo.
 pause
+endlocal
