@@ -14,6 +14,7 @@
     "pullback_confirm": false,
     "reversal_drop": 0.002,
     "reversal_bounce": 0.001,
+    "disable_put_signals": true,
     "symbol": "QQQ.US"
   },
   "risk": {

@@ -1088,7 +1088,12 @@ class QQQLiveTrader:
         sig = self.v7.check_signal()
         if sig is None:
             return
-            
+
+        # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
+        if sig.get('dir') == 'put' and self.cfg.get('disable_put_signals', True):
+            print(f"  ⛔ v7 PUT信号已禁用 (disable_put_signals=True)")
+            return
+
         # 执行交易
         print(f"  🎯 v7信号: {sig['engine']} {sig['dir']} @ ${sig['price']:.2f} (强度:{sig['strength']:.0f})")
         self._execute_trade(sig)
@@ -1240,6 +1245,11 @@ class QQQLiveTrader:
             sig_dir = 'call'
         elif entry_price < lower and gap_dn < max_gap:
             sig_dir = 'put'
+
+        # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
+        if sig_dir == 'put' and self.cfg.get('disable_put_signals', True):
+            print(f"  ⛔ PUT信号已禁用 (disable_put_signals=True)")
+            return
 
         if not sig_dir:
             return
@@ -1584,6 +1594,11 @@ class QQQLiveTrader:
                         self._close_position("反转信号-平CALL")
                         self.position = None
                     
+                    # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
+                    if self.cfg.get('disable_put_signals', True):
+                        print(f"  ⛔ 反转PUT信号已禁用 (disable_put_signals=True)")
+                        return
+
                     sig = {
                         'dir': 'put',
                         'reason': f'超涨回调|从{self.session_low:.2f}涨{rise_from_low*100:.1f}% RSI1m{rsi_1m:.0f} RSI5m{rsi_5m:.0f}',
@@ -4171,6 +4186,39 @@ class QQQLiveTrader:
 
         # 从broker对账重建交易记录（即使trades_today为空也能记录）
         broker_trades = self._reconcile_trades_from_broker()
+
+        # 检查是否有新发现的broker对账平仓，发送通知
+        existing_symbols = {t.get('opt_symbol') for t in (self.trades_today or [])}
+        for bt in broker_trades:
+            sym = bt.get('opt_symbol', '')
+            pnl = bt.get('pnl_usd', 0)
+            # 如果这笔交易不在trades_today中，说明是新发现的平仓
+            if sym and sym not in existing_symbols and pnl != 0:
+                direction = bt.get('dir', '').upper()
+                entry_price = bt.get('entry_price', 0)
+                exit_price = bt.get('exit_price', 0)
+                contracts = bt.get('contracts', 0)
+                pnl_pct = bt.get('pnl_pct', 0)
+                emoji = '🟢' if pnl > 0 else '🔴'
+                self._notify(
+                    f"🏁 平仓 {sym}",
+                    'exit',
+                    pos={
+                        'opt_symbol': sym,
+                        'dir': bt.get('dir', ''),
+                        'entry_opt_price': entry_price,
+                        'exit_opt_price': exit_price,
+                        'contracts': contracts,
+                        'pnl_pct': pnl_pct,
+                        'pnl_usd': pnl,
+                    },
+                    reason='broker对账',
+                    entry_opt=entry_price,
+                    exit_opt=exit_price,
+                    pnl_pct=pnl_pct,
+                    pnl_usd=pnl,
+                )
+                print(f"  {emoji} broker对账平仓通知: {sym} {direction} {contracts}张 ${pnl:+,.2f}")
 
         # 合并：broker对账数据 + 内部trades_today（去重）
         # broker数据更可靠，作为主源；trades_today补充未平仓的
