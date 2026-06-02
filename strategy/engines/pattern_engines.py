@@ -94,22 +94,26 @@ class GranvillePullbackEngine(BaseEngine):
         prev = self.bars[-2]
         price = cur['close']
         ma_slope = ma - _sma(self.closes[:-1], self.ma_period)
+        vol_avg = sum(self.volumes[-21:-1]) / 20 if len(self.volumes) >= 21 else 0
+        vol_ratio = cur['volume'] / vol_avg if vol_avg > 0 else 1.0
 
         touched_from_above = prev['low'] <= ma * (1 + self.touch_pct) and prev['close'] >= ma * (1 - self.touch_pct)
         touched_from_below = prev['high'] >= ma * (1 - self.touch_pct) and prev['close'] <= ma * (1 + self.touch_pct)
+        call_confirm = cur['close'] > max(self.highs[-4:-1]) and vol_ratio >= self.cfg.get('granville_vol_mult', 0.9)
+        put_confirm = cur['close'] < min(self.lows[-4:-1]) and vol_ratio >= self.cfg.get('granville_vol_mult', 0.9)
 
-        if price > trend_ma and ma_slope > 0 and touched_from_above and cur['close'] > cur['open'] and cur['close'] > ma:
+        if price > trend_ma and ma_slope > 0 and touched_from_above and call_confirm and cur['close'] > cur['open'] and cur['close'] > ma:
             dist = (price - ma) / ma * 100
             strength = min(100, 58 + dist * 120)
             return Signal(self.name, SignalDirection.CALL, strength, price,
                           f"Granville回踩MA{self.ma_period}后上行 dist={dist:.2f}%",
-                          {'ma': ma, 'trend_ma': trend_ma, 'dist_pct': dist})
-        if price < trend_ma and ma_slope < 0 and touched_from_below and cur['close'] < cur['open'] and cur['close'] < ma:
+                          {'ma': ma, 'trend_ma': trend_ma, 'dist_pct': dist, 'vol_ratio': vol_ratio})
+        if price < trend_ma and ma_slope < 0 and touched_from_below and put_confirm and cur['close'] < cur['open'] and cur['close'] < ma:
             dist = (ma - price) / ma * 100
             strength = min(100, 58 + dist * 120)
             return Signal(self.name, SignalDirection.PUT, strength, price,
                           f"Granville反抽MA{self.ma_period}后下行 dist={dist:.2f}%",
-                          {'ma': ma, 'trend_ma': trend_ma, 'dist_pct': dist})
+                          {'ma': ma, 'trend_ma': trend_ma, 'dist_pct': dist, 'vol_ratio': vol_ratio})
         return None
 
 

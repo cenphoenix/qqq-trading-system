@@ -152,6 +152,11 @@ class EMAEngine(BaseEngine):
             return None
             
         price = self.closes[-1]
+        if len(self.closes) < max(self.ema_slow, 5):
+            return None
+        sma8 = sum(self.closes[-8:]) / 8 if len(self.closes) >= 8 else price
+        recent_up = self.closes[-1] > self.closes[-2] and self.closes[-2] >= self.closes[-3]
+        recent_down = self.closes[-1] < self.closes[-2] and self.closes[-2] <= self.closes[-3]
         
         # ADX过滤：必须有足够的趋势强度
         if self.adx < self.adx_threshold:
@@ -159,7 +164,7 @@ class EMAEngine(BaseEngine):
             
         # 金叉: 9 EMA上穿21 EMA (CALL)
         if self.ema9 > self.ema21 and self.ema9_prev <= self.ema21_prev:
-            if price > self.ema50:  # 价格在50 EMA上方
+            if price > self.ema50 and price > sma8 and recent_up:  # 价格在50 EMA上方
                 # 计算强度
                 ema_spread = (self.ema9 - self.ema21) / self.ema21 * 100
                 trend_dist = (price - self.ema50) / self.ema50 * 100
@@ -181,7 +186,7 @@ class EMAEngine(BaseEngine):
                 
         # 死叉: 9 EMA下穿21 EMA (PUT)
         if self.ema9 < self.ema21 and self.ema9_prev >= self.ema21_prev:
-            if price < self.ema50:  # 价格在50 EMA下方
+            if price < self.ema50 and price < sma8 and recent_down:  # 价格在50 EMA下方
                 ema_spread = (self.ema21 - self.ema9) / self.ema21 * 100
                 trend_dist = (self.ema50 - price) / self.ema50 * 100
                 strength = min(100, 60 + ema_spread * 1000 + trend_dist * 50 + self.adx)

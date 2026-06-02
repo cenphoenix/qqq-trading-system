@@ -241,6 +241,7 @@ class QQQLiveTrader:
         self._position_check_lock = False # 报价推送触发风控时防重入
         self._subscribed_quote_symbols = set()
         self.latest_quote_prices = {}
+        self._signal_cooldowns = {}
 
         # -- P0 #7 阶梯式日亏损熔断 --
         self._loss_circuit_warning_fired = False    # 警告级熔断是否已触发
@@ -284,6 +285,66 @@ class QQQLiveTrader:
                         f"{candle['close']},{candle['volume']},{candle.get('turnover', 0)}\n")
         except Exception as e:
             print(f"  ⚠️ CSV写入失败: {e}")
+
+    def _is_valid_stock_entry_price(self, entry_price, current_stock=None):
+        """Validate that entry_price is a QQQ stock price, not an option premium."""
+        try:
+            entry = float(entry_price or 0)
+            current = float(current_stock or self.current_price or 0)
+            if entry < 100:
+                return False
+            if current > 100 and abs(current - entry) / current > 0.10:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _current_stock_price(self):
+        price = self.latest_quote_prices.get(self.cfg['symbol']) or self.current_price or 0
+        try:
+            if float(price) > 100:
+                return float(price)
+        except Exception:
+            pass
+        try:
+            stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
+            if stock_quotes and float(stock_quotes[0].last_done) > 100:
+                return float(stock_quotes[0].last_done)
+        except Exception:
+            pass
+        return 0.0
+
+    def _position_signal_name(self, pos):
+        name = pos.get('display_engine') or pos.get('engine') or ''
+        if name:
+            return display_signal_name(name)
+        reason = str(pos.get('reason', ''))
+        for candidate in ('VWAP_Breakout', 'Granville_Pullback', 'EMA_Cross', 'Kline_Pattern', 'RSI_Reversal'):
+            if candidate in reason:
+                return candidate
+        if pos.get('regime') == 'neutral':
+            return 'Kline_Pattern'
+        return display_signal_name(name)
+
+    def _timeout_profile(self, pos):
+        signal = self._position_signal_name(pos)
+        reason = str(pos.get('reason', ''))
+        regime = pos.get('regime', '')
+        if signal == 'VWAP_Breakout':
+            return {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 2.0}
+        if signal == 'EMA_Cross':
+            return {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 0.0}
+        if signal == 'Granville_Pullback':
+            return {'signal': signal, 'stage': 7, 'hard': 10, 'min_profit': 2.0}
+        if signal == 'Kline_Pattern' or regime == 'neutral' or 'neutral' in reason:
+            return {'signal': 'Kline_Pattern', 'stage': 6, 'hard': 8, 'min_profit': 5.0}
+        base = int(pos.get('timeout_bars', 10) or 10)
+        return {
+            'signal': signal or 'default',
+            'stage': max(base * 3 // 4, 7),
+            'hard': base,
+            'min_profit': 5.0,
+        }
 
     def _start_signal_probe(self, sig, opt_symbol, contracts, entry_price, entry_bar):
         """记录入场后5/10/20根K线的正股方向收益，用于分析信号质量。"""
@@ -917,6 +978,8 @@ class QQQLiveTrader:
                     if qty > 0 and 'QQQ' in symbol and now_et in symbol:
                         cost = float(getattr(p, 'cost_price', 0))
                         direction = 'call' if 'C' in symbol.upper() else 'put'
+                        stock_entry = self._current_stock_price()
+                        stock_exit_enabled = stock_entry > 100
 
                         print(f"🔍 发现长桥持仓: {symbol} x{qty}")
                         print(f"📥 正在接管并同步到系统...")
@@ -925,13 +988,15 @@ class QQQLiveTrader:
                         self.position = {
                             'dir': direction,
                             'contracts': qty,
-                            'entry_price': cost,              # 期权成本价
                             'entry_opt_price': cost,          # 期权成本价（显式）
                             'opt_symbol': symbol,
+                            'entry_price': stock_entry if stock_exit_enabled else 0,
                             # 设为当前时间，防止被误判超时直接平仓
                             'entry_time': datetime.now(TZ_ET),
                             'stock_peak': 0,       # 等待报价更新
                             'stock_valley': 0,
+                            'stock_peak': stock_entry if stock_exit_enabled else 0,
+                            'stock_exit_enabled': stock_exit_enabled,
                             'half_closed': False,  # 假设未半仓
                             'max_pnl_pct': 0,
                             'max_pnl_abs': 0,
@@ -946,8 +1011,9 @@ class QQQLiveTrader:
                             'entry_time': datetime.now(TZ_ET),
                             'dir': direction,
                             'contracts': qty,
-                            'entry_price': cost,
                             'opt_symbol': symbol,
+                            'entry_opt_price': cost,
+                            'entry_price': stock_entry if stock_exit_enabled else 0,
                             'pnl_pct': 0,
                             'pnl_usd': 0,
                             'win': None,
@@ -1199,6 +1265,7 @@ class QQQLiveTrader:
             self.loss_cooldown_until = None  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
+            self._signal_cooldowns = {}
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
             self._loss_circuit_conservative_fired = False  # 新交易日重置熔断通知
             self._daily_summary_sent = False  # 新交易日重置日终总结标记
@@ -1328,6 +1395,12 @@ class QQQLiveTrader:
         # 检查v7信号
         sig = self.v7.check_signal()
         if sig is None:
+            return
+        cooldown_key = f"{sig.get('display_engine') or sig.get('engine')}:{sig.get('dir')}"
+        cooldown_until = self._signal_cooldowns.get(cooldown_key)
+        if cooldown_until and datetime.now(TZ_ET) < cooldown_until:
+            remaining = int((cooldown_until - datetime.now(TZ_ET)).total_seconds() / 60) + 1
+            print(f"  ⏳ 信号冷却中: {cooldown_key} 剩余{remaining}分钟")
             return
 
         # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
@@ -1494,11 +1567,12 @@ class QQQLiveTrader:
 
         if not sig_dir:
             return
+        ch = self.close_history
 
         # ===== P1 #8 Neutral状态空间安全垫(Buffer) =====
         # 横盘市需要超越突破线至少0.01%才入场
         if regime == 'neutral':
-            buffer_pct = 0.0001  # 0.01%
+            buffer_pct = self.cfg.get('neutral_breakout_buffer_pct', 0.0003)
             if sig_dir == 'call' and entry_price <= upper * (1 + buffer_pct):
                 if self.cfg.get('debug', False):
                     print(f"  ⛔ Neutral Buffer: 价格${entry_price:.2f}未达8根高点${upper:.2f}+{buffer_pct*100:.2f}%(${upper*(1+buffer_pct):.2f})")
@@ -1507,6 +1581,21 @@ class QQQLiveTrader:
                 if self.cfg.get('debug', False):
                     print(f"  ⛔ Neutral Buffer: 价格${entry_price:.2f}未达8根低点${lower:.2f}-{buffer_pct*100:.2f}%(${lower*(1-buffer_pct):.2f})")
                 return
+            macd_hist = getattr(self.engine, 'macd_hist', 0)
+            if sig_dir == 'call' and macd_hist <= self.cfg.get('neutral_min_macd_hist', 0):
+                print(f"  ⛔ Neutral MACD确认不足: MACD_hist={macd_hist:.4f}，跳过做多")
+                return
+            if sig_dir == 'put' and macd_hist >= -self.cfg.get('neutral_min_macd_hist', 0):
+                print(f"  ⛔ Neutral MACD确认不足: MACD_hist={macd_hist:.4f}，跳过做空")
+                return
+            if len(ch) >= 5:
+                sma5 = np.mean(ch[-5:])
+                if sig_dir == 'call' and entry_price <= sma5:
+                    print(f"  ⛔ Neutral SMA5确认不足: 价格${entry_price:.2f} <= SMA5 ${sma5:.2f}")
+                    return
+                if sig_dir == 'put' and entry_price >= sma5:
+                    print(f"  ⛔ Neutral SMA5确认不足: 价格${entry_price:.2f} >= SMA5 ${sma5:.2f}")
+                    return
 
         # ===== B. 趋势方向过滤：禁止逆势交易 =====
         ch = self.close_history
@@ -2052,6 +2141,11 @@ class QQQLiveTrader:
             loss_penalty = 1.0
 
         combined_mult = pos_mult * vol_mult_factor * time_risk_mult * loss_penalty
+        min_option_price = self.cfg.get('min_full_size_option_price', 0.35)
+        if opt_price < min_option_price:
+            low_price_mult = self.cfg.get('low_option_price_mult', 0.5)
+            combined_mult *= low_price_mult
+            print(f"  🛡️ 低权利金风控: ${opt_price:.2f} < ${min_option_price:.2f}，仓位系数降至{low_price_mult:.0%}")
         # PUT单独仓位5%，CALL下午5%
         if sig['dir'] == 'put':
             effective_pct = min(self.cfg['order_pct'], 5.0)
@@ -2221,6 +2315,8 @@ class QQQLiveTrader:
                 'entry_time': datetime.now(TZ_ET),
                 'entry_bar': len(self.one_min_candles),
                 'reason': sig['reason'],
+                'engine': sig.get('engine', ''),
+                'display_engine': sig.get('display_engine') or display_signal_name(sig.get('engine', '')),
                 'max_pnl_pct': 0,
                 'half_closed': False,  # 动态止盈：是否已平仓一半
                 'half_closed_max_pct': 0.0,  # 半仓后的峰值（用于跟踪止盈）
@@ -2422,14 +2518,16 @@ class QQQLiveTrader:
                         
                         # 计算盈亏
                         pnl_pct = (current_price - cost) / cost * 100 if cost > 0 else 0
+                        stock_entry = self._current_stock_price()
+                        stock_exit_enabled = stock_entry > 100
                         
                         # 恢复内部持仓状态
                         self.position = {
                             'order_id': 'synced',
                             'dir': 'call' if 'C' in str(symbol) else 'put',
-                            'entry_price': cost,              # 期权成本
                             'entry_opt_price': cost,          # 期权成本
                             'opt_symbol': symbol,
+                            'entry_price': stock_entry if stock_exit_enabled else 0,
                             'sl_pct': self.cfg['sl'],
                             'tp_pct': self.cfg['tp'],
                             'contracts': qty,
@@ -2440,6 +2538,8 @@ class QQQLiveTrader:
                             'max_pnl_pct': pnl_pct,
                             'half_closed': False,
                             'half_closed_max_pct': 0.0,
+                            'stock_peak': stock_entry if stock_exit_enabled else 0,
+                            'stock_exit_enabled': stock_exit_enabled,
                             'order_status': 'synced',
                         }
                         print(f"  🔄 从长桥同步持仓: {symbol} x {qty}张, 成本${cost:.2f}, 盈亏{pnl_pct:+.1f}%")
@@ -2489,6 +2589,7 @@ class QQQLiveTrader:
 
         pos = self.position
         entry_stock = pos['entry_price']  # 正股入场价
+        stock_entry_valid = pos.get('stock_exit_enabled', True) and self._is_valid_stock_entry_price(entry_stock, current_stock)
 
         # ===== 定期验证长桥实际持仓（每60秒一次）=====
         current_time = time.time()
@@ -2507,6 +2608,7 @@ class QQQLiveTrader:
                 current_stock = float(stock_quotes[0].last_done)
             except:
                 return
+        stock_entry_valid = pos.get('stock_exit_enabled', True) and self._is_valid_stock_entry_price(entry_stock, current_stock)
 
         # 获取期权当前价格（尝试获取实时价）
         if opt_price is None:
@@ -2518,6 +2620,9 @@ class QQQLiveTrader:
                     opt_price = float(opt_quotes[0].last_done)
             except:
                 pass
+
+        if opt_price is None and not stock_entry_valid:
+            opt_price = pos.get('entry_opt_price') or 1.0
 
         # 如果获取不到期权价格，用BS估算
         if opt_price is None:
@@ -2556,12 +2661,12 @@ class QQQLiveTrader:
             pos['half_closed_max_pct'] = max(pos.get('half_closed_max_pct', 0), pnl_pct)
 
         # ===== v6.5 正股跟踪止损：更新正股峰值 =====
-        if pos['dir'] == 'call':
+        if stock_entry_valid and pos['dir'] == 'call':
             pos['stock_peak'] = max(pos.get('stock_peak', entry_stock), current_stock)
-        else:  # put
+        elif stock_entry_valid:  # put
             pos['stock_peak'] = min(pos.get('stock_peak', entry_stock), current_stock)
 
-        stock_pnl = (current_stock - entry_stock) / entry_stock if entry_stock else 0
+        stock_pnl = (current_stock - entry_stock) / entry_stock if stock_entry_valid else 0
         if pos['dir'] == 'put':
             stock_pnl = -stock_pnl
         stock_pnl_pct = stock_pnl * 100
@@ -2590,7 +2695,7 @@ class QQQLiveTrader:
             ex = f"止损({pnl_pct:.1f}%≤-{sl_pct:.0f}%)"
 
         # --- 1.2 正股风控（回测v6.3口径，降低期权报价噪声影响）---
-        if not ex and self.cfg.get('stock_exit_enabled', True):
+        if not ex and self.cfg.get('stock_exit_enabled', True) and stock_entry_valid:
             stock_sl = self.cfg.get('stock_sl_pct', 0.0025)
             stock_tp = self.cfg.get('stock_tp_pct', 0.0040)
             stock_trail_activate = self.cfg.get('stock_trail_activate', 0.0030)
@@ -2613,32 +2718,23 @@ class QQQLiveTrader:
 
         # --- 2. 分阶段超时（v6.3: 使用动态timeout_bars）---
         if not ex and not pos['half_closed']:
-            dynamic_timeout = pos.get('timeout_bars', 10)
+            timeout_profile = self._timeout_profile(pos)
+            signal_name = timeout_profile['signal']
+            s2_bars = timeout_profile['stage']
+            s2_min = timeout_profile['min_profit']
+            s3_bars = timeout_profile['hard']
 
-            # P1 #3 SMA5动量延长超时：盈利+正股未破SMA5 → 放宽到15分钟
+            # P1 #3 SMA5动量延长超时：盈利+正股未破SMA5 → 趋势信号放宽到15分钟
             if pnl_pct > 0 and len(self.close_history) >= 5:
                 sma5 = sum(self.close_history[-5:]) / 5
                 if (pos['dir'] == 'call' and current_stock > sma5) or \
                    (pos['dir'] == 'put' and current_stock < sma5):
-                    dynamic_timeout = 15
-
-            # Timeout — 放宽：1分钟K线下给足时间让行情发展
-            # Stage 1: 前4根K线，不看盈亏，只看止损（让交易有呼吸空间）
-            # Stage 2: 7根K线，盈利<5%才超时（不再要求30%）
-            # Stage 3: 动态bars，硬超时
-            s1_bars = max(dynamic_timeout // 2, 4)    # stage1至少4根
-            s2_bars = max(dynamic_timeout * 3 // 4, 7) # stage2至少7根
-            s2_min = 5.0  # 盈利≥5%就不超时（从60%大幅下调）
-            s3_bars = dynamic_timeout
-
-            # Stage 1: 只看持仓时长，不强制平仓（给交易发展空间）
-            # elif bars_held >= s1_bars and pnl_pct < s1_min:  # 已禁用s1强制退出
-            #     ex = f"阶段超时({s1_bars}min)"
+                    s3_bars = max(s3_bars, self.cfg.get('trend_extend_timeout_bars', 15))
 
             if bars_held >= s3_bars:
-                ex = f"硬超时({s3_bars}分钟)"
+                ex = f"硬超时({signal_name},{s3_bars}分钟)"
             elif bars_held >= s2_bars and pnl_pct < s2_min:
-                ex = f"阶段超时({s2_bars}min盈利{pnl_pct:.1f}%<{s2_min:.0f}%)"
+                ex = f"阶段超时({signal_name},{s2_bars}min盈利{pnl_pct:.1f}%<{s2_min:.0f}%)"
 
         # --- 3. 动态止盈：盈利≥150%平仓一半 ---
         if not ex and not pos['half_closed'] and pnl_pct >= tp_partial:
@@ -2646,7 +2742,7 @@ class QQQLiveTrader:
             return
 
         # --- 4. 半仓后：正股跟踪止损（替代期权峰值回撤，更稳定）---
-        if not ex and pos['half_closed']:
+        if not ex and pos['half_closed'] and stock_entry_valid:
             stock_trail = self.cfg.get('stock_trail_pct', 0.003)
             peak = pos.get('stock_peak', entry_stock)
             if pos['dir'] == 'call' and peak > entry_stock:
@@ -2668,9 +2764,16 @@ class QQQLiveTrader:
 
         # --- 6. 半仓后超时（动态timeout_bars）---
         if not ex and pos['half_closed']:
-            s3_bars = pos.get('timeout_bars', 10)  # 使用动态超时
+            timeout_profile = self._timeout_profile(pos)
+            s3_bars = timeout_profile['hard']
+            signal_name = timeout_profile['signal']
+            if len(self.close_history) >= 5:
+                sma5 = sum(self.close_history[-5:]) / 5
+                if (pos['dir'] == 'call' and current_stock > sma5) or \
+                   (pos['dir'] == 'put' and current_stock < sma5):
+                    s3_bars = max(s3_bars, self.cfg.get('trend_extend_timeout_bars', 15))
             if bars_held >= s3_bars:
-                ex = f"硬超时({s3_bars}分钟)"
+                ex = f"硬超时({signal_name},{s3_bars}分钟)"
 
         if ex:
             self._close_position(ex)
@@ -3214,6 +3317,11 @@ class QQQLiveTrader:
             # P1 #10 冷却：时间戳方式（替代 tick 计数，防止20s循环烧完冷却）
             if pnl_pct < 0:
                 self.last_loss_dir = pos['dir']
+                signal_name = display_signal_name(pos.get('display_engine') or pos.get('engine') or '')
+                if 'Granville_Pullback' in str(pos.get('reason', '')) or signal_name == 'Granville_Pullback':
+                    key = f"Granville_Pullback:{pos['dir']}"
+                    self._signal_cooldowns[key] = datetime.now(TZ_ET) + timedelta(minutes=self.cfg.get('granville_loss_cooldown_min', 10))
+                    print(f"  ⏳ Granville亏损冷却: {key} 10分钟")
 
                 abs_loss = abs(pnl_pct)
                 cons_limit = self.cfg.get('loss_consecutive_limit', 3)
