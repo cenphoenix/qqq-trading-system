@@ -5,6 +5,7 @@ v7 FastAPI WebSocket Dashboard
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import date, datetime
 from decimal import Decimal
@@ -39,6 +40,53 @@ def _json_safe(value: Any):
     if hasattr(value, "value"):
         return _json_safe(value.value)
     return str(value)
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ''):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ''):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_option_dir(symbol: Any) -> str:
+    match = re.search(r'\d{6}([CP])', str(symbol or '').upper())
+    if not match:
+        return ''
+    return 'call' if match.group(1) == 'C' else 'put'
+
+
+def _normalize_position(pos: Dict) -> Dict:
+    """Keep broker and internal positions using the same fields for the UI."""
+    if not isinstance(pos, dict):
+        return {'symbol': str(pos), 'opt_symbol': str(pos), 'dir': '', 'contracts': 0, 'entry_opt_price': 0}
+
+    item = dict(pos)
+    symbol = item.get('opt_symbol') or item.get('symbol') or item.get('sym') or ''
+    direction = item.get('dir') or item.get('direction') or _infer_option_dir(symbol)
+    contracts = _to_int(item.get('contracts', item.get('qty', item.get('quantity', 0))))
+    entry_opt_price = _to_float(item.get('entry_opt_price', item.get('cost', item.get('entry_price', 0))))
+
+    item['symbol'] = symbol
+    item['opt_symbol'] = symbol
+    item['dir'] = direction
+    item['dir_label'] = '做多' if direction == 'call' else '做空' if direction == 'put' else '--'
+    item['contracts'] = contracts
+    item['qty'] = contracts
+    item['entry_opt_price'] = entry_opt_price
+    item['cost'] = entry_opt_price
+    return item
 
 
 class DashboardState:
@@ -117,6 +165,7 @@ class DashboardState:
         if self.current_position:
             positions.append(self.current_position)
         positions.extend(self.broker_positions)
+        positions = [_normalize_position(p) for p in positions]
         
         # 交易记录 - 保持和旧dashboard一样的格式
         trades = []

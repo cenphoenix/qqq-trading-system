@@ -14,7 +14,7 @@ RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
 4. 风控：动态止损/半仓止盈/分阶段超时/日亏损熔断/冷却
 5. Telegram推送交易信号 / Web仪表盘
 """
-import os, sys, time, json, signal, math
+import os, sys, time, json, signal, math, re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import numpy as np
@@ -4116,11 +4116,19 @@ class QQQLiveTrader:
                             available = float(getattr(p, 'available_quantity', qty) or qty)
                             cost = float(getattr(p, 'cost_price', 0) or 0)
                             channel = str(getattr(ch, 'name', '') or str(getattr(ch, 'channel', '')))
+                            opt_match = re.search(r'\d{6}([CP])', symbol.upper())
+                            direction = ''
+                            if opt_match:
+                                direction = 'call' if opt_match.group(1) == 'C' else 'put'
                             positions.append({
                                 'symbol': symbol,
+                                'opt_symbol': symbol,
+                                'dir': direction,
                                 'qty': int(qty),
+                                'contracts': int(qty),
                                 'available': int(available),
                                 'cost': cost,
+                                'entry_opt_price': cost,
                                 'channel': channel,
                             })
             except Exception as e:
