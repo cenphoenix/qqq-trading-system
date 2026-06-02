@@ -346,6 +346,12 @@ class QQQLiveTrader:
             'min_profit': 5.0,
         }
 
+    def _allow_broker_exit_notifications_now(self):
+        """Broker reconcile is only a fallback; avoid off-hours historical notification spam."""
+        now = datetime.now(TZ_ET)
+        cur_min = now.hour * 60 + now.minute
+        return 570 <= cur_min <= 970  # 09:30-16:10 ET
+
     def _start_signal_probe(self, sig, opt_symbol, contracts, entry_price, entry_bar):
         """记录入场后5/10/20根K线的正股方向收益，用于分析信号质量。"""
         try:
@@ -483,20 +489,31 @@ class QQQLiveTrader:
         except Exception:
             return f"{source}|{time.time()}"
 
-    def _notification_log_path(self):
-        today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
+    def _notification_log_path(self, date_str=None):
+        today_et = date_str or datetime.now(TZ_ET).strftime('%Y-%m-%d')
         log_dir = os.path.join(_app_dir(), 'logs')
         os.makedirs(log_dir, exist_ok=True)
         return os.path.join(log_dir, f'notifications_{today_et}.json')
 
-    def _load_notification_keys(self):
+    def _load_notification_keys(self, include_recent_days=False):
         try:
-            path = self._notification_log_path()
-            if not os.path.exists(path):
-                return set()
-            with open(path, encoding='utf-8') as f:
-                data = json.load(f)
-            return {str(item.get('key')) for item in data.get('items', []) if item.get('key')}
+            paths = [self._notification_log_path()]
+            if include_recent_days:
+                log_dir = os.path.join(_app_dir(), 'logs')
+                if os.path.isdir(log_dir):
+                    files = sorted(
+                        [os.path.join(log_dir, name) for name in os.listdir(log_dir) if name.startswith('notifications_') and name.endswith('.json')],
+                        reverse=True,
+                    )
+                    paths = list(dict.fromkeys(paths + files[:5]))
+            keys = set()
+            for path in paths:
+                if not os.path.exists(path):
+                    continue
+                with open(path, encoding='utf-8') as f:
+                    data = json.load(f)
+                keys.update(str(item.get('key')) for item in data.get('items', []) if item.get('key'))
+            return keys
         except Exception:
             return set()
 
@@ -4763,8 +4780,15 @@ class QQQLiveTrader:
 
         # 检查是否有新发现的broker对账平仓，发送通知。
         # 不能只按 opt_symbol 去重：同一天同一合约会反复开平，按合约去重会漏发前几单。
-        notified_keys = self._load_notification_keys()
+        notified_keys = self._load_notification_keys(include_recent_days=True)
+        allow_broker_notify = self._allow_broker_exit_notifications_now()
+        if not allow_broker_notify:
+            print("  ⏭️ 非交易时间，跳过broker对账平仓补漏通知")
         for bt in broker_trades:
+            if not allow_broker_notify:
+                continue
+            if bt.get('date') != today_et:
+                continue
             sym = bt.get('opt_symbol', '')
             pnl = bt.get('pnl_usd', 0)
             notify_key = self._trade_notify_key(bt, 'broker_exit')
