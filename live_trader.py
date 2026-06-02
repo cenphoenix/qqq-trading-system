@@ -439,6 +439,38 @@ class QQQLiveTrader:
         except Exception:
             return set()
 
+    def _load_notification_items(self):
+        try:
+            path = self._notification_log_path()
+            if not os.path.exists(path):
+                return []
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('items', []) if isinstance(data, dict) else []
+        except Exception:
+            return []
+
+    def _recent_live_exit_notification_exists(self, opt_symbol, seconds=300):
+        """Return True when live exit/partial already notified recently for the same contract."""
+        if not opt_symbol:
+            return False
+        now = datetime.now(TZ_ET)
+        for item in reversed(self._load_notification_items()):
+            if item.get('type') not in ('exit', 'partial'):
+                continue
+            key = str(item.get('key', ''))
+            title = str(item.get('title', ''))
+            if title != opt_symbol and f'|{opt_symbol}|' not in key:
+                continue
+            try:
+                sent_at = datetime.strptime(str(item.get('time', '')), '%Y-%m-%d %H:%M:%S')
+                sent_at = sent_at.replace(tzinfo=TZ_ET)
+            except Exception:
+                return True
+            if 0 <= (now - sent_at).total_seconds() <= seconds:
+                return True
+        return False
+
     def _mark_notification_sent(self, key, msg_type, title=''):
         try:
             path = self._notification_log_path()
@@ -4629,6 +4661,11 @@ class QQQLiveTrader:
             pnl = bt.get('pnl_usd', 0)
             notify_key = self._trade_notify_key(bt, 'broker_exit')
             if sym and pnl != 0 and notify_key not in notified_keys:
+                if self._recent_live_exit_notification_exists(sym):
+                    self._mark_notification_sent(notify_key, 'broker_exit_suppressed', sym)
+                    notified_keys.add(notify_key)
+                    print(f"  ⏭️ broker对账平仓通知已抑制，实盘路径刚发过: {sym}")
+                    continue
                 direction = bt.get('dir', '').upper()
                 entry_price = bt.get('entry_price', 0)
                 exit_price = bt.get('exit_price', 0)
