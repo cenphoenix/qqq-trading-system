@@ -331,13 +331,13 @@ class QQQLiveTrader:
         reason = str(pos.get('reason', ''))
         regime = pos.get('regime', '')
         if signal == 'VWAP_Breakout':
-            return {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 2.0}
+            return {'signal': signal, 'stage': 8, 'hard': 12, 'min_profit': 0.0}
         if signal == 'EMA_Cross':
             return {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 0.0}
         if signal == 'Granville_Pullback':
             return {'signal': signal, 'stage': 7, 'hard': 10, 'min_profit': 2.0}
         if signal == 'Kline_Pattern' or regime == 'neutral' or 'neutral' in reason:
-            return {'signal': 'Kline_Pattern', 'stage': 6, 'hard': 8, 'min_profit': 5.0}
+            return {'signal': 'Kline_Pattern', 'stage': 10, 'hard': 12, 'min_profit': 0.0}
         base = int(pos.get('timeout_bars', 10) or 10)
         return {
             'signal': signal or 'default',
@@ -345,6 +345,36 @@ class QQQLiveTrader:
             'hard': base,
             'min_profit': 5.0,
         }
+
+    def _entry_signal_name(self, sig):
+        raw = sig.get('display_engine') or sig.get('engine') or sig.get('raw_engine') or ''
+        if raw in ('VWAP_Breakout', 'EMA_Cross', 'Kline_Pattern', 'Granville_Pullback', 'RSI_Reversal', 'Chan_First_Buy'):
+            return raw
+        return display_signal_name(raw)
+
+    def _should_skip_entry_signal(self, sig):
+        signal = self._entry_signal_name(sig)
+        price = float(sig.get('price') or 0)
+        direction = sig.get('dir', '')
+
+        if signal == 'VWAP_Breakout':
+            vwap = getattr(self.engine, 'vwap', 0) or 0
+            if vwap > 0 and price > 0:
+                dist = (price - vwap) / vwap if direction == 'call' else (vwap - price) / vwap
+                max_dist = self.cfg.get('vwap_max_chase_pct', 0.0030)
+                if dist > max_dist:
+                    print(f"  ⛔ VWAP追高过滤: 距VWAP {dist*100:.2f}% > {max_dist*100:.2f}%，跳过")
+                    return True
+
+        if signal == 'EMA_Cross':
+            meta = sig.get('metadata') or {}
+            adx = float(meta.get('adx') or getattr(self.engine, 'adx', 0) or 0)
+            min_adx = self.cfg.get('ema_min_adx_live', 35)
+            if adx < min_adx:
+                print(f"  ⛔ EMA质量过滤: ADX={adx:.1f} < {min_adx:.0f}，跳过")
+                return True
+
+        return False
 
     def _allow_broker_exit_notifications_now(self):
         """Broker reconcile is only a fallback; avoid off-hours historical notification spam."""
@@ -1427,6 +1457,8 @@ class QQQLiveTrader:
 
         # 执行交易
         print(f"  🎯 v7信号: {sig['engine']} {sig['dir']} @ ${sig['price']:.2f} (强度:{sig['strength']:.0f})")
+        if self._should_skip_entry_signal(sig):
+            return
         self._execute_trade(sig)
         
     def _check_signal_20s(self):
@@ -2158,9 +2190,9 @@ class QQQLiveTrader:
             loss_penalty = 1.0
 
         combined_mult = pos_mult * vol_mult_factor * time_risk_mult * loss_penalty
-        min_option_price = self.cfg.get('min_full_size_option_price', 0.35)
+        min_option_price = self.cfg.get('min_full_size_option_price', 0.75)
         if opt_price < min_option_price:
-            low_price_mult = self.cfg.get('low_option_price_mult', 0.5)
+            low_price_mult = self.cfg.get('low_option_price_mult', 0.35)
             combined_mult *= low_price_mult
             print(f"  🛡️ 低权利金风控: ${opt_price:.2f} < ${min_option_price:.2f}，仓位系数降至{low_price_mult:.0%}")
         # PUT单独仓位5%，CALL下午5%
@@ -2172,6 +2204,14 @@ class QQQLiveTrader:
             effective_pct = self.cfg['order_pct']
         order_amount = capital * effective_pct / 100 * combined_mult
         contracts = max(1, int(order_amount / (opt_price * self.cfg['contract_multiplier'])))
+        max_contracts = int(self.cfg.get('max_contracts_per_trade', 400) or 400)
+        if opt_price < min_option_price:
+            max_contracts = min(max_contracts, int(self.cfg.get('max_low_price_contracts', 300) or 300))
+        if cur_min_et >= 720:
+            max_contracts = min(max_contracts, int(self.cfg.get('max_afternoon_contracts', 300) or 300))
+        if contracts > max_contracts:
+            print(f"  🛡️ 单笔张数上限: {contracts}张 → {max_contracts}张")
+            contracts = max_contracts
         if gamma_warning:  # 15:45+ 直接禁止
             contracts = 0
         qty = contracts * self.cfg['contract_multiplier']
@@ -2691,6 +2731,7 @@ class QQQLiveTrader:
 
         # 持仓K线数
         bars_held = len(self.one_min_candles) - pos['entry_bar']
+        signal_name_for_exit = self._position_signal_name(pos)
 
         # ===== v6.3 动态退出条件（使用regime参数）=====
         ex = None
@@ -2712,6 +2753,32 @@ class QQQLiveTrader:
             ex = f"止损({pnl_pct:.1f}%≤-{sl_pct:.0f}%)"
 
         # --- 1.2 正股风控（回测v6.3口径，降低期权报价噪声影响）---
+        if not ex and not pos.get('half_closed'):
+            fast_bars = int(self.cfg.get('fast_fail_bars', 5) or 5)
+            if bars_held >= fast_bars and stock_entry_valid:
+                if signal_name_for_exit == 'VWAP_Breakout':
+                    stock_stop = self.cfg.get('vwap_fast_stock_stop_pct', 0.0006) * 100
+                    opt_stop = self.cfg.get('vwap_fast_option_stop_pct', 18)
+                    if stock_pnl_pct <= -stock_stop or pnl_pct <= -opt_stop:
+                        ex = f"VWAP快退({bars_held}min, 正股{stock_pnl_pct:.2f}%, 期权{pnl_pct:.1f}%)"
+                elif signal_name_for_exit == 'Kline_Pattern':
+                    stock_stop = self.cfg.get('kline_fast_stock_stop_pct', 0.0005) * 100
+                    opt_stop = self.cfg.get('kline_fast_option_stop_pct', 12)
+                    if stock_pnl_pct <= -stock_stop and pnl_pct <= -opt_stop:
+                        ex = f"Kline快退({bars_held}min, 正股{stock_pnl_pct:.2f}%, 期权{pnl_pct:.1f}%)"
+
+        if not ex and not pos.get('half_closed'):
+            quick_activate = self.cfg.get('quick_trail_activate_pct', 15)
+            quick_drop = self.cfg.get('quick_trail_drop_pct', 8)
+            floor_activate = self.cfg.get('profit_floor_activate_pct', 20)
+            floor_pct = self.cfg.get('profit_floor_pct', 8)
+            if pos.get('max_pnl_pct', 0) >= floor_activate and pnl_pct <= floor_pct:
+                ex = f"盈利保护({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
+            elif pos.get('max_pnl_pct', 0) >= quick_activate:
+                drawdown = pos.get('max_pnl_pct', 0) - pnl_pct
+                if drawdown >= quick_drop:
+                    ex = f"快速移动止盈({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
+
         if not ex and self.cfg.get('stock_exit_enabled', True) and stock_entry_valid:
             stock_sl = self.cfg.get('stock_sl_pct', 0.0025)
             stock_tp = self.cfg.get('stock_tp_pct', 0.0040)
