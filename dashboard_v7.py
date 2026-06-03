@@ -3,6 +3,7 @@ v7 FastAPI WebSocket Dashboard
 合并旧Flask dashboard的所有功能 + v7多引擎显示
 """
 import asyncio
+import logging
 import json
 import os
 import re
@@ -21,6 +22,11 @@ from signal_names import display_signal_name
 
 
 app = FastAPI(title="QQQ 0DTE v7 Dashboard")
+
+# Browser websocket disconnects on Windows can surface as noisy low-level
+# "data transfer failed" logs. They are harmless for the trading engine.
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.protocols.websockets.websockets_impl").setLevel(logging.CRITICAL)
 
 
 def _json_safe(value: Any):
@@ -254,13 +260,14 @@ async def _broadcast_loop():
             if state.connected_clients:
                 data = state.to_dict()
                 disconnected = []
-                for client in state.connected_clients:
+                for client in list(state.connected_clients):
                     try:
                         await client.send_json(data)
                     except Exception:
                         disconnected.append(client)
                 for client in disconnected:
-                    state.connected_clients.remove(client)
+                    if client in state.connected_clients:
+                        state.connected_clients.remove(client)
         except Exception:
             pass
 
@@ -281,8 +288,11 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        state.connected_clients.remove(websocket)
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass
+    finally:
+        if websocket in state.connected_clients:
+            state.connected_clients.remove(websocket)
 
 
 @app.get("/api/state")
@@ -349,6 +359,7 @@ def set_connected(connected: bool):
 
 
 def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
+    import importlib.util
     import time
     import socket
     global _server_started
@@ -377,7 +388,12 @@ def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
                 print(f"❌ 端口{port}持续占用，请手动关闭占用进程")
                 return
     
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    ws_impl = "wsproto" if importlib.util.find_spec("wsproto") else "websockets"
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning", ws=ws_impl)
+    except TypeError:
+        # Older uvicorn versions may not accept explicit websocket protocol args.
+        uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 # Dashboard HTML
