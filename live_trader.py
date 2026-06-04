@@ -105,6 +105,8 @@ def _load_config():
             'shadow_signal_tracking': True,
             'shadow_signal_cooldown_bars': 5,
             'shadow_signal_max_per_day': 100,
+            'shadow_signal_live_orders': False,
+            'shadow_live_order_pos_mult': 0.25,
             'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -609,10 +611,10 @@ class QQQLiveTrader:
                     and int(entry_bar) - int(probe.get('entry_bar', -9999)) < cooldown
                 ]
                 if recent_shadow:
-                    return
+                    return False
                 max_shadow = int(self.cfg.get('shadow_signal_max_per_day', 100) or 100)
                 if sum(probe.get('source') == 'shadow' for probe in self.signal_probes) >= max_shadow:
-                    return
+                    return False
 
             self._signal_probe_seq += 1
             entry_time = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
@@ -636,21 +638,50 @@ class QQQLiveTrader:
             if len(self.signal_probes) > 500:
                 self.signal_probes = self.signal_probes[-500:]
             self._save_signal_probes_snapshot()
+            return True
         except Exception as e:
             print(f"  ⚠️ 信号追踪初始化失败: {e}")
+            return False
 
     def _should_skip_and_track(self, sig):
+        if sig.get('_shadow_live_approved'):
+            return False
+
         skipped = self._should_skip_entry_signal(sig)
-        if skipped and self.cfg.get('shadow_signal_tracking', True):
-            self._start_signal_probe(
-                sig=sig,
-                opt_symbol='',
-                contracts=0,
-                entry_price=float(sig.get('price') or self.current_price or 0),
-                entry_bar=len(self.one_min_candles),
-                source='shadow',
-                rejection_reason=self._last_entry_rejection or '质量过滤未通过',
-            )
+        if skipped:
+            rejection = self._last_entry_rejection or '质量过滤未通过'
+            live_orders = self.cfg.get('shadow_signal_live_orders', False)
+            if live_orders:
+                signal_name = self._entry_signal_name(sig)
+                cooldown = int(self.cfg.get('shadow_signal_cooldown_bars', 5) or 5)
+                duplicate = any(
+                    probe.get('source') in ('shadow', 'shadow_live')
+                    and probe.get('signal') == signal_name
+                    and probe.get('dir') == sig.get('dir', '')
+                    and len(self.one_min_candles) - int(probe.get('entry_bar', -9999)) < cooldown
+                    for probe in self.signal_probes
+                )
+                if not duplicate:
+                    sig['_shadow_live_approved'] = True
+                    sig['shadow_live_order'] = True
+                    sig['shadow_rejection_reason'] = rejection
+                    sig['pos_mult'] = min(
+                        float(sig.get('pos_mult', 1.0) or 1.0),
+                        float(self.cfg.get('shadow_live_order_pos_mult', 0.25) or 0.25),
+                    )
+                    sig['reason'] = f"[影子测试单|原拒绝:{rejection}] {sig.get('reason', '')}"
+                    print(f"  🧪 影子信号真实下单已开启: {signal_name} {sig.get('dir')} | {rejection}")
+                    return False
+            if self.cfg.get('shadow_signal_tracking', True):
+                self._start_signal_probe(
+                    sig=sig,
+                    opt_symbol='',
+                    contracts=0,
+                    entry_price=float(sig.get('price') or self.current_price or 0),
+                    entry_bar=len(self.one_min_candles),
+                    source='shadow',
+                    rejection_reason=rejection,
+                )
         return skipped
 
     def _update_signal_probes(self, candle):
@@ -2632,6 +2663,8 @@ class QQQLiveTrader:
                 'reason': sig['reason'],
                 'engine': sig.get('engine', ''),
                 'display_engine': sig.get('display_engine') or display_signal_name(sig.get('engine', '')),
+                'shadow_live_order': bool(sig.get('shadow_live_order', False)),
+                'shadow_rejection_reason': sig.get('shadow_rejection_reason', ''),
                 'max_pnl_pct': 0,
                 'half_closed': False,  # 动态止盈：是否已平仓一半
                 'half_closed_max_pct': 0.0,  # 半仓后的峰值（用于跟踪止盈）
@@ -2651,7 +2684,12 @@ class QQQLiveTrader:
             }
             self._subscribe_position_quote(opt_symbol)
             self.trades_today.append(self.position.copy())
-            self._start_signal_probe(sig, opt_symbol, contracts, float(price), len(self.one_min_candles))
+            probe_source = 'shadow_live' if sig.get('shadow_live_order') else 'live'
+            self._start_signal_probe(
+                sig, opt_symbol, contracts, float(price), len(self.one_min_candles),
+                source=probe_source,
+                rejection_reason=sig.get('shadow_rejection_reason', ''),
+            )
             self._add_event(f"📈 开仓: {opt_symbol} x{contracts}张 @${executed_price:.2f}", "trade")
             self.current_signal = None  # 已开仓，清除信号
             

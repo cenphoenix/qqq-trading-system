@@ -91,6 +91,8 @@ DEFAULT_CONFIG = {
         "shadow_signal_tracking": True,
         "shadow_signal_cooldown_bars": 5,
         "shadow_signal_max_per_day": 100,
+        "shadow_signal_live_orders": False,
+        "shadow_live_order_pos_mult": 0.25,
         "enable_countertrend_reversal_entries": False,
         # 超时退出
         "timeout_stage1_bars": 5,
