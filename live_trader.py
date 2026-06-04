@@ -102,6 +102,9 @@ def _load_config():
             'brooks_range_call_max_position': 0.40,
             'brooks_range_put_min_position': 0.60,
             'brooks_trend_skip_fixed_stock_tp': True,
+            'shadow_signal_tracking': True,
+            'shadow_signal_cooldown_bars': 5,
+            'shadow_signal_max_per_day': 100,
             'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -191,6 +194,7 @@ class QQQLiveTrader:
         self.v7 = V7Integration(self.cfg)
         self.price_action = PriceActionFilter(self.cfg)
         self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
+        self._last_entry_rejection = ''
 
         # 初始化长桥连接
         self._init_api()
@@ -376,6 +380,7 @@ class QQQLiveTrader:
         return display_signal_name(raw)
 
     def _should_skip_entry_signal(self, sig):
+        self._last_entry_rejection = ''
         signal = self._entry_signal_name(sig)
         price = float(sig.get('price') or 0)
         direction = sig.get('dir', '')
@@ -384,6 +389,7 @@ class QQQLiveTrader:
 
         countertrend_signals = {'RSI_Reversal', 'Chan_First_Buy', 'RSI_Overbought', 'Momentum_Death'}
         if signal in countertrend_signals and not self.cfg.get('enable_countertrend_reversal_entries', False):
+            self._last_entry_rejection = f'逆势反转信号暂停: {signal}'
             print(f"  ⛔ 逆势反转信号已暂停: {signal}（等待更可靠的主要趋势反转结构）")
             return True
 
@@ -391,6 +397,7 @@ class QQQLiveTrader:
             market_state = self.price_action.market_state(self.one_min_candles)
             state_direction = market_state.get('direction', '')
             if state_direction and direction and state_direction != direction:
+                self._last_entry_rejection = f'Brooks方向冲突: {market_state.get("state")}'
                 print(
                     f"  ⛔ Brooks方向冲突: {market_state.get('state')} "
                     f"优先于 {signal} {direction}"
@@ -414,6 +421,7 @@ class QQQLiveTrader:
                     and 'Failed_Breakout' in direction_setups
                 )
                 if not edge_entry:
+                    self._last_entry_rejection = 'Brooks震荡区间中部或缺少边缘失败突破'
                     print(f"  ⛔ Brooks震荡区间过滤: 区间中部或缺少边缘失败突破，跳过 {signal}")
                     return True
             sig.setdefault('metadata', {})['brooks_market_state'] = market_state
@@ -421,6 +429,7 @@ class QQQLiveTrader:
         if direction == 'put':
             context['vwap_dir_dist'] = -context['vwap_dist']
             if not self.cfg.get('enable_put_entries', False):
+                self._last_entry_rejection = 'PUT信号暂停'
                 print("  ⛔ PUT信号已暂停 (enable_put_entries=False)")
                 return True
             if self.cfg.get('put_quality_filter', True) and self._should_skip_put_signal(sig, signal, context):
@@ -428,6 +437,7 @@ class QQQLiveTrader:
             if self.cfg.get('price_action_filter', True) and self.cfg.get('price_action_require_put_trend', True):
                 price_action = self.price_action.evaluate(self.one_min_candles, direction)
                 if not price_action.get('allow'):
+                    self._last_entry_rejection = f'PUT价格行为过滤: {price_action.get("reason", "")}'
                     print(f"  ⛔ PUT价格行为过滤: {price_action.get('reason', '未确认空头趋势')}")
                     return True
                 sig.setdefault('metadata', {})['price_action'] = price_action
@@ -435,6 +445,7 @@ class QQQLiveTrader:
             if self.cfg.get('price_action_require_call_quality', True):
                 price_action = self.price_action.evaluate(self.one_min_candles, direction)
                 if not price_action.get('ready'):
+                    self._last_entry_rejection = 'CALL价格行为K线不足'
                     print(f"  ⛔ CALL价格行为过滤: {price_action.get('reason', 'K线不足')}")
                     return True
                 if signal == 'VWAP_Breakout':
@@ -442,6 +453,9 @@ class QQQLiveTrader:
                         self.cfg.get('price_action_vwap_call_max_range_position', 0.40)
                     )
                     if price_action['range_position'] > max_range_position:
+                        self._last_entry_rejection = (
+                            f'VWAP CALL区间位置过高: {price_action["range_position"]*100:.0f}%'
+                        )
                         print(
                             f"  ⛔ VWAP CALL追高过滤: 最近20根区间位置"
                             f"{price_action['range_position']*100:.0f}% > {max_range_position*100:.0f}%"
@@ -449,6 +463,7 @@ class QQQLiveTrader:
                         return True
                 if signal == 'EMA_Cross' and self.cfg.get('price_action_require_ema_call_strong_bar', True):
                     if not price_action.get('strong_breakout'):
+                        self._last_entry_rejection = 'EMA CALL缺少强多头信号K线'
                         print(f"  ⛔ EMA CALL价格行为过滤: {price_action.get('reason', '缺少强多头信号K线')}")
                         return True
                 sig.setdefault('metadata', {})['price_action'] = price_action
@@ -457,6 +472,7 @@ class QQQLiveTrader:
             dist = context['vwap_dir_dist'] if direction else context['vwap_dist']
             max_dist = self.cfg.get('vwap_max_chase_pct', 0.0030)
             if dist > max_dist:
+                self._last_entry_rejection = f'VWAP距离过远: {dist*100:.2f}%'
                 print(f"  ⛔ VWAP追高过滤: 距VWAP {dist*100:.2f}% > {max_dist*100:.2f}%，跳过")
                 return True
 
@@ -465,6 +481,7 @@ class QQQLiveTrader:
             adx = float(meta.get('adx') or getattr(self.engine, 'adx', 0) or 0)
             min_adx = self.cfg.get('ema_min_adx_live', 35)
             if adx < min_adx:
+                self._last_entry_rejection = f'EMA ADX不足: {adx:.1f}<{min_adx:.0f}'
                 print(f"  ⛔ EMA质量过滤: ADX={adx:.1f} < {min_adx:.0f}，跳过")
                 return True
 
@@ -574,13 +591,31 @@ class QQQLiveTrader:
         cur_min = now.hour * 60 + now.minute
         return 570 <= cur_min <= 970  # 09:30-16:10 ET
 
-    def _start_signal_probe(self, sig, opt_symbol, contracts, entry_price, entry_bar):
+    def _start_signal_probe(
+        self, sig, opt_symbol, contracts, entry_price, entry_bar,
+        source='live', rejection_reason='',
+    ):
         """记录入场后5/10/20根K线的正股方向收益，用于分析信号质量。"""
         try:
+            signal_name = self._entry_signal_name(sig)
+            direction = sig.get('dir', '')
+            if source == 'shadow':
+                cooldown = int(self.cfg.get('shadow_signal_cooldown_bars', 5) or 5)
+                recent_shadow = [
+                    probe for probe in self.signal_probes
+                    if probe.get('source') == 'shadow'
+                    and probe.get('signal') == signal_name
+                    and probe.get('dir') == direction
+                    and int(entry_bar) - int(probe.get('entry_bar', -9999)) < cooldown
+                ]
+                if recent_shadow:
+                    return
+                max_shadow = int(self.cfg.get('shadow_signal_max_per_day', 100) or 100)
+                if sum(probe.get('source') == 'shadow' for probe in self.signal_probes) >= max_shadow:
+                    return
+
             self._signal_probe_seq += 1
             entry_time = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
-            raw_signal = sig.get('display_engine') or sig.get('engine') or sig.get('regime') or 'breakout'
-            signal_name = display_signal_name(raw_signal)
             probe = {
                 'id': self._signal_probe_seq,
                 'entry_time': entry_time,
@@ -592,6 +627,8 @@ class QQQLiveTrader:
                 'contracts': int(contracts),
                 'reason': sig.get('reason', ''),
                 'regime': sig.get('regime', ''),
+                'source': source,
+                'rejection_reason': rejection_reason,
                 'milestones': {5: None, 10: None, 20: None},
                 'completed': False,
             }
@@ -601,6 +638,20 @@ class QQQLiveTrader:
             self._save_signal_probes_snapshot()
         except Exception as e:
             print(f"  ⚠️ 信号追踪初始化失败: {e}")
+
+    def _should_skip_and_track(self, sig):
+        skipped = self._should_skip_entry_signal(sig)
+        if skipped and self.cfg.get('shadow_signal_tracking', True):
+            self._start_signal_probe(
+                sig=sig,
+                opt_symbol='',
+                contracts=0,
+                entry_price=float(sig.get('price') or self.current_price or 0),
+                entry_bar=len(self.one_min_candles),
+                source='shadow',
+                rejection_reason=self._last_entry_rejection or '质量过滤未通过',
+            )
+        return skipped
 
     def _update_signal_probes(self, candle):
         """每根已完成K线更新未完成的信号追踪记录。"""
@@ -686,6 +737,8 @@ class QQQLiveTrader:
                 'contracts': p.get('contracts', 0),
                 'reason': p.get('reason', ''),
                 'regime': p.get('regime', ''),
+                'source': p.get('source', 'live'),
+                'rejection_reason': p.get('rejection_reason', ''),
                 'm5_pct': p.get('m5_pct'),
                 'm10_pct': p.get('m10_pct'),
                 'm20_pct': p.get('m20_pct'),
@@ -865,6 +918,8 @@ class QQQLiveTrader:
                     'entry_price': p.get('entry_price', 0),
                     'reason': p.get('reason', ''),
                     'regime': p.get('regime', ''),
+                    'source': p.get('source', 'live'),
+                    'rejection_reason': p.get('rejection_reason', ''),
                     'm5_pct': p.get('m5_pct'),
                     'm10_pct': p.get('m10_pct'),
                     'm20_pct': p.get('m20_pct'),
@@ -1652,7 +1707,7 @@ class QQQLiveTrader:
 
         # 执行交易
         print(f"  🎯 v7信号: {sig['engine']} {sig['dir']} @ ${sig['price']:.2f} (强度:{sig['strength']:.0f})")
-        if self._should_skip_entry_signal(sig):
+        if self._should_skip_and_track(sig):
             return
         self._execute_trade(sig)
         
@@ -2017,7 +2072,7 @@ class QQQLiveTrader:
         filters_passed = [f"regime={regime}", f"LB{lb}", f"量能✓", f"动量✓", f"实体✓", f"滤镜{bonus_count}/{preloaded_pass}"]
         sig['reason'] += f" [{', '.join(filters_passed)}]"
 
-        if self._should_skip_entry_signal(sig):
+        if self._should_skip_and_track(sig):
             return
         self.daily_signals += 1
         self.current_signal = sig
@@ -2129,7 +2184,7 @@ class QQQLiveTrader:
                                 return
                         else:
                             self.loss_cooldown_until = None
-                    if self._should_skip_entry_signal(sig):
+                    if self._should_skip_and_track(sig):
                         return
                     self.reversal_fired = True
                     self.daily_signals += 1
@@ -2201,7 +2256,7 @@ class QQQLiveTrader:
                                 return
                         else:
                             self.loss_cooldown_until = None
-                    if self._should_skip_entry_signal(sig):
+                    if self._should_skip_and_track(sig):
                         return
                     self.reversal_fired = True
                     self.daily_signals += 1
@@ -2251,7 +2306,7 @@ class QQQLiveTrader:
             print(f"  ⛔ PUT已达每日上限({self.put_trades}/3)，跳过")
             return
         # ===== 防重入锁：防止下单等待期间重复开仓 =====
-        if self._should_skip_entry_signal(sig):
+        if self._should_skip_and_track(sig):
             return
         if self._trading_lock:
             print(f"  ⛔ 开仓锁定中，跳过")
@@ -4653,6 +4708,8 @@ class QQQLiveTrader:
                     'contracts': int(p.get('contracts', 0) or 0),
                     'reason': p.get('reason', ''),
                     'regime': p.get('regime', ''),
+                    'source': p.get('source', 'live'),
+                    'rejection_reason': p.get('rejection_reason', ''),
                     'm5_pct': p.get('m5_pct'),
                     'm10_pct': p.get('m10_pct'),
                     'm20_pct': p.get('m20_pct'),

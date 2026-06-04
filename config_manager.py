@@ -88,6 +88,9 @@ DEFAULT_CONFIG = {
         "brooks_range_call_max_position": 0.40,
         "brooks_range_put_min_position": 0.60,
         "brooks_trend_skip_fixed_stock_tp": True,
+        "shadow_signal_tracking": True,
+        "shadow_signal_cooldown_bars": 5,
+        "shadow_signal_max_per_day": 100,
         "enable_countertrend_reversal_entries": False,
         # 超时退出
         "timeout_stage1_bars": 5,

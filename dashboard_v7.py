@@ -673,7 +673,7 @@ function update(d){
     return `<tr>
       <td>${p.id||''}</td>
       <td>${time||'--:--:--'}</td>
-      <td>${p.signal||p.regime||'QQQ_Breakout'}</td>
+      <td title="${p.rejection_reason||p.reason||''}">${p.source==='shadow'?'模拟·':''}${p.signal||p.regime||'QQQ_Breakout'}</td>
       <td class="${dirUp?'t-up':'t-down'}">${dirUp?'多':'空'}</td>
       <td>${p.entry_price?'$'+Number(p.entry_price).toFixed(2):'--'}</td>
       ${cell(p.m5_pct)}${cell(p.m10_pct)}${cell(p.m20_pct)}
