@@ -67,7 +67,28 @@ DEFAULT_CONFIG = {
         "stock_tp_pct": 0.0040,     # 正股顺向0.40%止盈
         "stock_trail_activate": 0.0030, # 正股顺向0.30%后启用跟踪
         "stock_trail_drop": 0.0015,     # 从正股峰值回撤0.15%退出
-        "put_time_stop_bars": 0,    # 0=关闭 PUT 专属时间止损
+        "put_time_stop_bars": 5,
+        "enable_put_entries": True,
+        "put_quality_filter": True,
+        "put_order_pct": 3.0,
+        "price_action_filter": True,
+        "price_action_require_put_trend": True,
+        "price_action_min_close_location": 0.65,
+        "price_action_min_body_ratio": 1.0,
+        "price_action_min_direction_bars": 3,
+        "price_action_tight_overlap": 0.62,
+        "price_action_tight_alternation": 0.43,
+        "price_action_require_call_quality": True,
+        "price_action_vwap_call_max_range_position": 0.40,
+        "price_action_require_ema_call_strong_bar": True,
+        "price_action_call_min_close_location": 0.55,
+        "price_action_call_min_body_ratio": 0.80,
+        "price_action_trend_extend_timeout_bars": 20,
+        "brooks_priority_mode": True,
+        "brooks_range_call_max_position": 0.40,
+        "brooks_range_put_min_position": 0.60,
+        "brooks_trend_skip_fixed_stock_tp": True,
+        "enable_countertrend_reversal_entries": False,
         # 超时退出
         "timeout_stage1_bars": 5,
         "timeout_stage1_min": 0.30,

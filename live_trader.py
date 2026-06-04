@@ -45,6 +45,7 @@ def _json_default(obj):
 
 # ===== 策略模块 =====
 from strategy import get_option_symbol, FilterEngine
+from strategy.price_action import PriceActionFilter
 from signal_names import display_signal_name
 from v7_integration import V7Integration
 
@@ -81,7 +82,27 @@ def _load_config():
             'trail_activate': 0.10, 'trail_drop': 0.05,
             'stock_exit_enabled': True, 'stock_sl_pct': 0.0025, 'stock_tp_pct': 0.0040,
             'stock_trail_activate': 0.0030, 'stock_trail_drop': 0.0015,
-            'put_time_stop_bars': 0,
+            'enable_put_entries': True, 'put_time_stop_bars': 5,
+            'put_order_pct': 3.0,
+            'put_allowed_signals': ['VWAP_Breakout', 'EMA_Cross', 'RSI_Reversal'],
+            'put_quality_filter': True, 'put_min_strength': 80,
+            'put_min_price_pos': 0.20, 'put_min_vwap_dist': 0.0010,
+            'put_min_macd_hist_abs': 0.0, 'put_min_sma20_slope_abs': 0.0,
+            'price_action_filter': True, 'price_action_require_put_trend': True,
+            'price_action_min_close_location': 0.65, 'price_action_min_body_ratio': 1.0,
+            'price_action_min_direction_bars': 3,
+            'price_action_tight_overlap': 0.62, 'price_action_tight_alternation': 0.43,
+            'price_action_require_call_quality': True,
+            'price_action_vwap_call_max_range_position': 0.40,
+            'price_action_require_ema_call_strong_bar': True,
+            'price_action_call_min_close_location': 0.55,
+            'price_action_call_min_body_ratio': 0.80,
+            'price_action_trend_extend_timeout_bars': 20,
+            'brooks_priority_mode': True,
+            'brooks_range_call_max_position': 0.40,
+            'brooks_range_put_min_position': 0.60,
+            'brooks_trend_skip_fixed_stock_tp': True,
+            'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
             'check_interval': 20, 'capital': 100000,
@@ -168,6 +189,8 @@ class QQQLiveTrader:
 
         # v7 多引擎信号系统
         self.v7 = V7Integration(self.cfg)
+        self.price_action = PriceActionFilter(self.cfg)
+        self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
 
         # 初始化长桥连接
         self._init_api()
@@ -358,8 +381,77 @@ class QQQLiveTrader:
         direction = sig.get('dir', '')
         reason = str(sig.get('reason', ''))
         context = self._entry_quality_context(price)
+
+        countertrend_signals = {'RSI_Reversal', 'Chan_First_Buy', 'RSI_Overbought', 'Momentum_Death'}
+        if signal in countertrend_signals and not self.cfg.get('enable_countertrend_reversal_entries', False):
+            print(f"  ⛔ 逆势反转信号已暂停: {signal}（等待更可靠的主要趋势反转结构）")
+            return True
+
+        if self.cfg.get('brooks_priority_mode', True):
+            market_state = self.price_action.market_state(self.one_min_candles)
+            state_direction = market_state.get('direction', '')
+            if state_direction and direction and state_direction != direction:
+                print(
+                    f"  ⛔ Brooks方向冲突: {market_state.get('state')} "
+                    f"优先于 {signal} {direction}"
+                )
+                return True
+            if market_state.get('state') == 'trading_range':
+                direction_setups = {
+                    setup.get('name')
+                    for setup in market_state.get('setups', [])
+                    if setup.get('direction') == direction
+                }
+                price_action = market_state.get(direction, {})
+                range_position = float(price_action.get('range_position', 0.5))
+                edge_entry = (
+                    direction == 'call'
+                    and signal == 'VWAP_Breakout'
+                    and range_position <= float(self.cfg.get('brooks_range_call_max_position', 0.40))
+                ) or (
+                    direction == 'put'
+                    and range_position >= float(self.cfg.get('brooks_range_put_min_position', 0.60))
+                    and 'Failed_Breakout' in direction_setups
+                )
+                if not edge_entry:
+                    print(f"  ⛔ Brooks震荡区间过滤: 区间中部或缺少边缘失败突破，跳过 {signal}")
+                    return True
+            sig.setdefault('metadata', {})['brooks_market_state'] = market_state
+
         if direction == 'put':
             context['vwap_dir_dist'] = -context['vwap_dist']
+            if not self.cfg.get('enable_put_entries', False):
+                print("  ⛔ PUT信号已暂停 (enable_put_entries=False)")
+                return True
+            if self.cfg.get('put_quality_filter', True) and self._should_skip_put_signal(sig, signal, context):
+                return True
+            if self.cfg.get('price_action_filter', True) and self.cfg.get('price_action_require_put_trend', True):
+                price_action = self.price_action.evaluate(self.one_min_candles, direction)
+                if not price_action.get('allow'):
+                    print(f"  ⛔ PUT价格行为过滤: {price_action.get('reason', '未确认空头趋势')}")
+                    return True
+                sig.setdefault('metadata', {})['price_action'] = price_action
+        elif direction == 'call' and self.cfg.get('price_action_filter', True):
+            if self.cfg.get('price_action_require_call_quality', True):
+                price_action = self.price_action.evaluate(self.one_min_candles, direction)
+                if not price_action.get('ready'):
+                    print(f"  ⛔ CALL价格行为过滤: {price_action.get('reason', 'K线不足')}")
+                    return True
+                if signal == 'VWAP_Breakout':
+                    max_range_position = float(
+                        self.cfg.get('price_action_vwap_call_max_range_position', 0.40)
+                    )
+                    if price_action['range_position'] > max_range_position:
+                        print(
+                            f"  ⛔ VWAP CALL追高过滤: 最近20根区间位置"
+                            f"{price_action['range_position']*100:.0f}% > {max_range_position*100:.0f}%"
+                        )
+                        return True
+                if signal == 'EMA_Cross' and self.cfg.get('price_action_require_ema_call_strong_bar', True):
+                    if not price_action.get('strong_breakout'):
+                        print(f"  ⛔ EMA CALL价格行为过滤: {price_action.get('reason', '缺少强多头信号K线')}")
+                        return True
+                sig.setdefault('metadata', {})['price_action'] = price_action
 
         if signal == 'VWAP_Breakout':
             dist = context['vwap_dir_dist'] if direction else context['vwap_dist']
@@ -420,6 +512,40 @@ class QQQLiveTrader:
             if dist_pct < min_dist_pct:
                 print(f"  ⛔ Granville回踩确认不足: dist={dist_pct:.2f}% < {min_dist_pct:.2f}%")
                 return True
+
+        return False
+
+    def _should_skip_put_signal(self, sig, signal, context):
+        allowed = self.cfg.get('put_allowed_signals') or ['VWAP_Breakout', 'EMA_Cross', 'RSI_Reversal']
+        if signal not in allowed:
+            print(f"  ⛔ PUT信号过滤: {signal} 不在允许列表 {allowed}")
+            return True
+
+        strength = float(sig.get('strength') or 0)
+        min_strength = float(self.cfg.get('put_min_strength', 80) or 0)
+        if strength and strength < min_strength:
+            print(f"  ⛔ PUT强度过滤: {strength:.0f} < {min_strength:.0f}")
+            return True
+
+        min_price_pos = float(self.cfg.get('put_min_price_pos', 0.20) or 0)
+        if context['price_pos'] < min_price_pos:
+            print(f"  ⛔ PUT低位追空过滤: 日内位置{context['price_pos']*100:.0f}% < {min_price_pos*100:.0f}%")
+            return True
+
+        min_vwap_dist = float(self.cfg.get('put_min_vwap_dist', 0.0010) or 0)
+        if context['vwap_dir_dist'] < min_vwap_dist:
+            print(f"  ⛔ PUT VWAP过滤: 价格低于VWAP {context['vwap_dir_dist']*100:.2f}% < {min_vwap_dist*100:.2f}%")
+            return True
+
+        min_macd_abs = float(self.cfg.get('put_min_macd_hist_abs', 0.0) or 0)
+        if context['macd_hist'] >= -min_macd_abs:
+            print(f"  ⛔ PUT动量过滤: MACD_hist={context['macd_hist']:.4f} 未转空")
+            return True
+
+        min_slope_abs = float(self.cfg.get('put_min_sma20_slope_abs', 0.0) or 0)
+        if context['sma20_slope'] >= -min_slope_abs:
+            print(f"  ⛔ PUT趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% 未向下")
+            return True
 
         return False
 
@@ -686,6 +812,7 @@ class QQQLiveTrader:
                 'signal_probes': [],
                 'daily_pnl': self.daily_pnl,
                 'filter_status': self.filter_status,
+                'price_action_state': self.price_action_state,
                 'current_signal': self.current_signal,
                 'session_high': self.session_high,
                 'session_low': self.session_low if self.session_low < 999999 else 0,
@@ -1379,6 +1506,7 @@ class QQQLiveTrader:
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._signal_cooldowns = {}
+            self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
             self._loss_circuit_conservative_fired = False  # 新交易日重置熔断通知
             self._daily_summary_sent = False  # 新交易日重置日终总结标记
@@ -1420,6 +1548,7 @@ class QQQLiveTrader:
 
         self.one_min_candles.append(one_min)
         self._update_signal_probes(one_min)
+        self.price_action_state = self.price_action.market_state(self.one_min_candles)
 
         # 写入today.csv（供cron监控读取）
         self._write_csv(one_min)
@@ -1517,7 +1646,7 @@ class QQQLiveTrader:
             return
 
         # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
-        if sig.get('dir') == 'put' and self.cfg.get('disable_put_signals', True):
+        if sig.get('dir') == 'put' and self.cfg.get('disable_put_signals', True) and not self.cfg.get('enable_put_entries', False):
             print(f"  ⛔ v7 PUT信号已禁用 (disable_put_signals=True)")
             return
 
@@ -1676,7 +1805,7 @@ class QQQLiveTrader:
             sig_dir = 'put'
 
         # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
-        if sig_dir == 'put' and self.cfg.get('disable_put_signals', True):
+        if sig_dir == 'put' and self.cfg.get('disable_put_signals', True) and not self.cfg.get('enable_put_entries', False):
             print(f"  ⛔ PUT信号已禁用 (disable_put_signals=True)")
             return
 
@@ -2000,6 +2129,8 @@ class QQQLiveTrader:
                                 return
                         else:
                             self.loss_cooldown_until = None
+                    if self._should_skip_entry_signal(sig):
+                        return
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做多! 从高点跌{drop_from_high*100:.1f}%")
@@ -2046,7 +2177,7 @@ class QQQLiveTrader:
                         self.position = None
                     
                     # ===== PUT信号拦截：真实数据显示系统PUT信号1W/20L，禁用可多赚$52K =====
-                    if self.cfg.get('disable_put_signals', True):
+                    if self.cfg.get('disable_put_signals', True) and not self.cfg.get('enable_put_entries', False):
                         print(f"  ⛔ 反转PUT信号已禁用 (disable_put_signals=True)")
                         return
 
@@ -2070,6 +2201,8 @@ class QQQLiveTrader:
                                 return
                         else:
                             self.loss_cooldown_until = None
+                    if self._should_skip_entry_signal(sig):
+                        return
                     self.reversal_fired = True
                     self.daily_signals += 1
                     print(f"  🔄 衰竭反转做空! 从低点涨{rise_from_low*100:.1f}%")
@@ -2265,9 +2398,9 @@ class QQQLiveTrader:
             low_price_mult = self.cfg.get('low_option_price_mult', 0.35)
             combined_mult *= low_price_mult
             print(f"  🛡️ 低权利金风控: ${opt_price:.2f} < ${min_option_price:.2f}，仓位系数降至{low_price_mult:.0%}")
-        # PUT单独仓位5%，CALL下午5%
+        # PUT uses a stricter standalone position cap; CALL afternoon trades stay capped at 5%.
         if sig['dir'] == 'put':
-            effective_pct = min(self.cfg['order_pct'], 5.0)
+            effective_pct = min(self.cfg['order_pct'], self.cfg.get('put_order_pct', 3.0))
         elif cur_min_et >= 720:
             effective_pct = min(self.cfg['order_pct'], 5.0)
         else:
@@ -2854,10 +2987,17 @@ class QQQLiveTrader:
             stock_tp = self.cfg.get('stock_tp_pct', 0.0040)
             stock_trail_activate = self.cfg.get('stock_trail_activate', 0.0030)
             stock_trail_drop = self.cfg.get('stock_trail_drop', 0.0015)
+            pa_state = self.price_action.market_state(self.one_min_candles)
+            brooks_trend_active = (
+                self.cfg.get('brooks_priority_mode', True)
+                and self.cfg.get('brooks_trend_skip_fixed_stock_tp', True)
+                and pa_state.get('direction') == pos['dir']
+                and stock_pnl > 0
+            )
 
             if stock_pnl <= -stock_sl:
                 ex = f"正股止损({stock_pnl_pct:.2f}%≤-{stock_sl*100:.2f}%)"
-            elif stock_pnl >= stock_tp:
+            elif stock_pnl >= stock_tp and not brooks_trend_active:
                 ex = f"正股止盈({stock_pnl_pct:.2f}%≥{stock_tp*100:.2f}%)"
             elif pos.get('max_stock_pnl_pct', 0) >= stock_trail_activate * 100:
                 stock_pullback = (pos.get('max_stock_pnl_pct', 0) - stock_pnl_pct) / 100
@@ -2884,6 +3024,14 @@ class QQQLiveTrader:
                 if (pos['dir'] == 'call' and current_stock > sma5) or \
                    (pos['dir'] == 'put' and current_stock < sma5):
                     s3_bars = max(s3_bars, self.cfg.get('trend_extend_timeout_bars', 15))
+
+            pa_state = self.price_action.market_state(self.one_min_candles)
+            if pnl_pct > 0 and pa_state.get('direction') == pos['dir']:
+                pa_extend = int(self.cfg.get('price_action_trend_extend_timeout_bars', 20) or 20)
+                if pa_extend > s3_bars:
+                    s3_bars = pa_extend
+                    if self.cfg.get('debug', False):
+                        print(f"  📈 Always-In {pos['dir']} 延长持仓至 {s3_bars} 分钟")
 
             if bars_held >= s3_bars:
                 ex = f"硬超时({signal_name},{s3_bars}分钟)"
