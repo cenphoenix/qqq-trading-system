@@ -356,15 +356,17 @@ class QQQLiveTrader:
         signal = self._entry_signal_name(sig)
         price = float(sig.get('price') or 0)
         direction = sig.get('dir', '')
+        reason = str(sig.get('reason', ''))
+        context = self._entry_quality_context(price)
+        if direction == 'put':
+            context['vwap_dir_dist'] = -context['vwap_dist']
 
         if signal == 'VWAP_Breakout':
-            vwap = getattr(self.engine, 'vwap', 0) or 0
-            if vwap > 0 and price > 0:
-                dist = (price - vwap) / vwap if direction == 'call' else (vwap - price) / vwap
-                max_dist = self.cfg.get('vwap_max_chase_pct', 0.0030)
-                if dist > max_dist:
-                    print(f"  ⛔ VWAP追高过滤: 距VWAP {dist*100:.2f}% > {max_dist*100:.2f}%，跳过")
-                    return True
+            dist = context['vwap_dir_dist'] if direction else context['vwap_dist']
+            max_dist = self.cfg.get('vwap_max_chase_pct', 0.0030)
+            if dist > max_dist:
+                print(f"  ⛔ VWAP追高过滤: 距VWAP {dist*100:.2f}% > {max_dist*100:.2f}%，跳过")
+                return True
 
         if signal == 'EMA_Cross':
             meta = sig.get('metadata') or {}
@@ -374,7 +376,71 @@ class QQQLiveTrader:
                 print(f"  ⛔ EMA质量过滤: ADX={adx:.1f} < {min_adx:.0f}，跳过")
                 return True
 
+        is_kline = signal == 'Kline_Pattern' or sig.get('regime') == 'neutral' or 'neutral' in reason
+        if is_kline and not self.cfg.get('enable_kline_entries', False):
+            print("  ⛔ Kline/neutral信号已暂停: 近期实盘和回测质量不足")
+            return True
+        if is_kline and self.cfg.get('kline_quality_filter', True):
+            max_pos = self.cfg.get('kline_max_price_pos', 0.82)
+            min_macd = self.cfg.get('kline_min_macd_hist', 0.0)
+            min_slope = self.cfg.get('kline_min_sma20_slope', 0.0)
+            if context['price_pos'] > max_pos:
+                print(f"  ⛔ Kline高位追入过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
+                return True
+            if context['macd_hist'] <= min_macd:
+                print(f"  ⛔ Kline动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
+                return True
+            if context['sma20_slope'] <= min_slope:
+                print(f"  ⛔ Kline趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
+                return True
+
+        if signal == 'Granville_Pullback' and not self.cfg.get('enable_granville_entries', False):
+            print("  ⛔ Granville信号已暂停: 近期实盘和回测质量不足")
+            return True
+        if signal == 'Granville_Pullback' and self.cfg.get('granville_quality_filter', True):
+            max_pos = self.cfg.get('granville_max_price_pos', 0.85)
+            min_macd = self.cfg.get('granville_min_macd_hist', 0.0)
+            min_slope = self.cfg.get('granville_min_sma20_slope', 0.0)
+            min_vwap_dist = self.cfg.get('granville_min_vwap_dist', 0.0)
+            meta = sig.get('metadata') or {}
+            dist_pct = float(meta.get('dist_pct') or 0)
+            min_dist_pct = self.cfg.get('granville_min_dist_pct', 0.03)
+            if context['price_pos'] > max_pos:
+                print(f"  ⛔ Granville高位过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
+                return True
+            if context['macd_hist'] <= min_macd:
+                print(f"  ⛔ Granville动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
+                return True
+            if context['sma20_slope'] <= min_slope:
+                print(f"  ⛔ Granville趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
+                return True
+            if context['vwap_dir_dist'] <= min_vwap_dist:
+                print(f"  ⛔ Granville VWAP过滤: 距VWAP={context['vwap_dir_dist']*100:.3f}% <= {min_vwap_dist*100:.3f}%")
+                return True
+            if dist_pct < min_dist_pct:
+                print(f"  ⛔ Granville回踩确认不足: dist={dist_pct:.2f}% < {min_dist_pct:.2f}%")
+                return True
+
         return False
+
+    def _entry_quality_context(self, price):
+        session_high = max(self.session_high or 0, price)
+        session_low = min(self.session_low if self.session_low < 999999 else price, price)
+        price_pos = (price - session_low) / (session_high - session_low) if session_high > session_low else 0.5
+        vwap = getattr(self.engine, 'vwap', 0) or price
+        vwap_dist = (price - vwap) / vwap if vwap else 0.0
+        sma20_slope = 0.0
+        if len(self.close_history) >= 25:
+            sma20 = float(np.mean(self.close_history[-20:]))
+            sma20_prev = float(np.mean(self.close_history[-25:-5]))
+            sma20_slope = (sma20 - sma20_prev) / price if price else 0.0
+        return {
+            'price_pos': price_pos,
+            'vwap_dist': vwap_dist,
+            'vwap_dir_dist': vwap_dist,
+            'macd_hist': float(getattr(self.engine, 'macd_hist', 0) or 0),
+            'sma20_slope': sma20_slope,
+        }
 
     def _allow_broker_exit_notifications_now(self):
         """Broker reconcile is only a fallback; avoid off-hours historical notification spam."""
@@ -1822,6 +1888,8 @@ class QQQLiveTrader:
         filters_passed = [f"regime={regime}", f"LB{lb}", f"量能✓", f"动量✓", f"实体✓", f"滤镜{bonus_count}/{preloaded_pass}"]
         sig['reason'] += f" [{', '.join(filters_passed)}]"
 
+        if self._should_skip_entry_signal(sig):
+            return
         self.daily_signals += 1
         self.current_signal = sig
         self._add_event(f"🎯 {direction}突破@${entry_price:.2f} | {filters_str}", "signal")
@@ -2050,6 +2118,8 @@ class QQQLiveTrader:
             print(f"  ⛔ PUT已达每日上限({self.put_trades}/3)，跳过")
             return
         # ===== 防重入锁：防止下单等待期间重复开仓 =====
+        if self._should_skip_entry_signal(sig):
+            return
         if self._trading_lock:
             print(f"  ⛔ 开仓锁定中，跳过")
             return
