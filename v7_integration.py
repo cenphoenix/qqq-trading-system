@@ -113,8 +113,11 @@ class V7Integration:
             pos_mult *= 0.7
             regime = 'neutral'
         elif sig.engine == 'momentum_death':
-            pos_mult *= 0.8
-            regime = 'trending'
+            pos_mult *= self.cfg.get('momentum_death_pos_mult', 0.55)
+            regime = 'choppy'
+            sl_pct = self.cfg.get('momentum_death_sl_pct', 0.22)
+            tp_partial = self.cfg.get('momentum_death_tp_partial_pct', 0.20)
+            timeout_bars = self.cfg.get('momentum_death_timeout_bars', 8)
 
         if dir_str == 'call':
             sl_price = price * (1 - sl_pct)

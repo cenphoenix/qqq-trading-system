@@ -84,7 +84,7 @@ def _load_config():
             'stock_trail_activate': 0.0030, 'stock_trail_drop': 0.0015,
             'enable_put_entries': True, 'put_time_stop_bars': 5,
             'put_order_pct': 3.0,
-            'put_allowed_signals': ['VWAP_Breakout', 'EMA_Cross', 'RSI_Reversal'],
+            'put_allowed_signals': ['VWAP_Breakout', 'EMA_Cross', 'RSI_Reversal', 'Momentum_Death'],
             'put_quality_filter': True, 'put_min_strength': 80,
             'put_min_price_pos': 0.20, 'put_min_vwap_dist': 0.0010,
             'put_min_macd_hist_abs': 0.0, 'put_min_sma20_slope_abs': 0.0,
@@ -122,6 +122,12 @@ def _load_config():
             'market_regime_countertrend_sl_pct': 0.20,
             'market_regime_range_breakout_pos_mult': 0.20,
             'market_regime_range_breakout_sl_pct': 0.22,
+            'enable_momentum_death_entries': True,
+            'momentum_death_pos_mult': 0.55,
+            'momentum_death_sl_pct': 0.22,
+            'momentum_death_tp_partial_pct': 0.20,
+            'momentum_death_timeout_bars': 8,
+            'momentum_death_relaxed_put_quality': True,
             'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -612,7 +618,8 @@ class QQQLiveTrader:
             return True
 
         countertrend_signals = {'RSI_Reversal', 'Chan_First_Buy', 'RSI_Overbought', 'Momentum_Death'}
-        if signal in countertrend_signals and not self.cfg.get('enable_countertrend_reversal_entries', False):
+        allow_momentum_death = signal == 'Momentum_Death' and self.cfg.get('enable_momentum_death_entries', True)
+        if signal in countertrend_signals and not allow_momentum_death and not self.cfg.get('enable_countertrend_reversal_entries', False):
             self._last_entry_rejection = f'逆势反转信号暂停: {signal}'
             print(f"  ⛔ 逆势反转信号已暂停: {signal}（等待更可靠的主要趋势反转结构）")
             return True
@@ -658,7 +665,15 @@ class QQQLiveTrader:
                 return True
             if self.cfg.get('put_quality_filter', True) and self._should_skip_put_signal(sig, signal, context):
                 return True
-            if self.cfg.get('price_action_filter', True) and self.cfg.get('price_action_require_put_trend', True):
+            skip_put_trend_requirement = (
+                signal == 'Momentum_Death'
+                and self.cfg.get('momentum_death_relaxed_put_quality', True)
+            )
+            if (
+                not skip_put_trend_requirement
+                and self.cfg.get('price_action_filter', True)
+                and self.cfg.get('price_action_require_put_trend', True)
+            ):
                 price_action = self.price_action.evaluate(self.one_min_candles, direction)
                 if not price_action.get('allow'):
                     self._last_entry_rejection = f'PUT价格行为过滤: {price_action.get("reason", "")}'
@@ -761,6 +776,20 @@ class QQQLiveTrader:
         if signal not in allowed:
             print(f"  ⛔ PUT信号过滤: {signal} 不在允许列表 {allowed}")
             return True
+
+        if signal == 'Momentum_Death' and self.cfg.get('momentum_death_relaxed_put_quality', True):
+            meta = sig.get('metadata') or {}
+            macd_prev = float(meta.get('macd_hist_prev') or 0)
+            macd_now = float(meta.get('macd_hist') or 0)
+            rsi_prev = float(meta.get('rsi_prev') or 50)
+            rsi_now = float(meta.get('rsi') or 50)
+            if not (macd_prev > macd_now and rsi_prev > rsi_now and context['price_pos'] >= 0.35):
+                print(
+                    f"  ⛔ Momentum_Death质量过滤: MACD {macd_prev:.3f}->{macd_now:.3f}, "
+                    f"RSI {rsi_prev:.1f}->{rsi_now:.1f}, pos={context['price_pos']*100:.0f}%"
+                )
+                return True
+            return False
 
         strength = float(sig.get('strength') or 0)
         min_strength = float(self.cfg.get('put_min_strength', 80) or 0)

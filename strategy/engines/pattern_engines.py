@@ -10,6 +10,33 @@ def _sma(values, period):
     return sum(values[-period:]) / period
 
 
+def _ema_series(values, period):
+    if len(values) < period:
+        return []
+    alpha = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    result = [ema]
+    for value in values[period:]:
+        ema = ema + alpha * (value - ema)
+        result.append(ema)
+    return result
+
+
+def _macd_hist_pair(closes):
+    if len(closes) < 35:
+        return None, None
+    ema12 = _ema_series(closes, 12)
+    ema26 = _ema_series(closes, 26)
+    offset = len(ema12) - len(ema26)
+    macd_line = [fast - slow for fast, slow in zip(ema12[offset:], ema26)]
+    signal = _ema_series(macd_line, 9)
+    if len(signal) < 2:
+        return None, None
+    macd_tail = macd_line[-len(signal):]
+    hist = [2.0 * (line - sig) for line, sig in zip(macd_tail, signal)]
+    return hist[-2], hist[-1]
+
+
 def _rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
@@ -179,17 +206,24 @@ class RSIOverboughtEngine(BaseEngine):
 
 
 class MomentumDeathEngine(BaseEngine):
-    """Bearish momentum failure after an extended move."""
+    """MACD + RSI bearish momentum failure, useful for choppy exhaustion shorts."""
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
         self.name = 'momentum_death'
         self.priority = 4
+        self.min_rsi_prev = cfg.get('momentum_death_min_rsi_prev', 50)
+        self.rsi_drop = cfg.get('momentum_death_min_rsi_drop', 2.5)
+        self.rsi_cross = cfg.get('momentum_death_rsi_cross', 50)
+        self.min_macd_prev = cfg.get('momentum_death_min_macd_prev', 0.03)
+        self.macd_decay = cfg.get('momentum_death_min_macd_decay', 0.35)
+        self.min_price_pos = cfg.get('momentum_death_min_price_pos', 0.45)
 
     def check(self) -> Optional[Signal]:
         if not self._initialized or len(self.closes) < 35:
             return None
         cur = self.bars[-1]
+        prev = self.bars[-2]
         price = cur['close']
         sma8 = _sma(self.closes, 8)
         sma21 = _sma(self.closes, 21)
@@ -197,14 +231,54 @@ class MomentumDeathEngine(BaseEngine):
             return None
         rsi_now = _rsi(self.closes, 14)
         rsi_prev = _rsi(self.closes[:-1], 14)
-        extension = (max(self.highs[-20:]) - min(self.lows[-20:])) / price * 100 if price else 0
-        lower_high = self.highs[-1] < self.highs[-2] <= self.highs[-3]
-        bearish_close = cur['close'] < cur['open'] and cur['close'] < sma8
-        trend_roll = sma8 < _sma(self.closes[:-1], 8) and sma8 > sma21
-        rsi_roll = rsi_prev >= 60 and rsi_now < rsi_prev - 3
-        if extension >= 0.35 and lower_high and bearish_close and trend_roll and rsi_roll:
-            strength = min(100, 58 + extension * 40 + (rsi_prev - rsi_now) * 3)
-            return Signal(self.name, SignalDirection.PUT, strength, price,
-                          f"动量衰竭转弱 RSI {rsi_prev:.0f}->{rsi_now:.0f}",
-                          {'extension_pct': extension, 'rsi': rsi_now})
+        macd_prev, macd_now = _macd_hist_pair(self.closes)
+        if macd_prev is None or macd_now is None:
+            return None
+
+        recent_high = max(self.highs[-20:])
+        recent_low = min(self.lows[-20:])
+        range_height = max(recent_high - recent_low, 1e-9)
+        price_pos = (price - recent_low) / range_height
+        extension = range_height / price * 100 if price else 0
+
+        macd_roll = (
+            macd_prev >= self.min_macd_prev
+            and macd_now < macd_prev
+            and (macd_prev - macd_now) >= max(self.macd_decay * abs(macd_prev), 0.015)
+        )
+        rsi_roll = (
+            rsi_prev >= self.min_rsi_prev
+            and rsi_now <= self.rsi_cross
+            and (rsi_prev - rsi_now) >= self.rsi_drop
+        )
+        bearish_close = (
+            cur['close'] < cur['open']
+            or cur['close'] < prev['close']
+            or cur['close'] < sma8
+        )
+        not_low_chase = price_pos >= self.min_price_pos
+
+        if macd_roll and rsi_roll and bearish_close and not_low_chase:
+            strength = min(
+                100,
+                62
+                + min(18, extension * 18)
+                + min(12, (rsi_prev - rsi_now) * 2.2)
+                + min(12, (macd_prev - macd_now) / max(abs(macd_prev), 0.001) * 12),
+            )
+            return Signal(
+                self.name,
+                SignalDirection.PUT,
+                strength,
+                price,
+                f"MACD+RSI双死叉 | MACD{macd_prev:.3f}->{macd_now:.3f} | RSI{rsi_prev:.1f}->{rsi_now:.1f}",
+                {
+                    'extension_pct': extension,
+                    'rsi': rsi_now,
+                    'rsi_prev': rsi_prev,
+                    'macd_hist': macd_now,
+                    'macd_hist_prev': macd_prev,
+                    'price_pos': price_pos,
+                },
+            )
         return None
