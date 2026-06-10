@@ -112,6 +112,7 @@ class DashboardState:
         # 行情
         self.current_price: float = 0.0
         self.candle_count: int = 0
+        self.day_market_regime: Dict = {}
         
         # VIX
         self.vix_state: Dict = {}
@@ -212,6 +213,7 @@ class DashboardState:
             'running': self.running,
             'current_price': self.current_price,
             'candle_count': self.candle_count,
+            'day_market_regime': self.day_market_regime,
             'uptime': uptime_str,
             
             # 账户
@@ -335,6 +337,9 @@ def add_trade(trade: Dict):
 
 def update_vix(vix_state: Dict):
     state.vix_state = vix_state
+
+def update_day_market_regime(regime: Dict):
+    state.day_market_regime = regime or {}
 
 def update_price(price: float):
     state.current_price = price
@@ -480,6 +485,7 @@ tr:hover{background:var(--surface-2)}
       <div class="kv"><span class="kv-label">QQQ</span><span class="kv-val" id="v-qqq">--</span></div>
       <div class="kv"><span class="kv-label">VIX</span><span class="kv-val" id="v-vix">--</span></div>
       <div class="kv"><span class="kv-label">VIX区间</span><span class="kv-val" id="v-vix-regime">--</span></div>
+      <div class="kv"><span class="kv-label">当日行情</span><span class="kv-val" id="v-day-regime">--</span></div>
     </div>
     <div class="card"><div class="card-title">💰 资金</div>
       <div class="kv"><span class="kv-label">总资产</span><span class="kv-val" id="v-equity">--</span></div>
@@ -579,6 +585,8 @@ function update(d){
   $('v-qqq').textContent=d.current_price?'$'+d.current_price.toFixed(2):'--';
   $('v-vix').textContent=d.vix.vix?d.vix.vix.toFixed(1):'--';
   $('v-vix-regime').textContent=d.vix.regime||'--';
+  const dayRegime=d.day_market_regime||{};
+  $('v-day-regime').textContent=dayRegime.label||dayRegime.type||'--';
   
   // 资金
   $('v-equity').textContent=fmt$(d.account.net_assets);

@@ -107,6 +107,21 @@ def _load_config():
             'shadow_signal_max_per_day': 100,
             'shadow_signal_live_orders': False,
             'shadow_live_order_pos_mult': 0.25,
+            'shadow_live_sl_pct': 0.22,
+            'shadow_live_disable_open_stop_widen': True,
+            'trend_day_filter_enabled': True,
+            'trend_day_min_bars': 30,
+            'trend_day_lookback_bars': 20,
+            'trend_day_min_move_pct': 0.0018,
+            'trend_day_min_vwap_dist': 0.0010,
+            'trend_day_min_sma20_slope': 0.00015,
+            'trend_day_countertrend_hard_block': False,
+            'market_regime_enabled': True,
+            'market_regime_soft_countertrend': True,
+            'market_regime_countertrend_pos_mult': 0.15,
+            'market_regime_countertrend_sl_pct': 0.20,
+            'market_regime_range_breakout_pos_mult': 0.20,
+            'market_regime_range_breakout_sl_pct': 0.22,
             'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -196,7 +211,14 @@ class QQQLiveTrader:
         self.v7 = V7Integration(self.cfg)
         self.price_action = PriceActionFilter(self.cfg)
         self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
+        self.day_market_regime = {
+            'type': 'warming_up',
+            'direction': '',
+            'label': '预热',
+            'reason': '',
+        }
         self._last_entry_rejection = ''
+        self._hard_skip_shadow_live = False
 
         # 初始化长桥连接
         self._init_api()
@@ -377,17 +399,217 @@ class QQQLiveTrader:
 
     def _entry_signal_name(self, sig):
         raw = sig.get('display_engine') or sig.get('engine') or sig.get('raw_engine') or ''
-        if raw in ('VWAP_Breakout', 'EMA_Cross', 'Kline_Pattern', 'Granville_Pullback', 'RSI_Reversal', 'Chan_First_Buy'):
+        if raw in (
+            'VWAP_Breakout', 'EMA_Cross', 'Kline_Pattern', 'Granville_Pullback',
+            'RSI_Reversal', 'RSI_Overbought', 'Chan_First_Buy', 'Momentum_Death',
+        ):
             return raw
         return display_signal_name(raw)
 
+    def _trend_day_bias(self, context=None):
+        if not self.cfg.get('trend_day_filter_enabled', True):
+            return {'direction': '', 'reason': ''}
+        min_bars = int(self.cfg.get('trend_day_min_bars', 30) or 30)
+        if len(self.close_history) < min_bars:
+            return {'direction': '', 'reason': ''}
+
+        lookback = int(self.cfg.get('trend_day_lookback_bars', 20) or 20)
+        if len(self.close_history) <= lookback:
+            return {'direction': '', 'reason': ''}
+
+        current = float(self.close_history[-1])
+        prior = float(self.close_history[-lookback])
+        if prior <= 0:
+            return {'direction': '', 'reason': ''}
+
+        ctx = context or self._entry_quality_context(current)
+        move = (current - prior) / prior
+        vwap_dist = float(ctx.get('vwap_dist', 0) or 0)
+        sma20_slope = float(ctx.get('sma20_slope', 0) or 0)
+        min_move = float(self.cfg.get('trend_day_min_move_pct', 0.0018) or 0.0018)
+        min_vwap = float(self.cfg.get('trend_day_min_vwap_dist', 0.0010) or 0.0010)
+        min_slope = float(self.cfg.get('trend_day_min_sma20_slope', 0.00015) or 0.00015)
+
+        if move >= min_move and vwap_dist >= min_vwap and sma20_slope >= min_slope:
+            return {
+                'direction': 'call',
+                'reason': f'trend_day_long move={move*100:.2f}% vwap={vwap_dist*100:.2f}% slope={sma20_slope*100:.3f}%',
+            }
+        if move <= -min_move and vwap_dist <= -min_vwap and sma20_slope <= -min_slope:
+            return {
+                'direction': 'put',
+                'reason': f'trend_day_short move={move*100:.2f}% vwap={vwap_dist*100:.2f}% slope={sma20_slope*100:.3f}%',
+            }
+        return {'direction': '', 'reason': ''}
+
+    def _classify_day_market_regime(self, context=None):
+        if not self.cfg.get('market_regime_enabled', True):
+            return {'type': 'disabled', 'direction': '', 'label': '未启用', 'reason': ''}
+        bars = self.one_min_candles
+        if len(bars) < 15:
+            return {
+                'type': 'warming_up',
+                'direction': '',
+                'label': '预热',
+                'reason': f'K线不足: {len(bars)}/15',
+            }
+
+        current = float(bars[-1]['close'])
+        first_open = float(bars[0]['open'])
+        session_high = max(float(bar['high']) for bar in bars)
+        session_low = min(float(bar['low']) for bar in bars)
+        session_range = max(session_high - session_low, 1e-9)
+        session_pos = (current - session_low) / session_range
+        day_move = (current - first_open) / first_open if first_open else 0.0
+
+        lookback = min(20, len(bars) - 1)
+        recent_prior = float(bars[-lookback]['close']) if lookback > 0 else current
+        recent_move = (current - recent_prior) / recent_prior if recent_prior else 0.0
+        recent = bars[-min(20, len(bars)):]
+        up_bars = sum(1 for bar in recent if float(bar['close']) >= float(bar['open']))
+        down_bars = len(recent) - up_bars
+
+        ctx = context or self._entry_quality_context(current)
+        vwap_dist = float(ctx.get('vwap_dist', 0) or 0)
+        sma20_slope = float(ctx.get('sma20_slope', 0) or 0)
+        pa_state = self.price_action_state if isinstance(self.price_action_state, dict) else {}
+        pa_direction = pa_state.get('direction', '')
+        pa_state_name = pa_state.get('state', '')
+
+        opening = bars[:min(15, len(bars))]
+        opening_high = max(float(bar['high']) for bar in opening)
+        opening_low = min(float(bar['low']) for bar in opening)
+        broke_open_high = current > opening_high
+        broke_open_low = current < opening_low
+
+        trend_up = (
+            len(bars) >= int(self.cfg.get('trend_day_min_bars', 30) or 30)
+            and vwap_dist >= 0.0006
+            and sma20_slope >= 0.00005
+            and session_pos >= 0.60
+            and (day_move >= 0.0012 or recent_move >= 0.0010 or up_bars >= 12)
+        )
+        trend_down = (
+            len(bars) >= int(self.cfg.get('trend_day_min_bars', 30) or 30)
+            and vwap_dist <= -0.0006
+            and sma20_slope <= -0.00005
+            and session_pos <= 0.40
+            and (day_move <= -0.0012 or recent_move <= -0.0010 or down_bars >= 12)
+        )
+
+        if trend_up or pa_direction == 'call' and session_pos >= 0.65 and vwap_dist > 0:
+            return {
+                'type': 'trend_up',
+                'direction': 'call',
+                'label': '趋势上涨',
+                'reason': (
+                    f'day={day_move*100:.2f}% recent={recent_move*100:.2f}% '
+                    f'vwap={vwap_dist*100:.2f}% pos={session_pos*100:.0f}% '
+                    f'slope={sma20_slope*100:.3f}%'
+                ),
+                'preferred_signals': ['Granville_Pullback', 'Kline_Pattern', 'VWAP_Breakout'],
+            }
+        if trend_down or pa_direction == 'put' and session_pos <= 0.35 and vwap_dist < 0:
+            return {
+                'type': 'trend_down',
+                'direction': 'put',
+                'label': '趋势下跌',
+                'reason': (
+                    f'day={day_move*100:.2f}% recent={recent_move*100:.2f}% '
+                    f'vwap={vwap_dist*100:.2f}% pos={session_pos*100:.0f}% '
+                    f'slope={sma20_slope*100:.3f}%'
+                ),
+                'preferred_signals': ['VWAP_Breakout', 'Kline_Pattern', 'Granville_Pullback'],
+            }
+
+        if len(bars) <= 75 and ((broke_open_high and day_move < 0) or (broke_open_low and day_move > 0)):
+            direction = 'put' if broke_open_high else 'call'
+            return {
+                'type': 'opening_reversal',
+                'direction': direction,
+                'label': '开盘反转',
+                'reason': f'open_range=({opening_low:.2f}-{opening_high:.2f}) day={day_move*100:.2f}%',
+                'preferred_signals': ['Kline_Pattern', 'RSI_Reversal', 'RSI_Overbought'],
+            }
+
+        range_pct = session_range / current if current else 0.0
+        if (
+            len(bars) >= 30
+            and (pa_state_name == 'trading_range' or abs(vwap_dist) <= 0.0015)
+            and 0.25 <= session_pos <= 0.75
+            and range_pct <= 0.0065
+        ):
+            return {
+                'type': 'range',
+                'direction': '',
+                'label': '震荡市',
+                'reason': f'range={range_pct*100:.2f}% vwap={vwap_dist*100:.2f}% pos={session_pos*100:.0f}%',
+                'preferred_signals': ['Failed_Breakout', 'VWAP_Reversion', 'Kline_Pattern'],
+            }
+
+        return {
+            'type': 'unclear',
+            'direction': '',
+            'label': '未明确',
+            'reason': f'day={day_move*100:.2f}% vwap={vwap_dist*100:.2f}% pos={session_pos*100:.0f}%',
+        }
+
+    def _apply_market_regime_to_signal(self, sig, signal, direction, context):
+        regime = self.day_market_regime or self._classify_day_market_regime(context)
+        sig.setdefault('metadata', {})['day_market_regime'] = regime
+        sig['day_market_regime'] = regime.get('type', '')
+        sig['day_market_label'] = regime.get('label', '')
+
+        regime_direction = regime.get('direction', '')
+        if (
+            self.cfg.get('market_regime_soft_countertrend', True)
+            and regime_direction
+            and direction
+            and direction != regime_direction
+        ):
+            sig['pos_mult'] = min(
+                float(sig.get('pos_mult', 1.0) or 1.0),
+                float(self.cfg.get('market_regime_countertrend_pos_mult', 0.15) or 0.15),
+            )
+            sig['sl_pct'] = min(
+                float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
+                float(self.cfg.get('market_regime_countertrend_sl_pct', 0.20) or 0.20),
+            )
+            sig['reason'] = f"[{regime.get('label', '')}逆势降级] {sig.get('reason', '')}"
+
+        if regime.get('type') == 'range' and signal == 'VWAP_Breakout':
+            sig['pos_mult'] = min(
+                float(sig.get('pos_mult', 1.0) or 1.0),
+                float(self.cfg.get('market_regime_range_breakout_pos_mult', 0.20) or 0.20),
+            )
+            sig['sl_pct'] = min(
+                float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
+                float(self.cfg.get('market_regime_range_breakout_sl_pct', 0.22) or 0.22),
+            )
+            sig['reason'] = f"[震荡突破降级] {sig.get('reason', '')}"
+
     def _should_skip_entry_signal(self, sig):
         self._last_entry_rejection = ''
+        self._hard_skip_shadow_live = False
         signal = self._entry_signal_name(sig)
         price = float(sig.get('price') or 0)
         direction = sig.get('dir', '')
         reason = str(sig.get('reason', ''))
         context = self._entry_quality_context(price)
+        self._apply_market_regime_to_signal(sig, signal, direction, context)
+
+        trend_bias = self._trend_day_bias(context)
+        trend_direction = trend_bias.get('direction', '')
+        if (
+            self.cfg.get('trend_day_countertrend_hard_block', True)
+            and trend_direction
+            and direction
+            and direction != trend_direction
+        ):
+            self._last_entry_rejection = f'趋势日逆势禁入: {trend_bias.get("reason", "")}'
+            self._hard_skip_shadow_live = True
+            print(f"  ⛔ 趋势日逆势禁入: {direction} vs {trend_direction} | {signal}")
+            return True
 
         countertrend_signals = {'RSI_Reversal', 'Chan_First_Buy', 'RSI_Overbought', 'Momentum_Death'}
         if signal in countertrend_signals and not self.cfg.get('enable_countertrend_reversal_entries', False):
@@ -629,6 +851,8 @@ class QQQLiveTrader:
                 'contracts': int(contracts),
                 'reason': sig.get('reason', ''),
                 'regime': sig.get('regime', ''),
+                'day_market_regime': sig.get('day_market_regime', ''),
+                'day_market_label': sig.get('day_market_label', ''),
                 'source': source,
                 'rejection_reason': rejection_reason,
                 'milestones': {5: None, 10: None, 20: None},
@@ -651,7 +875,7 @@ class QQQLiveTrader:
         if skipped:
             rejection = self._last_entry_rejection or '质量过滤未通过'
             live_orders = self.cfg.get('shadow_signal_live_orders', False)
-            if live_orders:
+            if live_orders and not self._hard_skip_shadow_live:
                 signal_name = self._entry_signal_name(sig)
                 cooldown = int(self.cfg.get('shadow_signal_cooldown_bars', 5) or 5)
                 duplicate = any(
@@ -665,6 +889,10 @@ class QQQLiveTrader:
                     sig['_shadow_live_approved'] = True
                     sig['shadow_live_order'] = True
                     sig['shadow_rejection_reason'] = rejection
+                    sig['sl_pct'] = min(
+                        float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
+                        float(self.cfg.get('shadow_live_sl_pct', 0.22) or 0.22),
+                    )
                     sig['pos_mult'] = min(
                         float(sig.get('pos_mult', 1.0) or 1.0),
                         float(self.cfg.get('shadow_live_order_pos_mult', 0.25) or 0.25),
@@ -897,6 +1125,7 @@ class QQQLiveTrader:
                 'daily_pnl': self.daily_pnl,
                 'filter_status': self.filter_status,
                 'price_action_state': self.price_action_state,
+                'day_market_regime': self.day_market_regime,
                 'current_signal': self.current_signal,
                 'session_high': self.session_high,
                 'session_low': self.session_low if self.session_low < 999999 else 0,
@@ -938,6 +1167,8 @@ class QQQLiveTrader:
                     'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
                     'opt_symbol': t.get('opt_symbol', ''),
                     'regime': t.get('regime', 'neutral'),
+                    'day_market_regime': t.get('day_market_regime', ''),
+                    'day_market_label': t.get('day_market_label', ''),
                 })
             for p in self.signal_probes[-200:]:
                 state['signal_probes'].append({
@@ -949,6 +1180,8 @@ class QQQLiveTrader:
                     'entry_price': p.get('entry_price', 0),
                     'reason': p.get('reason', ''),
                     'regime': p.get('regime', ''),
+                    'day_market_regime': p.get('day_market_regime', ''),
+                    'day_market_label': p.get('day_market_label', ''),
                     'source': p.get('source', 'live'),
                     'rejection_reason': p.get('rejection_reason', ''),
                     'm5_pct': p.get('m5_pct'),
@@ -1593,6 +1826,12 @@ class QQQLiveTrader:
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._signal_cooldowns = {}
             self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
+            self.day_market_regime = {
+                'type': 'warming_up',
+                'direction': '',
+                'label': '预热',
+                'reason': '',
+            }
             self._loss_circuit_warning_fired = False      # 新交易日重置熔断通知
             self._loss_circuit_conservative_fired = False  # 新交易日重置熔断通知
             self._daily_summary_sent = False  # 新交易日重置日终总结标记
@@ -1657,6 +1896,12 @@ class QQQLiveTrader:
 
         # FilterEngine 计算 ATR/VWAP/SMA 等技术指标（供信号检测用）
         self.engine.update(one_min)
+        self.day_market_regime = self._classify_day_market_regime()
+        try:
+            import dashboard_v7
+            dashboard_v7.update_day_market_regime(self.day_market_regime)
+        except Exception:
+            pass
         
         # v7 多引擎更新
         et_now = now.astimezone(TZ_ET)
@@ -2673,6 +2918,8 @@ class QQQLiveTrader:
                 'tp_partial_pct': sig.get('tp_partial_pct', 1.00),  # 动态止盈阈值
                 'timeout_bars': sig.get('timeout_bars', 10),        # 动态超时
                 'regime': sig.get('regime', 'neutral'),             # 市场状态
+                'day_market_regime': sig.get('day_market_regime', ''),
+                'day_market_label': sig.get('day_market_label', ''),
                 # 正股跟踪止损
                 'stock_peak': float(price),  # 正股最高价(Call)/最低价(Put)
                 'peak_opt_pnl': 0,           # 期权峰值盈利(用于半仓跟踪)
@@ -2703,6 +2950,8 @@ class QQQLiveTrader:
                     'strength': sig.get('strength', 0),
                     'entry_price': float(price),
                     'reason': sig['reason'],
+                    'day_market_regime': sig.get('day_market_regime', ''),
+                    'day_market_label': sig.get('day_market_label', ''),
                 })
                 dashboard_v7.update_position(self.position)
                 dashboard_v7.update_trades(self.trades_today)
@@ -3041,7 +3290,14 @@ class QQQLiveTrader:
             # 计算入场时的ET分钟数
             entry_candle_idx = min(entry_bar, len(self.one_min_candles) - 1)
             # 简化：如果持仓在开盘30分钟内，放宽止损
-            if bars_held <= 30 and sl_pct < 35:
+            if (
+                bars_held <= 30
+                and sl_pct < 35
+                and not (
+                    pos.get('shadow_live_order')
+                    and self.cfg.get('shadow_live_disable_open_stop_widen', True)
+                )
+            ):
                 sl_pct = 35.0
 
         # --- 1. 止损（期权价格，最高优先）---
