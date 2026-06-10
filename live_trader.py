@@ -5482,6 +5482,7 @@ class QQQLiveTrader:
         """保存今日交易记录到 JSON 文件"""
         from zoneinfo import ZoneInfo
         TZ_ET = ZoneInfo("America/New_York")
+        today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
 
         # 先同步长桥订单信息
         self._sync_longbridge_orders()
