@@ -4062,6 +4062,27 @@ class QQQLiveTrader:
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
 
+    def _fmt_day_market(self, source=None):
+        regime = {}
+        if isinstance(source, dict):
+            raw = source.get('metadata', {}).get('day_market_regime') if isinstance(source.get('metadata'), dict) else None
+            if isinstance(raw, dict):
+                regime = raw
+            else:
+                regime = {
+                    'type': source.get('day_market_regime', ''),
+                    'label': source.get('day_market_label', ''),
+                }
+        if not regime:
+            regime = self.day_market_regime if isinstance(self.day_market_regime, dict) else {}
+        label = regime.get('label') or regime.get('type') or '--'
+        direction = regime.get('direction') or ''
+        reason = regime.get('reason') or ''
+        direction_text = {'call': '偏多', 'put': '偏空'}.get(direction, '中性')
+        if reason:
+            return f"当日行情 <b>{label}</b> ({direction_text})\n<code>{reason}</code>\n"
+        return f"当日行情 <b>{label}</b> ({direction_text})\n"
+
     def _fmt_entry(self, sig, opt_symbol, price, contracts, qty, order_id):
         """格式化开仓通知"""
         dir_emoji = '🟢' if sig['dir'] == 'call' else '🔴'
@@ -4081,7 +4102,8 @@ class QQQLiveTrader:
             f"───────────\n"
             f"正股 <b>${price:.2f}</b> | 期权 <b>${entry_opt:.2f}</b>\n"
             f"数量 <b>{contracts}</b>张 ({qty}股)\n"
-            f"市场 <b>{regime}</b>\n"
+            f"策略行情 <b>{regime}</b>\n"
+            f"{self._fmt_day_market(sig)}"
             f"理由 {reason}\n"
             f"订单 {order_id}\n"
             f"───────────\n"
@@ -4108,6 +4130,7 @@ class QQQLiveTrader:
             f"───────────\n"
             f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
             f"{emoji} {label} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
+            f"{self._fmt_day_market(pos)}"
             f"订单 {order_id}\n"
             f"───────────\n"
             f"📈 今日统计\n"
@@ -4128,6 +4151,7 @@ class QQQLiveTrader:
             f"───────────\n"
             f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
             f"{emoji} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
+            f"{self._fmt_day_market(pos)}"
             f"平掉 <b>{half}</b>张 | 剩余 <b>{remaining}</b>张"
         )
 
@@ -5459,6 +5483,8 @@ class QQQLiveTrader:
                         'contracts': contracts,
                         'pnl_pct': pnl_pct,
                         'pnl_usd': pnl,
+                        'day_market_regime': self.day_market_regime.get('type', '') if isinstance(self.day_market_regime, dict) else '',
+                        'day_market_label': self.day_market_regime.get('label', '') if isinstance(self.day_market_regime, dict) else '',
                     },
                     reason='broker对账',
                     entry_opt=entry_price,
