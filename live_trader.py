@@ -74,8 +74,8 @@ def _load_config():
             'loss_cooldown': 3, 'tp_partial_pct': 1.00, 'tp_trail_drop': 0.30,
             'stock_trail_pct': 0.003, 'timeout_stage1_bars': 5, 'timeout_stage1_min': 0.30,
             'timeout_stage2_bars': 10, 'timeout_stage2_min': 0.60, 'timeout_stage3_bars': 15,
-            'option_offset': 2.0, 'order_pct': 8, 'contract_multiplier': 100,
-            'pos_pct': 8, 'max_trades': 999, 'daily_limit': 25,
+            'option_offset': 2.0, 'order_pct': 20, 'contract_multiplier': 100,
+            'pos_pct': 20, 'max_trades': 999, 'daily_limit': 25,
             'start_time': '09:40', 'end_time': '14:30',
             'extended_end_time': '15:00',
             'extension_order_pct': 5,
@@ -83,8 +83,8 @@ def _load_config():
             'stock_exit_enabled': True, 'stock_sl_pct': 0.0025, 'stock_tp_pct': 0.0040,
             'stock_trail_activate': 0.0030, 'stock_trail_drop': 0.0015,
             'enable_put_entries': True, 'put_time_stop_bars': 5,
-            'put_order_pct': 3.0,
-            'put_allowed_signals': ['VWAP_Breakout', 'EMA_Cross', 'RSI_Reversal', 'Momentum_Death'],
+            'put_order_pct': 8.0,
+            'put_allowed_signals': ['VWAP_Breakout', 'Kline_Pattern', 'Granville_Pullback'],
             'put_quality_filter': True, 'put_min_strength': 80,
             'put_min_price_pos': 0.20, 'put_min_vwap_dist': 0.0010,
             'put_min_macd_hist_abs': 0.0, 'put_min_sma20_slope_abs': 0.0,
@@ -106,7 +106,7 @@ def _load_config():
             'shadow_signal_cooldown_bars': 5,
             'shadow_signal_max_per_day': 100,
             'shadow_signal_live_orders': False,
-            'shadow_live_order_pos_mult': 0.25,
+            'shadow_live_order_pos_mult': 0.80,
             'shadow_live_sl_pct': 0.22,
             'shadow_live_disable_open_stop_widen': True,
             'trend_day_filter_enabled': True,
@@ -115,19 +115,22 @@ def _load_config():
             'trend_day_min_move_pct': 0.0018,
             'trend_day_min_vwap_dist': 0.0010,
             'trend_day_min_sma20_slope': 0.00015,
-            'trend_day_countertrend_hard_block': False,
+            'trend_day_countertrend_hard_block': True,
             'market_regime_enabled': True,
-            'market_regime_soft_countertrend': True,
+            'market_regime_soft_countertrend': False,
+            'market_regime_hard_countertrend': True,
             'market_regime_countertrend_pos_mult': 0.15,
             'market_regime_countertrend_sl_pct': 0.20,
             'market_regime_range_breakout_pos_mult': 0.20,
             'market_regime_range_breakout_sl_pct': 0.22,
-            'enable_momentum_death_entries': True,
+            'enable_momentum_death_entries': False,
             'momentum_death_pos_mult': 0.55,
             'momentum_death_sl_pct': 0.22,
             'momentum_death_tp_partial_pct': 0.20,
             'momentum_death_timeout_bars': 8,
             'momentum_death_relaxed_put_quality': True,
+            'disabled_entry_signals': ['EMA_Cross', 'RSI_Reversal', 'RSI_Overbought', 'Chan_First_Buy', 'Momentum_Death'],
+            'market_regime_hard_countertrend': True,
             'enable_countertrend_reversal_entries': False,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
@@ -568,11 +571,15 @@ class QQQLiveTrader:
 
         regime_direction = regime.get('direction', '')
         if (
-            self.cfg.get('market_regime_soft_countertrend', True)
+            (self.cfg.get('market_regime_soft_countertrend', True) or self.cfg.get('market_regime_hard_countertrend', False))
             and regime_direction
             and direction
             and direction != regime_direction
         ):
+            if self.cfg.get('market_regime_hard_countertrend', False):
+                self._last_entry_rejection = f'当日行情逆势禁入: {regime.get("label", "")}'
+                self._hard_skip_shadow_live = True
+                return True
             sig['pos_mult'] = min(
                 float(sig.get('pos_mult', 1.0) or 1.0),
                 float(self.cfg.get('market_regime_countertrend_pos_mult', 0.15) or 0.15),
@@ -593,6 +600,7 @@ class QQQLiveTrader:
                 float(self.cfg.get('market_regime_range_breakout_sl_pct', 0.22) or 0.22),
             )
             sig['reason'] = f"[震荡突破降级] {sig.get('reason', '')}"
+        return False
 
     def _should_skip_entry_signal(self, sig):
         self._last_entry_rejection = ''
@@ -602,7 +610,14 @@ class QQQLiveTrader:
         direction = sig.get('dir', '')
         reason = str(sig.get('reason', ''))
         context = self._entry_quality_context(price)
-        self._apply_market_regime_to_signal(sig, signal, direction, context)
+        disabled_signals = set(self.cfg.get('disabled_entry_signals') or [])
+        if signal in disabled_signals:
+            self._last_entry_rejection = f'胜率优先禁用信号: {signal}'
+            self._hard_skip_shadow_live = True
+            print(f"  ⛔ 胜率优先禁用信号: {signal}")
+            return True
+        if self._apply_market_regime_to_signal(sig, signal, direction, context):
+            return True
 
         trend_bias = self._trend_day_bias(context)
         trend_direction = trend_bias.get('direction', '')
@@ -924,7 +939,7 @@ class QQQLiveTrader:
                     )
                     sig['pos_mult'] = min(
                         float(sig.get('pos_mult', 1.0) or 1.0),
-                        float(self.cfg.get('shadow_live_order_pos_mult', 0.25) or 0.25),
+                        float(self.cfg.get('shadow_live_order_pos_mult', 0.80) or 0.80),
                     )
                     sig['reason'] = f"[影子测试单|原拒绝:{rejection}] {sig.get('reason', '')}"
                     print(f"  🧪 影子信号真实下单已开启: {signal_name} {sig.get('dir')} | {rejection}")
@@ -2758,13 +2773,13 @@ class QQQLiveTrader:
             low_price_mult = self.cfg.get('low_option_price_mult', 0.35)
             combined_mult *= low_price_mult
             print(f"  🛡️ 低权利金风控: ${opt_price:.2f} < ${min_option_price:.2f}，仓位系数降至{low_price_mult:.0%}")
-        # PUT uses a stricter standalone position cap; CALL afternoon trades stay capped at 5%.
+        # PUT uses a stricter standalone position cap; afternoon trades use half size.
         if sig['dir'] == 'put':
             effective_pct = min(self.cfg['order_pct'], self.cfg.get('put_order_pct', 3.0))
-        elif cur_min_et >= 720:
-            effective_pct = min(self.cfg['order_pct'], 5.0)
         else:
             effective_pct = self.cfg['order_pct']
+        if cur_min_et >= 720:
+            effective_pct *= 0.5
         order_amount = capital * effective_pct / 100 * combined_mult
         contracts = max(1, int(order_amount / (opt_price * self.cfg['contract_multiplier'])))
         max_contracts = int(self.cfg.get('max_contracts_per_trade', 400) or 400)
@@ -2778,7 +2793,6 @@ class QQQLiveTrader:
         if gamma_warning:  # 15:45+ 直接禁止
             contracts = 0
         qty = contracts * self.cfg['contract_multiplier']
-        effective_pct = self.cfg['order_pct'] * combined_mult / 100
         print(f"  📊 下单: {contracts}张 × ${opt_price:.2f} × {self.cfg['contract_multiplier']}股 = ${order_amount:,.2f} (pos_mult={pos_mult:.2f}, vol_coef={vol_mult_factor:.2f}, time_coef={time_risk_mult:.2f})")
 
         if contracts <= 0:

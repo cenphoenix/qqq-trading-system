@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     # ---- 资金风控 ----
     "risk": {
         "capital": 100000,          # 账户总资金
-        "order_pct": 8,             # 单笔下单占总资金百分比
+        "order_pct": 20,            # 单笔下单占总资金百分比
         "sl": 0.25,                 # 止损 25%
         "tp": 0.30,                 # 止盈 30%（旧逻辑兼容）
         "daily_limit": 25,          # 日亏损熔断百分比
@@ -70,7 +70,12 @@ DEFAULT_CONFIG = {
         "put_time_stop_bars": 5,
         "enable_put_entries": True,
         "put_quality_filter": True,
-        "put_order_pct": 3.0,
+        "put_allowed_signals": [
+            "VWAP_Breakout",
+            "Kline_Pattern",
+            "Granville_Pullback",
+        ],
+        "put_order_pct": 8.0,
         "price_action_filter": True,
         "price_action_require_put_trend": False,
         "price_action_min_close_location": 0.65,
@@ -92,7 +97,7 @@ DEFAULT_CONFIG = {
         "shadow_signal_cooldown_bars": 5,
         "shadow_signal_max_per_day": 100,
         "shadow_signal_live_orders": False,
-        "shadow_live_order_pos_mult": 0.40,
+        "shadow_live_order_pos_mult": 0.80,
         "shadow_live_sl_pct": 0.26,
         "shadow_live_disable_open_stop_widen": True,
         "trend_day_filter_enabled": True,
@@ -101,14 +106,15 @@ DEFAULT_CONFIG = {
         "trend_day_min_move_pct": 0.0018,
         "trend_day_min_vwap_dist": 0.0010,
         "trend_day_min_sma20_slope": 0.00015,
-        "trend_day_countertrend_hard_block": False,
+        "trend_day_countertrend_hard_block": True,
         "market_regime_enabled": True,
-        "market_regime_soft_countertrend": True,
+        "market_regime_soft_countertrend": False,
+        "market_regime_hard_countertrend": True,
         "market_regime_countertrend_pos_mult": 0.25,
         "market_regime_countertrend_sl_pct": 0.24,
         "market_regime_range_breakout_pos_mult": 0.35,
         "market_regime_range_breakout_sl_pct": 0.25,
-        "enable_momentum_death_entries": True,
+        "enable_momentum_death_entries": False,
         "momentum_death_pos_mult": 0.65,
         "momentum_death_sl_pct": 0.25,
         "momentum_death_tp_partial_pct": 0.20,
@@ -120,6 +126,13 @@ DEFAULT_CONFIG = {
         "momentum_death_min_macd_prev": 0.03,
         "momentum_death_min_macd_decay": 0.35,
         "momentum_death_min_price_pos": 0.45,
+        "disabled_entry_signals": [
+            "EMA_Cross",
+            "RSI_Reversal",
+            "RSI_Overbought",
+            "Chan_First_Buy",
+            "Momentum_Death",
+        ],
         "enable_countertrend_reversal_entries": False,
         "enable_kline_entries": True,
         "enable_granville_entries": True,
