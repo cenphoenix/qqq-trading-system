@@ -107,6 +107,8 @@ def _load_config():
             'shadow_signal_max_per_day': 100,
             'shadow_signal_live_orders': True,
             'shadow_live_order_pos_mult': 0.80,
+            'shadow_live_open_pos_mult': 0.50,
+            'shadow_live_afternoon_allowed_signals': ['VWAP_Breakout'],
             'shadow_live_sl_pct': 0.22,
             'shadow_live_disable_open_stop_widen': True,
             'trend_day_filter_enabled': True,
@@ -131,6 +133,20 @@ def _load_config():
             'momentum_death_relaxed_put_quality': True,
             'disabled_entry_signals': ['EMA_Cross', 'RSI_Reversal', 'RSI_Overbought', 'Chan_First_Buy', 'Momentum_Death'],
             'enable_countertrend_reversal_entries': False,
+            'enable_kline_entries': True,
+            'kline_quality_filter': True,
+            'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
+            'kline_max_price_pos': 0.82,
+            'kline_min_macd_hist': 0.0,
+            'kline_min_sma20_slope': 0.0,
+            'enable_granville_entries': True,
+            'granville_quality_filter': True,
+            'granville_max_price_pos': 0.85,
+            'granville_min_macd_hist': 0.0,
+            'granville_min_sma20_slope': 0.00005,
+            'granville_min_vwap_dist': 0.0005,
+            'granville_min_dist_pct': 0.20,
+            'granville_require_day_direction': True,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
             'check_interval': 20, 'capital': 100000,
@@ -743,16 +759,28 @@ class QQQLiveTrader:
             print("  ⛔ Kline/neutral信号已暂停: 近期实盘和回测质量不足")
             return True
         if is_kline and self.cfg.get('kline_quality_filter', True):
+            allowed_patterns = self.cfg.get('kline_call_live_patterns') or []
+            if direction == 'call' and allowed_patterns and not any(pat in reason for pat in allowed_patterns):
+                self._last_entry_rejection = 'Kline普通形态仅记录'
+                self._hard_skip_shadow_live = True
+                print(f"  ⛔ Kline普通CALL形态仅记录不下单: {reason}")
+                return True
             max_pos = self.cfg.get('kline_max_price_pos', 0.82)
             min_macd = self.cfg.get('kline_min_macd_hist', 0.0)
             min_slope = self.cfg.get('kline_min_sma20_slope', 0.0)
             if context['price_pos'] > max_pos:
+                self._last_entry_rejection = f'Kline高位追入过滤: {context["price_pos"]*100:.0f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline高位追入过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
                 return True
             if context['macd_hist'] <= min_macd:
+                self._last_entry_rejection = f'Kline动量过滤: MACD_hist={context["macd_hist"]:.4f}'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
                 return True
             if context['sma20_slope'] <= min_slope:
+                self._last_entry_rejection = f'Kline趋势过滤: SMA20斜率={context["sma20_slope"]*100:.4f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
                 return True
 
@@ -760,6 +788,19 @@ class QQQLiveTrader:
             print("  ⛔ Granville信号已暂停: 近期实盘和回测质量不足")
             return True
         if signal == 'Granville_Pullback' and self.cfg.get('granville_quality_filter', True):
+            day_direction = ''
+            if isinstance(self.day_market_regime, dict):
+                day_direction = self.day_market_regime.get('direction', '') or ''
+            if (
+                direction == 'call'
+                and self.cfg.get('granville_require_day_direction', True)
+                and day_direction
+                and day_direction != 'call'
+            ):
+                self._last_entry_rejection = f'Granville逆当日方向仅记录: {day_direction}'
+                self._hard_skip_shadow_live = True
+                print(f"  ⛔ Granville CALL逆当日方向仅记录: day={day_direction}")
+                return True
             max_pos = self.cfg.get('granville_max_price_pos', 0.85)
             min_macd = self.cfg.get('granville_min_macd_hist', 0.0)
             min_slope = self.cfg.get('granville_min_sma20_slope', 0.0)
@@ -768,18 +809,28 @@ class QQQLiveTrader:
             dist_pct = float(meta.get('dist_pct') or 0)
             min_dist_pct = self.cfg.get('granville_min_dist_pct', 0.03)
             if context['price_pos'] > max_pos:
+                self._last_entry_rejection = f'Granville高位过滤: {context["price_pos"]*100:.0f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville高位过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
                 return True
             if context['macd_hist'] <= min_macd:
+                self._last_entry_rejection = f'Granville动量过滤: MACD_hist={context["macd_hist"]:.4f}'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
                 return True
             if context['sma20_slope'] <= min_slope:
+                self._last_entry_rejection = f'Granville趋势过滤: SMA20斜率={context["sma20_slope"]*100:.4f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
                 return True
             if context['vwap_dir_dist'] <= min_vwap_dist:
+                self._last_entry_rejection = f'Granville VWAP过滤: {context["vwap_dir_dist"]*100:.3f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville VWAP过滤: 距VWAP={context['vwap_dir_dist']*100:.3f}% <= {min_vwap_dist*100:.3f}%")
                 return True
             if dist_pct < min_dist_pct:
+                self._last_entry_rejection = f'Granville回踩确认不足: {dist_pct:.2f}%'
+                self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville回踩确认不足: dist={dist_pct:.2f}% < {min_dist_pct:.2f}%")
                 return True
 
@@ -920,29 +971,42 @@ class QQQLiveTrader:
             live_orders = self.cfg.get('shadow_signal_live_orders', False)
             if live_orders and not self._hard_skip_shadow_live:
                 signal_name = self._entry_signal_name(sig)
-                cooldown = int(self.cfg.get('shadow_signal_cooldown_bars', 5) or 5)
-                duplicate = any(
-                    probe.get('source') in ('shadow', 'shadow_live')
-                    and probe.get('signal') == signal_name
-                    and probe.get('dir') == sig.get('dir', '')
-                    and len(self.one_min_candles) - int(probe.get('entry_bar', -9999)) < cooldown
-                    for probe in self.signal_probes
-                )
-                if not duplicate:
-                    sig['_shadow_live_approved'] = True
-                    sig['shadow_live_order'] = True
-                    sig['shadow_rejection_reason'] = rejection
-                    sig['sl_pct'] = min(
-                        float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
-                        float(self.cfg.get('shadow_live_sl_pct', 0.22) or 0.22),
+                now_et = datetime.now(TZ_ET)
+                cur_min_et = now_et.hour * 60 + now_et.minute
+                afternoon_allowed = set(self.cfg.get('shadow_live_afternoon_allowed_signals') or [])
+                if cur_min_et >= 780 and afternoon_allowed and signal_name not in afternoon_allowed:
+                    print(f"  ⏭️ 下午影子真实单仅允许 {sorted(afternoon_allowed)}，{signal_name} 只记录")
+                    live_orders = False
+                if not live_orders:
+                    pass
+                else:
+                    cooldown = int(self.cfg.get('shadow_signal_cooldown_bars', 5) or 5)
+                    duplicate = any(
+                        probe.get('source') in ('shadow', 'shadow_live')
+                        and probe.get('signal') == signal_name
+                        and probe.get('dir') == sig.get('dir', '')
+                        and len(self.one_min_candles) - int(probe.get('entry_bar', -9999)) < cooldown
+                        for probe in self.signal_probes
                     )
-                    sig['pos_mult'] = min(
-                        float(sig.get('pos_mult', 1.0) or 1.0),
-                        float(self.cfg.get('shadow_live_order_pos_mult', 0.80) or 0.80),
-                    )
-                    sig['reason'] = f"[影子测试单|原拒绝:{rejection}] {sig.get('reason', '')}"
-                    print(f"  🧪 影子信号真实下单已开启: {signal_name} {sig.get('dir')} | {rejection}")
-                    return False
+                    if not duplicate:
+                        shadow_mult = float(self.cfg.get('shadow_live_order_pos_mult', 0.80) or 0.80)
+                        if cur_min_et < 600:
+                            shadow_mult *= float(self.cfg.get('shadow_live_open_pos_mult', 0.50) or 0.50)
+                            rejection = f"{rejection}; 开盘影子仓位减半"
+                        sig['_shadow_live_approved'] = True
+                        sig['shadow_live_order'] = True
+                        sig['shadow_rejection_reason'] = rejection
+                        sig['sl_pct'] = min(
+                            float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
+                            float(self.cfg.get('shadow_live_sl_pct', 0.22) or 0.22),
+                        )
+                        sig['pos_mult'] = min(
+                            float(sig.get('pos_mult', 1.0) or 1.0),
+                            shadow_mult,
+                        )
+                        sig['reason'] = f"[影子测试单|原拒绝:{rejection}] {sig.get('reason', '')}"
+                        print(f"  🧪 影子信号真实下单已开启: {signal_name} {sig.get('dir')} | {rejection}")
+                        return False
             if self.cfg.get('shadow_signal_tracking', True):
                 self._start_signal_probe(
                     sig=sig,
@@ -5410,6 +5474,8 @@ class QQQLiveTrader:
             for t in self.trades_today:
                 if t.get('exit_time') is None:
                     continue  # 只保存已平仓的交易
+                if not t.get('opt_symbol') or int(t.get('contracts') or 0) <= 0:
+                    continue
                 entry_time = t.get('entry_time')
                 exit_time = t.get('exit_time')
                 if isinstance(entry_time, datetime):
@@ -5558,6 +5624,8 @@ class QQQLiveTrader:
         for t in (self.trades_today or []):
             opt_sym = t.get('opt_symbol', '')
             contracts = t.get('contracts', 0)
+            if not opt_sym or int(contracts or 0) <= 0:
+                continue
             key = f"{opt_sym}_{contracts}"
             if key not in seen_symbols:
                 # 这笔交易broker没有对账记录，用internal数据
