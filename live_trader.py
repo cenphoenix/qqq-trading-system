@@ -147,6 +147,12 @@ def _load_config():
             'granville_min_vwap_dist': 0.0005,
             'granville_min_dist_pct': 0.20,
             'granville_require_day_direction': True,
+            'trend_quick_trail_activate_pct': 20,
+            'trend_quick_trail_drop_pct': 12,
+            'trend_timeout_bonus_bars': 4,
+            'afternoon_put_start_min': 810,
+            'afternoon_put_min_vwap_dist': 0.006,
+            'afternoon_put_min_sma20_slope_abs': 0.00005,
             'max_gap': 0.0020, 'vol_mult': 0.8, 'min_body': 0.0003,
             'reversal_drop': 0.002, 'reversal_bounce': 0.001,
             'check_interval': 20, 'capital': 100000,
@@ -401,25 +407,48 @@ class QQQLiveTrader:
             return 'Kline_Pattern'
         return display_signal_name(name)
 
+    def _is_trend_aligned_position(self, pos):
+        """Return True when a position direction matches the current/day trend."""
+        if not pos:
+            return False
+        direction = pos.get('dir', '')
+        day_direction = pos.get('day_market_direction', '')
+        regime = pos.get('day_market_regime', '')
+        if not day_direction and isinstance(self.day_market_regime, dict):
+            day_direction = self.day_market_regime.get('direction', '')
+            regime = regime or self.day_market_regime.get('type', '')
+        return (
+            direction in ('call', 'put')
+            and day_direction == direction
+            and regime in ('trend_up', 'trend_down')
+        )
+
     def _timeout_profile(self, pos):
         signal = self._position_signal_name(pos)
         reason = str(pos.get('reason', ''))
         regime = pos.get('regime', '')
         if signal == 'VWAP_Breakout':
-            return {'signal': signal, 'stage': 8, 'hard': 12, 'min_profit': 0.0}
-        if signal == 'EMA_Cross':
-            return {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 0.0}
-        if signal == 'Granville_Pullback':
-            return {'signal': signal, 'stage': 7, 'hard': 10, 'min_profit': 2.0}
-        if signal == 'Kline_Pattern' or regime == 'neutral' or 'neutral' in reason:
-            return {'signal': 'Kline_Pattern', 'stage': 10, 'hard': 12, 'min_profit': 0.0}
-        base = int(pos.get('timeout_bars', 10) or 10)
-        return {
-            'signal': signal or 'default',
-            'stage': max(base * 3 // 4, 7),
-            'hard': base,
-            'min_profit': 5.0,
-        }
+            profile = {'signal': signal, 'stage': 8, 'hard': 12, 'min_profit': 0.0}
+        elif signal == 'EMA_Cross':
+            profile = {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 0.0}
+        elif signal == 'Granville_Pullback':
+            profile = {'signal': signal, 'stage': 7, 'hard': 10, 'min_profit': 2.0}
+        elif signal == 'Kline_Pattern' or regime == 'neutral' or 'neutral' in reason:
+            profile = {'signal': 'Kline_Pattern', 'stage': 10, 'hard': 12, 'min_profit': 0.0}
+        else:
+            base = int(pos.get('timeout_bars', 10) or 10)
+            profile = {
+                'signal': signal or 'default',
+                'stage': max(base * 3 // 4, 7),
+                'hard': base,
+                'min_profit': 5.0,
+            }
+        if self._is_trend_aligned_position(pos):
+            bonus = int(self.cfg.get('trend_timeout_bonus_bars', 4) or 0)
+            profile = dict(profile)
+            profile['stage'] += bonus
+            profile['hard'] += bonus
+        return profile
 
     def _entry_signal_name(self, sig):
         raw = sig.get('display_engine') or sig.get('engine') or sig.get('raw_engine') or ''
@@ -583,6 +612,7 @@ class QQQLiveTrader:
         sig.setdefault('metadata', {})['day_market_regime'] = regime
         sig['day_market_regime'] = regime.get('type', '')
         sig['day_market_label'] = regime.get('label', '')
+        sig['day_market_direction'] = regime.get('direction', '')
 
         regime_direction = regime.get('direction', '')
         if (
@@ -872,6 +902,29 @@ class QQQLiveTrader:
             print(f"  ⛔ PUT VWAP过滤: 价格低于VWAP {context['vwap_dir_dist']*100:.2f}% < {min_vwap_dist*100:.2f}%")
             return True
 
+        now_et = datetime.now(TZ_ET)
+        cur_min_et = now_et.hour * 60 + now_et.minute
+        afternoon_start = int(self.cfg.get('afternoon_put_start_min', 810) or 810)
+        if cur_min_et >= afternoon_start:
+            afternoon_vwap = float(self.cfg.get('afternoon_put_min_vwap_dist', 0.006) or 0.006)
+            afternoon_slope = float(self.cfg.get('afternoon_put_min_sma20_slope_abs', 0.00005) or 0.00005)
+            if context['vwap_dir_dist'] < afternoon_vwap:
+                self._last_entry_rejection = f'下午PUT VWAP跌破不足: {context["vwap_dir_dist"]*100:.2f}%'
+                self._hard_skip_shadow_live = True
+                print(
+                    f"  ⛔ 下午PUT假跌破过滤: 距VWAP {context['vwap_dir_dist']*100:.2f}% "
+                    f"< {afternoon_vwap*100:.2f}%"
+                )
+                return True
+            if context['sma20_slope'] > -afternoon_slope:
+                self._last_entry_rejection = f'下午PUT趋势斜率不足: {context["sma20_slope"]*100:.4f}%'
+                self._hard_skip_shadow_live = True
+                print(
+                    f"  ⛔ 下午PUT趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% "
+                    f"> -{afternoon_slope*100:.4f}%"
+                )
+                return True
+
         min_macd_abs = float(self.cfg.get('put_min_macd_hist_abs', 0.0) or 0)
         if context['macd_hist'] >= -min_macd_abs:
             print(f"  ⛔ PUT动量过滤: MACD_hist={context['macd_hist']:.4f} 未转空")
@@ -947,6 +1000,7 @@ class QQQLiveTrader:
                 'regime': sig.get('regime', ''),
                 'day_market_regime': sig.get('day_market_regime', ''),
                 'day_market_label': sig.get('day_market_label', ''),
+                'day_market_direction': sig.get('day_market_direction', ''),
                 'source': source,
                 'rejection_reason': rejection_reason,
                 'milestones': {5: None, 10: None, 20: None},
@@ -1276,6 +1330,7 @@ class QQQLiveTrader:
                     'regime': t.get('regime', 'neutral'),
                     'day_market_regime': t.get('day_market_regime', ''),
                     'day_market_label': t.get('day_market_label', ''),
+                    'day_market_direction': t.get('day_market_direction', ''),
                 })
             for p in self.signal_probes[-200:]:
                 state['signal_probes'].append({
@@ -1289,6 +1344,7 @@ class QQQLiveTrader:
                     'regime': p.get('regime', ''),
                     'day_market_regime': p.get('day_market_regime', ''),
                     'day_market_label': p.get('day_market_label', ''),
+                    'day_market_direction': p.get('day_market_direction', ''),
                     'source': p.get('source', 'live'),
                     'rejection_reason': p.get('rejection_reason', ''),
                     'm5_pct': p.get('m5_pct'),
@@ -3026,6 +3082,7 @@ class QQQLiveTrader:
                 'regime': sig.get('regime', 'neutral'),             # 市场状态
                 'day_market_regime': sig.get('day_market_regime', ''),
                 'day_market_label': sig.get('day_market_label', ''),
+                'day_market_direction': sig.get('day_market_direction', ''),
                 # 正股跟踪止损
                 'stock_peak': float(price),  # 正股最高价(Call)/最低价(Put)
                 'peak_opt_pnl': 0,           # 期权峰值盈利(用于半仓跟踪)
@@ -3058,6 +3115,7 @@ class QQQLiveTrader:
                     'reason': sig['reason'],
                     'day_market_regime': sig.get('day_market_regime', ''),
                     'day_market_label': sig.get('day_market_label', ''),
+                    'day_market_direction': sig.get('day_market_direction', ''),
                 })
                 dashboard_v7.update_position(self.position)
                 dashboard_v7.update_trades(self.trades_today)
@@ -3428,6 +3486,9 @@ class QQQLiveTrader:
         if not ex and not pos.get('half_closed'):
             quick_activate = self.cfg.get('quick_trail_activate_pct', 15)
             quick_drop = self.cfg.get('quick_trail_drop_pct', 8)
+            if self._is_trend_aligned_position(pos):
+                quick_activate = self.cfg.get('trend_quick_trail_activate_pct', quick_activate)
+                quick_drop = self.cfg.get('trend_quick_trail_drop_pct', quick_drop)
             floor_activate = self.cfg.get('profit_floor_activate_pct', 20)
             floor_pct = self.cfg.get('profit_floor_pct', 8)
             if pos.get('max_pnl_pct', 0) >= floor_activate and pnl_pct <= floor_pct:
@@ -5594,6 +5655,7 @@ class QQQLiveTrader:
                         'pnl_usd': pnl,
                         'day_market_regime': self.day_market_regime.get('type', '') if isinstance(self.day_market_regime, dict) else '',
                         'day_market_label': self.day_market_regime.get('label', '') if isinstance(self.day_market_regime, dict) else '',
+                        'day_market_direction': self.day_market_regime.get('direction', '') if isinstance(self.day_market_regime, dict) else '',
                     },
                     reason='broker对账',
                     entry_opt=entry_price,
@@ -5657,6 +5719,9 @@ class QQQLiveTrader:
                     'exit_reason': t.get('exit_reason', ''),
                     'opt_symbol': opt_sym,
                     'regime': t.get('regime', 'neutral'),
+                    'day_market_regime': t.get('day_market_regime', ''),
+                    'day_market_label': t.get('day_market_label', ''),
+                    'day_market_direction': t.get('day_market_direction', ''),
                     'atr_at_entry': t.get('atr_at_entry', 0),
                     'macd_hist_entry': t.get('macd_hist_entry', 0),
                     'vwap_entry': t.get('vwap_entry', 0),
