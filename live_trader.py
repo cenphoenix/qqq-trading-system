@@ -4393,6 +4393,12 @@ class QQQLiveTrader:
 
     def _fmt_daily_summary(self):
         """格式化日终总结通知"""
+        try:
+            self._save_daily_records()
+            from review_summary import build_review_summary
+            return build_review_summary('day', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
+        except Exception as e:
+            print(f"⚠️ 新版日终复盘生成失败，回退旧版: {e}")
         closed_trades = [t for t in self.trades_today if t.get('win') is not None]
         total = len(closed_trades)
         wins = sum(1 for t in closed_trades if t.get('win'))
@@ -4440,6 +4446,11 @@ class QQQLiveTrader:
 
     def _fmt_weekly_summary(self):
         """格式化周度收益汇总通知"""
+        try:
+            from review_summary import build_review_summary
+            return build_review_summary('week', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
+        except Exception as e:
+            print(f"⚠️ 新版周度复盘生成失败，回退旧版: {e}")
         from datetime import timedelta
         import json
         
@@ -4576,31 +4587,70 @@ class QQQLiveTrader:
             f"请检查账户状态"
         )
 
+    def _fmt_monthly_summary(self):
+        """格式化月度复盘通知"""
+        try:
+            from review_summary import build_review_summary
+            return build_review_summary('month', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
+        except Exception as e:
+            return f"<b>月度复盘生成失败</b>\n<code>{str(e)[:180]}</code>"
+
+    def _summary_flags_path(self):
+        records_dir = os.path.join(_app_dir(), 'records')
+        os.makedirs(records_dir, exist_ok=True)
+        return os.path.join(records_dir, 'review_summary_sent.json')
+
+    def _load_summary_flags(self):
+        try:
+            path = self._summary_flags_path()
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8-sig') as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_summary_flags(self, flags):
+        try:
+            path = self._summary_flags_path()
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(flags, f, ensure_ascii=False, indent=2, default=_json_default)
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"⚠️ 复盘推送标记保存失败: {e}")
+
+    def _send_period_summary_once(self, period, msg_type):
+        try:
+            from review_summary import build_review_summary
+            summary = build_review_summary(period, datetime.now(TZ_ET).strftime('%Y-%m-%d'))
+            key = f"{period}:{summary.get('start_date')}:{summary.get('end_date')}"
+            flags = self._load_summary_flags()
+            if flags.get(key):
+                return False
+            sent = self._notify(f"📊 {summary.get('title', '复盘摘要')}", msg_type=msg_type)
+            if sent:
+                flags[key] = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
+                self._save_summary_flags(flags)
+            return sent
+        except Exception as e:
+            print(f"⚠️ {period}复盘推送失败: {e}")
+            return False
+
     def _check_and_send_weekly_summary(self):
-        """检查是否需要发送周报（每周五收盘后）"""
+        """检查是否需要发送周报/月报（收盘后）"""
         now = datetime.now(TZ_ET)
-        # 周五 (weekday=4) 且在16:00-16:30之间
-        if now.weekday() == 4 and 16 <= now.hour < 17 and now.minute < 30:
-            # 检查今天是否已发送过周报
-            weekly_sent_file = os.path.join(_app_dir(), 'weekly_sent.flag')
-            if os.path.exists(weekly_sent_file):
-                try:
-                    with open(weekly_sent_file, 'r') as f:
-                        sent_date = f.read().strip()
-                    if sent_date == now.strftime('%Y-%m-%d'):
-                        return  # 今天已发送
-                except Exception:
-                    pass
-            
-            # 发送周报
-            self._notify("📊 周度总结", msg_type='weekly_summary')
-            
-            # 标记已发送
-            try:
-                with open(weekly_sent_file, 'w') as f:
-                    f.write(now.strftime('%Y-%m-%d'))
-            except Exception:
-                pass
+        if not (16 <= now.hour < 17 and now.minute >= 5):
+            return
+        if now.weekday() == 4:
+            self._send_period_summary_once('week', 'weekly_summary')
+        try:
+            from review_summary import is_last_weekday_of_month
+            if now.weekday() < 5 and is_last_weekday_of_month(now.date()):
+                self._send_period_summary_once('month', 'monthly_summary')
+        except Exception as e:
+            print(f"⚠️ 月报日期检查失败: {e}")
 
     def _notify_telegram(self, msg, msg_type='info', **kw):
         """Telegram通知 - 支持HTML格式的消息"""
@@ -4634,6 +4684,8 @@ class QQQLiveTrader:
                 text = self._fmt_daily_summary()
             elif msg_type == 'weekly_summary':
                 text = self._fmt_weekly_summary()
+            elif msg_type == 'monthly_summary':
+                text = self._fmt_monthly_summary()
             elif msg_type == 'network' and kw:
                 text = self._fmt_network_alert(**kw)
             elif msg_type == 'rate_limit' and kw:
