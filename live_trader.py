@@ -125,6 +125,14 @@ def _load_config():
             'market_regime_countertrend_sl_pct': 0.20,
             'market_regime_range_breakout_pos_mult': 0.20,
             'market_regime_range_breakout_sl_pct': 0.22,
+            'opening_range_filter_enabled': True,
+            'opening_range_minutes': 30,
+            'opening_range_call_block_pos': 0.90,
+            'opening_range_inside_fade_start_min': 690,
+            'opening_range_breakout_buffer_pct': 0.0010,
+            'opening_range_breakout_min_vwap_dist': 0.0012,
+            'opening_range_breakout_min_sma20_slope': 0.00008,
+            'opening_range_breakout_min_recent_move_pct': 0.0012,
             'enable_momentum_death_entries': False,
             'momentum_death_pos_mult': 0.55,
             'momentum_death_sl_pct': 0.22,
@@ -495,6 +503,161 @@ class QQQLiveTrader:
             }
         return {'direction': '', 'reason': ''}
 
+    def _bar_et_minute(self, bar):
+        value = bar.get('time') or bar.get('timestamp')
+        try:
+            if isinstance(value, datetime):
+                dt = value
+            elif isinstance(value, (int, float)):
+                dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            elif isinstance(value, str):
+                dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            else:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ_ET)
+            dt = dt.astimezone(TZ_ET)
+            return dt.hour * 60 + dt.minute
+        except Exception:
+            return None
+
+    def _regular_session_bars(self):
+        bars = []
+        for bar in self.one_min_candles:
+            minute = self._bar_et_minute(bar)
+            if minute is not None and 570 <= minute <= 960:
+                bars.append(bar)
+        return bars
+
+    def _opening_range_context(self, price, context=None):
+        if not self.cfg.get('opening_range_filter_enabled', True):
+            return {'enabled': False, 'ready': False}
+
+        minutes = int(self.cfg.get('opening_range_minutes', 30) or 30)
+        if minutes <= 0:
+            return {'enabled': False, 'ready': False}
+
+        regular_bars = self._regular_session_bars()
+        if regular_bars:
+            opening = [
+                bar for bar in regular_bars
+                if (self._bar_et_minute(bar) or 0) < 570 + minutes
+            ]
+            after_opening = [
+                bar for bar in regular_bars
+                if (self._bar_et_minute(bar) or 0) >= 570 + minutes
+            ]
+        else:
+            opening = self.one_min_candles[:minutes]
+            after_opening = self.one_min_candles[minutes:]
+
+        if len(opening) < max(10, minutes // 2) or not after_opening:
+            return {
+                'enabled': True,
+                'ready': False,
+                'reason': f'opening_range_warming bars={len(opening)}/{minutes}',
+            }
+
+        current = float(price or opening[-1].get('close', 0) or 0)
+        high = max(float(bar['high']) for bar in opening)
+        low = min(float(bar['low']) for bar in opening)
+        width = max(high - low, 1e-9)
+        pos = (current - low) / width
+
+        ctx = context or self._entry_quality_context(current)
+        vwap_dist = float(ctx.get('vwap_dist', 0) or 0)
+        sma20_slope = float(ctx.get('sma20_slope', 0) or 0)
+        recent_move = 0.0
+        recent_bars = regular_bars or self.one_min_candles
+        if len(recent_bars) >= 6:
+            prior = float(recent_bars[-6].get('close', 0) or 0)
+            if prior > 0:
+                recent_move = (current - prior) / prior
+        current_minute = self._bar_et_minute(recent_bars[-1]) if recent_bars else None
+
+        buffer_pct = float(self.cfg.get('opening_range_breakout_buffer_pct', 0.0010) or 0.0010)
+        min_vwap = float(self.cfg.get('opening_range_breakout_min_vwap_dist', 0.0012) or 0.0012)
+        min_slope = float(self.cfg.get('opening_range_breakout_min_sma20_slope', 0.00008) or 0.00008)
+        min_recent = float(self.cfg.get('opening_range_breakout_min_recent_move_pct', 0.0012) or 0.0012)
+
+        call_breakout = (
+            current >= high * (1 + buffer_pct)
+            and vwap_dist >= min_vwap
+            and sma20_slope >= min_slope
+            and recent_move >= min_recent
+        )
+        put_breakdown = (
+            current <= low * (1 - buffer_pct)
+            and vwap_dist <= -min_vwap
+            and sma20_slope <= -min_slope
+            and recent_move <= -min_recent
+        )
+
+        return {
+            'enabled': True,
+            'ready': True,
+            'minutes': minutes,
+            'high': high,
+            'low': low,
+            'width_pct': width / current if current else 0.0,
+            'position': pos,
+            'current_minute': current_minute,
+            'above_high_pct': (current - high) / high if high else 0.0,
+            'below_low_pct': (low - current) / low if low else 0.0,
+            'call_breakout': call_breakout,
+            'put_breakdown': put_breakdown,
+            'vwap_dist': vwap_dist,
+            'sma20_slope': sma20_slope,
+            'recent_move': recent_move,
+        }
+
+    def _should_skip_opening_range_call(self, sig, signal, context):
+        if sig.get('dir') != 'call':
+            return False
+
+        or_ctx = self._opening_range_context(float(sig.get('price') or 0), context)
+        sig.setdefault('metadata', {})['opening_range'] = or_ctx
+        sig['opening_range'] = or_ctx
+        if not or_ctx.get('enabled') or not or_ctx.get('ready'):
+            return False
+
+        block_pos = float(self.cfg.get('opening_range_call_block_pos', 0.90) or 0.90)
+        inside_fade_start = int(self.cfg.get('opening_range_inside_fade_start_min', 690) or 690)
+        price = float(sig.get('price') or 0)
+        high = float(or_ctx.get('high') or 0)
+        above_opening_high = high > 0 and price > high
+        weak_above_breakout = (
+            above_opening_high
+            and (
+                or_ctx['sma20_slope'] < float(self.cfg.get('opening_range_breakout_min_sma20_slope', 0.00008) or 0.00008)
+                or or_ctx['recent_move'] < float(self.cfg.get('opening_range_breakout_min_recent_move_pct', 0.0012) or 0.0012)
+            )
+        )
+        inside_late_fade = (
+            (or_ctx.get('current_minute') or 0) >= inside_fade_start
+            and or_ctx.get('position', 0.0) >= block_pos
+            and or_ctx['sma20_slope'] <= 0
+            and or_ctx['recent_move'] <= 0
+        )
+
+        if weak_above_breakout or inside_late_fade:
+            self._last_entry_rejection = (
+                f"OpeningRange CALL chase block: pos={or_ctx['position']*100:.0f}% "
+                f"high={high:.2f} vwap={or_ctx['vwap_dist']*100:.2f}% "
+                f"slope={or_ctx['sma20_slope']*100:.3f}% recent={or_ctx['recent_move']*100:.2f}%"
+            )
+            self._hard_skip_shadow_live = True
+            print(f"  OR CALL chase block: {signal} | {self._last_entry_rejection}")
+            return True
+
+        if above_opening_high:
+            sig['reason'] = (
+                f"[OR breakout accepted high={or_ctx['high']:.2f} pos={or_ctx['position']*100:.0f}%] "
+                f"{sig.get('reason', '')}"
+            )
+
+        return False
+
     def _classify_day_market_regime(self, context=None):
         if not self.cfg.get('market_regime_enabled', True):
             return {'type': 'disabled', 'direction': '', 'label': '未启用', 'reason': ''}
@@ -662,6 +825,8 @@ class QQQLiveTrader:
             print(f"  ⛔ 胜率优先禁用信号: {signal}")
             return True
         if self._apply_market_regime_to_signal(sig, signal, direction, context):
+            return True
+        if self._should_skip_opening_range_call(sig, signal, context):
             return True
 
         trend_bias = self._trend_day_bias(context)
@@ -1001,6 +1166,7 @@ class QQQLiveTrader:
                 'day_market_regime': sig.get('day_market_regime', ''),
                 'day_market_label': sig.get('day_market_label', ''),
                 'day_market_direction': sig.get('day_market_direction', ''),
+                'opening_range': sig.get('opening_range', {}),
                 'source': source,
                 'rejection_reason': rejection_reason,
                 'milestones': {5: None, 10: None, 20: None},

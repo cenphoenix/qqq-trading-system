@@ -217,6 +217,72 @@ def _direction_stats(trades: List[Dict]) -> Dict[str, Dict]:
     return out
 
 
+def _trade_issue_tags(trade: Dict) -> List[str]:
+    text = " ".join(
+        str(trade.get(key, "") or "")
+        for key in ("reason", "exit_reason", "signal", "regime")
+    ).lower()
+    direction = str(trade.get("dir") or "").lower()
+    pnl = _to_float(trade.get("pnl_usd"))
+    tags = []
+
+    if pnl >= 0:
+        return tags
+
+    if direction == "call" and any(k in text for k in ("openingrange", "or ", "breakout", "vwap_breakout", "追高", "突破")):
+        tags.append("CALL chase / weak breakout")
+    if any(k in text for k in ("timeout", "超时", "硬超时")):
+        tags.append("Timeout loss")
+    if any(k in text for k in ("stop", "止损", "快退", "fast")):
+        tags.append("Stop / fast-fail")
+    if any(k in text for k in ("trail", "移动止盈", "盈利回吐")):
+        tags.append("Profit giveback")
+    if direction == "put" and any(k in text for k in ("counter", "reversal", "反转", "逆势")):
+        tags.append("PUT countertrend")
+    if "broker" in text or "对账" in text:
+        tags.append("Broker reconcile")
+    if not tags:
+        tags.append("Unclassified loss")
+    return tags[:3]
+
+
+def _issue_tag_stats(trades: List[Dict]) -> List[Dict]:
+    groups: Dict[str, Dict] = defaultdict(lambda: {
+        "tag": "",
+        "trades": 0,
+        "pnl": 0.0,
+        "max_loss": 0.0,
+        "directions": defaultdict(int),
+    })
+    for trade in trades:
+        pnl = _to_float(trade.get("pnl_usd"))
+        if pnl >= 0:
+            continue
+        for tag in _trade_issue_tags(trade):
+            g = groups[tag]
+            g["tag"] = tag
+            g["trades"] += 1
+            g["pnl"] += pnl
+            g["max_loss"] = min(g["max_loss"], pnl)
+            direction = str(trade.get("dir") or "").lower() or "unknown"
+            g["directions"][direction] += 1
+
+    rows = []
+    for g in groups.values():
+        direction = ""
+        if g["directions"]:
+            direction = max(g["directions"].items(), key=lambda item: item[1])[0]
+        rows.append({
+            "tag": g["tag"],
+            "trades": g["trades"],
+            "pnl": round(g["pnl"], 2),
+            "max_loss": round(g["max_loss"], 2),
+            "main_direction": direction,
+        })
+    rows.sort(key=lambda x: (x["pnl"], -x["trades"]))
+    return rows
+
+
 def _recommendations(signal_rows: List[Dict], trades: List[Dict], probes: List[Dict]) -> List[str]:
     recs = []
     losers = [s for s in signal_rows if s["trades"] >= 2 and s["pnl"] < 0]
@@ -269,6 +335,7 @@ def build_review_summary(period: str = "day", anchor: Optional[str] = None) -> D
     worst_trades = sorted(trades, key=lambda t: _to_float(t.get("pnl_usd")))[:5]
     best_signals = signal_rows[:5]
     worst_signals = sorted(signal_rows, key=lambda x: (x["pnl"], x["m20_avg"]))[:5]
+    issue_tags = _issue_tag_stats(trades)[:6]
     period_key = (period or "day").lower()
     title_map = {"day": "每日复盘", "daily": "每日复盘", "week": "每周复盘", "weekly": "每周复盘", "month": "每月复盘", "monthly": "每月复盘"}
 
@@ -289,6 +356,7 @@ def build_review_summary(period: str = "day", anchor: Optional[str] = None) -> D
         "worst_trades": _compact_trades(worst_trades),
         "best_signals": best_signals,
         "worst_signals": worst_signals,
+        "issue_tags": issue_tags,
         "recommendations": _recommendations(signal_rows, trades, probes),
         "probe_count": len(probes),
     }
@@ -355,6 +423,14 @@ def format_telegram_summary(summary: Dict) -> str:
             lines.append("最佳 " + _line_trade(summary["best_trades"][0]))
         if summary.get("worst_trades"):
             lines.append("最差 " + _line_trade(summary["worst_trades"][0]))
+    issue_tags = summary.get("issue_tags") or []
+    if issue_tags:
+        lines += ["────────────", "<b>Loss Tags</b>"]
+        for item in issue_tags[:4]:
+            lines.append(
+                f"{html.escape(str(item.get('tag', '')))}: "
+                f"{item.get('trades', 0)}x / {_money(item.get('pnl'))}"
+            )
     recs = summary.get("recommendations") or []
     if recs:
         lines += ["────────────", "<b>下一步建议</b>"]
