@@ -108,6 +108,13 @@ def _load_config():
             'shadow_signal_live_orders': True,
             'shadow_live_order_pos_mult': 0.80,
             'shadow_live_open_pos_mult': 0.50,
+            'shadow_live_rejected_pos_mult': 0.60,
+            'shadow_live_reduced_rejection_keywords': [
+                '质量过滤未通过',
+                'Brooks方向冲突',
+                'Kline OR下破幅度不足',
+                'Granville动量过滤',
+            ],
             'shadow_live_afternoon_allowed_signals': ['VWAP_Breakout'],
             'shadow_live_sl_pct': 0.22,
             'shadow_live_disable_open_stop_widen': True,
@@ -145,18 +152,26 @@ def _load_config():
             'kline_quality_filter': True,
             'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
             'kline_max_price_pos': 0.82,
+            'kline_put_or_break_min_buffer_pct': 0.0020,
             'kline_min_macd_hist': 0.0,
             'kline_min_sma20_slope': 0.0,
             'enable_granville_entries': True,
             'granville_quality_filter': True,
             'granville_max_price_pos': 0.85,
             'granville_min_macd_hist': 0.0,
+            'granville_put_min_macd_hist_abs': 0.05,
             'granville_min_sma20_slope': 0.00005,
             'granville_min_vwap_dist': 0.0005,
             'granville_min_dist_pct': 0.20,
             'granville_require_day_direction': True,
             'trend_quick_trail_activate_pct': 20,
             'trend_quick_trail_drop_pct': 12,
+            'profit_take_tiers': [
+                {'profit_pct': 30, 'close_pct': 0.30},
+                {'profit_pct': 60, 'close_pct': 0.30},
+                {'profit_pct': 100, 'close_remaining': True},
+            ],
+            'profit_peak_pullback_pct': 30,
             'trend_timeout_bonus_bars': 4,
             'afternoon_put_start_min': 810,
             'afternoon_put_min_vwap_dist': 0.006,
@@ -960,6 +975,22 @@ class QQQLiveTrader:
                 self._hard_skip_shadow_live = True
                 print(f"  ⛔ Kline普通CALL形态仅记录不下单: {reason}")
                 return True
+            if direction == 'put':
+                or_ctx = self._opening_range_context(float(sig.get('price') or 0), context)
+                min_or_break = float(self.cfg.get('kline_put_or_break_min_buffer_pct', 0.0020) or 0.0020)
+                if (
+                    or_ctx.get('ready')
+                    and or_ctx.get('below_low_pct', 0) > 0
+                    and or_ctx.get('below_low_pct', 0) < min_or_break
+                ):
+                    self._last_entry_rejection = (
+                        f"Kline OR下破幅度不足: {or_ctx.get('below_low_pct', 0) * 100:.2f}%"
+                    )
+                    print(
+                        f"  ⛔ Kline PUT刚破开盘区间不追: "
+                        f"{or_ctx.get('below_low_pct', 0) * 100:.2f}% < {min_or_break * 100:.2f}%"
+                    )
+                    return True
             max_pos = self.cfg.get('kline_max_price_pos', 0.82)
             min_macd = self.cfg.get('kline_min_macd_hist', 0.0)
             min_slope = self.cfg.get('kline_min_sma20_slope', 0.0)
@@ -968,12 +999,12 @@ class QQQLiveTrader:
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline高位追入过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
                 return True
-            if context['macd_hist'] <= min_macd:
+            if direction != 'put' and context['macd_hist'] <= min_macd:
                 self._last_entry_rejection = f'Kline动量过滤: MACD_hist={context["macd_hist"]:.4f}'
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
                 return True
-            if context['sma20_slope'] <= min_slope:
+            if direction != 'put' and context['sma20_slope'] <= min_slope:
                 self._last_entry_rejection = f'Kline趋势过滤: SMA20斜率={context["sma20_slope"]*100:.4f}%'
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Kline趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
@@ -1008,17 +1039,26 @@ class QQQLiveTrader:
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville高位过滤: 日内位置{context['price_pos']*100:.0f}% > {max_pos*100:.0f}%")
                 return True
-            if context['macd_hist'] <= min_macd:
+            if direction == 'put':
+                min_put_macd = float(self.cfg.get('granville_put_min_macd_hist_abs', 0.05) or 0)
+                if context['macd_hist'] > -min_put_macd:
+                    self._last_entry_rejection = f'Granville动量过滤: PUT MACD_hist={context["macd_hist"]:.4f}'
+                    print(
+                        f"  ⛔ Granville PUT动量不足: MACD_hist={context['macd_hist']:.4f} "
+                        f"> -{min_put_macd:.4f}"
+                    )
+                    return True
+            if direction != 'put' and context['macd_hist'] <= min_macd:
                 self._last_entry_rejection = f'Granville动量过滤: MACD_hist={context["macd_hist"]:.4f}'
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville动量过滤: MACD_hist={context['macd_hist']:.4f} <= {min_macd:.4f}")
                 return True
-            if context['sma20_slope'] <= min_slope:
+            if direction != 'put' and context['sma20_slope'] <= min_slope:
                 self._last_entry_rejection = f'Granville趋势过滤: SMA20斜率={context["sma20_slope"]*100:.4f}%'
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville趋势过滤: SMA20斜率={context['sma20_slope']*100:.4f}% <= {min_slope*100:.4f}%")
                 return True
-            if context['vwap_dir_dist'] <= min_vwap_dist:
+            if direction != 'put' and context['vwap_dir_dist'] <= min_vwap_dist:
                 self._last_entry_rejection = f'Granville VWAP过滤: {context["vwap_dir_dist"]*100:.3f}%'
                 self._hard_skip_shadow_live = direction == 'call'
                 print(f"  ⛔ Granville VWAP过滤: 距VWAP={context['vwap_dir_dist']*100:.3f}% <= {min_vwap_dist*100:.3f}%")
@@ -1210,6 +1250,10 @@ class QQQLiveTrader:
                     )
                     if not duplicate:
                         shadow_mult = float(self.cfg.get('shadow_live_order_pos_mult', 0.80) or 0.80)
+                        rejected_mult = self._shadow_live_rejection_multiplier(rejection)
+                        if rejected_mult is not None:
+                            shadow_mult = min(shadow_mult, rejected_mult)
+                            rejection = f"{rejection}; shadow reduced to {rejected_mult:.0%}"
                         if cur_min_et < 600:
                             shadow_mult *= float(self.cfg.get('shadow_live_open_pos_mult', 0.50) or 0.50)
                             rejection = f"{rejection}; 开盘影子仓位减半"
@@ -1238,6 +1282,38 @@ class QQQLiveTrader:
                     rejection_reason=rejection,
                 )
         return skipped
+
+    def _shadow_live_rejection_multiplier(self, rejection):
+        """Return reduced size for shadow-live orders rejected by risky filters."""
+        text = str(rejection or '')
+        keywords = self.cfg.get('shadow_live_reduced_rejection_keywords') or [
+            '质量过滤未通过',
+            'Brooks方向冲突',
+        ]
+        if any(str(keyword) and str(keyword) in text for keyword in keywords):
+            return float(self.cfg.get('shadow_live_rejected_pos_mult', 0.60) or 0.60)
+        return None
+
+    def _profit_take_tiers(self):
+        """Configured option partial take-profit tiers, sorted by trigger."""
+        tiers = self.cfg.get('profit_take_tiers') or []
+        normalized = []
+        if isinstance(tiers, list):
+            for idx, tier in enumerate(tiers):
+                if not isinstance(tier, dict):
+                    continue
+                profit_pct = float(tier.get('profit_pct') or 0)
+                close_pct = float(tier.get('close_pct') or 0)
+                close_remaining = bool(tier.get('close_remaining', False))
+                if profit_pct <= 0 or (close_pct <= 0 and not close_remaining):
+                    continue
+                normalized.append({
+                    'key': str(tier.get('key') or f'tier_{idx + 1}_{profit_pct:g}'),
+                    'profit_pct': profit_pct,
+                    'close_pct': min(max(close_pct, 0.01), 0.95),
+                    'close_remaining': close_remaining,
+                })
+        return sorted(normalized, key=lambda item: item['profit_pct'])
 
     def _update_signal_probes(self, candle):
         """每根已完成K线更新未完成的信号追踪记录。"""
@@ -3231,6 +3307,7 @@ class QQQLiveTrader:
                 'tp_pct': self.cfg['tp'],           # 止盈百分比（旧逻辑保留）
                 'contracts': contracts,             # 张数
                 'quantity': qty,                    # 总股数
+                'original_contracts': contracts,
                 'entry_time': datetime.now(TZ_ET),
                 'entry_bar': len(self.one_min_candles),
                 'reason': sig['reason'],
@@ -3239,6 +3316,8 @@ class QQQLiveTrader:
                 'shadow_live_order': bool(sig.get('shadow_live_order', False)),
                 'shadow_rejection_reason': sig.get('shadow_rejection_reason', ''),
                 'max_pnl_pct': 0,
+                'partial_tiers_done': [],
+                'partial_closed_contracts': 0,
                 'half_closed': False,  # 动态止盈：是否已平仓一半
                 'half_closed_max_pct': 0.0,  # 半仓后的峰值（用于跟踪止盈）
                 'order_status': 'filled',  # 订单状态
@@ -3649,20 +3728,29 @@ class QQQLiveTrader:
                     if stock_pnl_pct <= -stock_stop and pnl_pct <= -opt_stop:
                         ex = f"Kline快退({bars_held}min, 正股{stock_pnl_pct:.2f}%, 期权{pnl_pct:.1f}%)"
 
-        if not ex and not pos.get('half_closed'):
+        if not ex:
             quick_activate = self.cfg.get('quick_trail_activate_pct', 15)
             quick_drop = self.cfg.get('quick_trail_drop_pct', 8)
             if self._is_trend_aligned_position(pos):
                 quick_activate = self.cfg.get('trend_quick_trail_activate_pct', quick_activate)
                 quick_drop = self.cfg.get('trend_quick_trail_drop_pct', quick_drop)
-            floor_activate = self.cfg.get('profit_floor_activate_pct', 20)
-            floor_pct = self.cfg.get('profit_floor_pct', 8)
-            if pos.get('max_pnl_pct', 0) >= floor_activate and pnl_pct <= floor_pct:
-                ex = f"盈利保护({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
-            elif pos.get('max_pnl_pct', 0) >= quick_activate:
-                drawdown = pos.get('max_pnl_pct', 0) - pnl_pct
-                if drawdown >= quick_drop:
-                    ex = f"快速移动止盈({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
+            tiers = self._profit_take_tiers()
+            if tiers:
+                peak_pnl = pos.get('max_pnl_pct', 0)
+                min_peak = min(tier['profit_pct'] for tier in tiers)
+                peak_pullback = float(self.cfg.get('profit_peak_pullback_pct', 30) or 30)
+                drawdown = peak_pnl - pnl_pct
+                if peak_pnl >= min_peak and drawdown >= peak_pullback:
+                    ex = f"浮盈回撤止盈({peak_pnl:.1f}%→{pnl_pct:.1f}%, 回撤{drawdown:.1f}%)"
+            else:
+                floor_activate = self.cfg.get('profit_floor_activate_pct', 20)
+                floor_pct = self.cfg.get('profit_floor_pct', 8)
+                if pos.get('max_pnl_pct', 0) >= floor_activate and pnl_pct <= floor_pct:
+                    ex = f"盈利保护({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
+                elif pos.get('max_pnl_pct', 0) >= quick_activate:
+                    drawdown = pos.get('max_pnl_pct', 0) - pnl_pct
+                    if drawdown >= quick_drop:
+                        ex = f"快速移动止盈({pos.get('max_pnl_pct', 0):.1f}%→{pnl_pct:.1f}%)"
 
         if not ex and self.cfg.get('stock_exit_enabled', True) and stock_entry_valid:
             stock_sl = self.cfg.get('stock_sl_pct', 0.0025)
@@ -3721,9 +3809,29 @@ class QQQLiveTrader:
                 ex = f"阶段超时({signal_name},{s2_bars}min盈利{pnl_pct:.1f}%<{s2_min:.0f}%)"
 
         # --- 3. 动态止盈：盈利≥150%平仓一半 ---
-        if not ex and not pos['half_closed'] and pnl_pct >= tp_partial:
-            self._close_partial(f"盈利{tp_partial:.0f}%平仓一半")
-            return
+        if not ex:
+            tiers = self._profit_take_tiers()
+            done_tiers = set(pos.get('partial_tiers_done') or [])
+            for tier in tiers:
+                if tier['key'] in done_tiers:
+                    continue
+                if pnl_pct >= tier['profit_pct'] and (
+                    pos.get('contracts', 0) > 1 or tier.get('close_remaining')
+                ):
+                    if tier.get('close_remaining'):
+                        self._close_position(f"最终止盈{tier['profit_pct']:.0f}% 平剩余仓位")
+                    else:
+                        original_contracts = int(pos.get('original_contracts') or pos.get('contracts') or 0)
+                        close_contracts = max(1, int(round(original_contracts * tier['close_pct'])))
+                        self._close_partial(
+                            f"分批止盈{tier['profit_pct']:.0f}% 平原始仓位{tier['close_pct']:.0%}",
+                            close_contracts=close_contracts,
+                            tier_key=tier['key'],
+                        )
+                    return
+            if not tiers and not pos['half_closed'] and pnl_pct >= tp_partial:
+                self._close_partial(f"盈利{tp_partial:.0f}%平仓一半")
+                return
 
         # --- 4. 半仓后：正股跟踪止损（替代期权峰值回撤，更稳定）---
         if not ex and pos['half_closed'] and stock_entry_valid:
@@ -3849,13 +3957,19 @@ class QQQLiveTrader:
         except Exception as e:
             print(f"  ⚠️ 持仓同步验证失败: {e}")
 
-    def _close_partial(self, reason):
-        """平仓一半仓位（动态止盈用）"""
+    def _close_partial(self, reason, close_ratio=0.50, tier_key=None, close_contracts=None):
+        """平仓部分仓位（动态止盈用）"""
         pos = self.position
         if not pos or pos['contracts'] <= 1:
             return
 
-        half = pos['contracts'] // 2
+        if close_contracts is not None:
+            half = max(1, int(close_contracts))
+        else:
+            close_ratio = min(max(float(close_ratio or 0.50), 0.01), 0.95)
+            half = max(1, int(round(pos['contracts'] * close_ratio)))
+        if half >= pos['contracts']:
+            half = pos['contracts'] - 1
         if half <= 0:
             return
 
@@ -3873,7 +3987,7 @@ class QQQLiveTrader:
             )
 
             order_id = resp.order_id
-            print(f"  📋 半仓平仓订单已提交: {order_id}")
+            print(f"  📋 部分平仓订单已提交: {order_id}")
 
             partial_filled = False
             executed_qty = 0
@@ -3997,6 +4111,13 @@ class QQQLiveTrader:
 
             # 更新持仓：减少张数
             pos['contracts'] -= half
+            pos['quantity'] = pos['contracts'] * self.cfg['contract_multiplier']
+            pos['partial_closed_contracts'] = int(pos.get('partial_closed_contracts', 0) or 0) + int(half)
+            if tier_key:
+                done = list(pos.get('partial_tiers_done') or [])
+                if tier_key not in done:
+                    done.append(tier_key)
+                pos['partial_tiers_done'] = done
             # 标记半仓状态，并重置峰值起点（剩余仓位的跟踪从当前价格开始）
             pos['half_closed'] = True
             pos['half_closed_max_pct'] = overall_pnl_pct   # 用整体盈亏作基准，而非已平仓半张的盈亏
