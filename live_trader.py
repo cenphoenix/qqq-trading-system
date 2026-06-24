@@ -140,6 +140,11 @@ def _load_config():
             'opening_range_breakout_min_vwap_dist': 0.0012,
             'opening_range_breakout_min_sma20_slope': 0.00008,
             'opening_range_breakout_min_recent_move_pct': 0.0012,
+            'extreme_down_call_filter_enabled': True,
+            'extreme_down_min_drop_pct': 0.012,
+            'extreme_down_max_day_move_for_call': -0.008,
+            'extreme_down_call_reclaim_recent_move_pct': 0.0015,
+            'extreme_down_call_hard_block_until_min': 690,
             'enable_momentum_death_entries': False,
             'momentum_death_pos_mult': 0.55,
             'momentum_death_sl_pct': 0.22,
@@ -673,6 +678,68 @@ class QQQLiveTrader:
 
         return False
 
+    def _should_skip_extreme_down_call(self, sig, signal, context):
+        """Block CALL entries during selloff/rebound traps until a real reversal forms."""
+        if sig.get('dir') != 'call' or not self.cfg.get('extreme_down_call_filter_enabled', True):
+            return False
+
+        bars = self._regular_session_bars() or self.one_min_candles
+        if len(bars) < 15:
+            return False
+
+        price = float(sig.get('price') or 0)
+        first_open = float(bars[0].get('open', 0) or 0)
+        if price <= 0 or first_open <= 0:
+            return False
+
+        session_low = min(float(bar.get('low', 0) or 0) for bar in bars)
+        day_move = (price - first_open) / first_open
+        max_drop = (session_low - first_open) / first_open
+        min_drop = -abs(float(self.cfg.get('extreme_down_min_drop_pct', 0.012) or 0.012))
+        max_day_move = float(self.cfg.get('extreme_down_max_day_move_for_call', -0.008) or -0.008)
+        if max_drop > min_drop and day_move > max_day_move:
+            return False
+
+        current_minute = self._bar_et_minute(bars[-1])
+        hard_block_until = int(self.cfg.get('extreme_down_call_hard_block_until_min', 690) or 690)
+        if current_minute is not None and current_minute > hard_block_until:
+            return False
+
+        or_ctx = self._opening_range_context(price, context)
+        or_mid = None
+        if or_ctx.get('ready'):
+            or_mid = (float(or_ctx.get('high') or 0) + float(or_ctx.get('low') or 0)) / 2
+
+        recent_move = 0.0
+        if len(bars) >= 6:
+            prior = float(bars[-6].get('close', 0) or 0)
+            if prior > 0:
+                recent_move = (price - prior) / prior
+
+        min_recent = float(self.cfg.get('extreme_down_call_reclaim_recent_move_pct', 0.0015) or 0.0015)
+        vwap_ok = float(context.get('vwap_dist', 0) or 0) > 0
+        slope_ok = float(context.get('sma20_slope', 0) or 0) > 0
+        midpoint_ok = or_mid is None or price >= or_mid
+        reversal_ok = midpoint_ok and vwap_ok and slope_ok and recent_move >= min_recent
+        if reversal_ok:
+            sig['reason'] = (
+                f"[极端下跌日CALL反转确认 day={day_move*100:.2f}% drop={max_drop*100:.2f}%] "
+                f"{sig.get('reason', '')}"
+            )
+            return False
+
+        mid_text = f"{or_mid:.2f}" if or_mid is not None else "n/a"
+        self._last_entry_rejection = (
+            f"极端下跌日CALL保护: day={day_move*100:.2f}% "
+            f"drop={max_drop*100:.2f}% mid={mid_text} "
+            f"vwap={float(context.get('vwap_dist', 0) or 0)*100:.2f}% "
+            f"slope={float(context.get('sma20_slope', 0) or 0)*100:.3f}% "
+            f"recent={recent_move*100:.2f}%"
+        )
+        self._hard_skip_shadow_live = True
+        print(f"  ⛔ 极端下跌日CALL保护: {signal} | {self._last_entry_rejection}")
+        return True
+
     def _classify_day_market_regime(self, context=None):
         if not self.cfg.get('market_regime_enabled', True):
             return {'type': 'disabled', 'direction': '', 'label': '未启用', 'reason': ''}
@@ -843,6 +910,8 @@ class QQQLiveTrader:
             return True
         if self._should_skip_opening_range_call(sig, signal, context):
             return True
+        if self._should_skip_extreme_down_call(sig, signal, context):
+            return True
 
         trend_bias = self._trend_day_bias(context)
         trend_direction = trend_bias.get('direction', '')
@@ -935,6 +1004,7 @@ class QQQLiveTrader:
                         self._last_entry_rejection = (
                             f'VWAP CALL区间位置过高: {price_action["range_position"]*100:.0f}%'
                         )
+                        self._hard_skip_shadow_live = True
                         print(
                             f"  ⛔ VWAP CALL追高过滤: 最近20根区间位置"
                             f"{price_action['range_position']*100:.0f}% > {max_range_position*100:.0f}%"
