@@ -951,10 +951,17 @@ class QQQLiveTrader:
                 }
                 price_action = market_state.get(direction, {})
                 range_position = float(price_action.get('range_position', 0.5))
+                meta = sig.get('metadata') or {}
+                vwap_retest_setup = signal == 'VWAP_Breakout' and meta.get('setup_type') == 'retest'
                 edge_entry = (
                     direction == 'call'
                     and signal == 'VWAP_Breakout'
-                    and range_position <= float(self.cfg.get('brooks_range_call_max_position', 0.40))
+                    and range_position <= float(
+                        self.cfg.get(
+                            'vwap_retest_call_max_range_position' if vwap_retest_setup else 'brooks_range_call_max_position',
+                            0.70 if vwap_retest_setup else 0.40,
+                        )
+                    )
                 ) or (
                     direction == 'put'
                     and range_position >= float(self.cfg.get('brooks_range_put_min_position', 0.60))
@@ -997,12 +1004,17 @@ class QQQLiveTrader:
                     print(f"  ⛔ CALL价格行为过滤: {price_action.get('reason', 'K线不足')}")
                     return True
                 if signal == 'VWAP_Breakout':
+                    meta = sig.get('metadata') or {}
+                    is_vwap_retest = meta.get('setup_type') == 'retest'
                     max_range_position = float(
-                        self.cfg.get('price_action_vwap_call_max_range_position', 0.40)
+                        self.cfg.get(
+                            'vwap_retest_call_max_range_position' if is_vwap_retest else 'price_action_vwap_call_max_range_position',
+                            0.70 if is_vwap_retest else 0.40,
+                        )
                     )
                     if price_action['range_position'] > max_range_position:
                         self._last_entry_rejection = (
-                            f'VWAP CALL区间位置过高: {price_action["range_position"]*100:.0f}%'
+                            f'VWAP CALL{"回踩" if is_vwap_retest else ""}区间位置过高: {price_action["range_position"]*100:.0f}%'
                         )
                         self._hard_skip_shadow_live = True
                         print(
