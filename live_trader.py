@@ -155,6 +155,24 @@ def _load_config():
             'enable_countertrend_reversal_entries': False,
             'enable_kline_entries': True,
             'kline_quality_filter': True,
+            'enable_v62_call_pool': True,
+            'v62_call_pool_pos_mult': 0.35,
+            'v62_call_pool_end_min': 870,
+            'v62_call_pool_cooldown_bars': 5,
+            'v62_call_pool_lookback': 3,
+            'v62_call_pool_vol_mult': 0.80,
+            'v62_call_pool_max_gap': 0.0020,
+            'v62_call_pool_min_body': 0.00015,
+            'v62_call_pool_max_price_pos': 0.85,
+            'v62_call_pool_trend_max_price_pos': 0.95,
+            'v62_call_pool_range_max_position': 0.40,
+            'v62_call_pool_fast_fail_bars': 5,
+            'v62_call_pool_breakout_fail_buffer_pct': 0.0001,
+            'v62_call_pool_vwap_fail_enabled': True,
+            'v62_call_pool_fast_option_stop_pct': 16,
+            'v62_call_pool_timeout_stage_bars': 12,
+            'v62_call_pool_timeout_bars': 20,
+            'v62_call_pool_trend_timeout_bars': 28,
             'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
             'kline_max_price_pos': 0.82,
             'kline_put_or_break_min_buffer_pct': 0.0020,
@@ -277,6 +295,7 @@ class QQQLiveTrader:
         }
         self._last_entry_rejection = ''
         self._hard_skip_shadow_live = False
+        self._v62_call_pool_last_bar = -999999
 
         # 初始化长桥连接
         self._init_api()
@@ -435,6 +454,16 @@ class QQQLiveTrader:
             return 'Kline_Pattern'
         return display_signal_name(name)
 
+    def _is_v62_call_position(self, pos):
+        if not pos or pos.get('dir') != 'call':
+            return False
+        return (
+            pos.get('engine') == 'v62_call_pool'
+            or pos.get('raw_engine') == 'v62_call_pool'
+            or pos.get('source') == 'v62_call_pool'
+            or 'v6.2 CALL' in str(pos.get('reason', ''))
+        )
+
     def _is_trend_aligned_position(self, pos):
         """Return True when a position direction matches the current/day trend."""
         if not pos:
@@ -461,6 +490,18 @@ class QQQLiveTrader:
             profile = {'signal': signal, 'stage': 10, 'hard': 12, 'min_profit': 0.0}
         elif signal == 'Granville_Pullback':
             profile = {'signal': signal, 'stage': 7, 'hard': 10, 'min_profit': 2.0}
+        elif self._is_v62_call_position(pos):
+            profile = {
+                'signal': 'v62_call_pool',
+                'stage': int(self.cfg.get('v62_call_pool_timeout_stage_bars', 12) or 12),
+                'hard': int(self.cfg.get('v62_call_pool_timeout_bars', 20) or 20),
+                'min_profit': 0.0,
+            }
+            if self._is_trend_aligned_position(pos):
+                profile['hard'] = max(
+                    profile['hard'],
+                    int(self.cfg.get('v62_call_pool_trend_timeout_bars', 28) or 28),
+                )
         elif signal == 'Kline_Pattern' or regime == 'neutral' or 'neutral' in reason:
             profile = {'signal': 'Kline_Pattern', 'stage': 10, 'hard': 12, 'min_profit': 0.0}
         else:
@@ -2312,6 +2353,7 @@ class QQQLiveTrader:
             self.last_loss_dir = None    # 新交易日重置亏损方向
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._signal_cooldowns = {}
+            self._v62_call_pool_last_bar = -999999
             self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
             self.day_market_regime = {
                 'type': 'warming_up',
@@ -2422,6 +2464,141 @@ class QQQLiveTrader:
             # v7 多引擎信号检测（如果v6.5未触发）
             if not self.position:
                 self._check_v7_signal(cur_min_et)
+
+            # v6.2 CALL small-size pool: extra signal source after main engines.
+            if not self.position:
+                self._check_v62_call_pool(one_min, cur_min_et)
+
+    def _check_v62_call_pool(self, bar, cur_min_et: int):
+        """Small-size v6.2-style CALL breakout pool, guarded by current regime filters."""
+        if not self.cfg.get('enable_v62_call_pool', False):
+            return
+        if self.position:
+            return
+
+        s_h, s_m = map(int, self.cfg['start_time'].split(':'))
+        start_min = s_h * 60 + s_m
+        end_min = int(self.cfg.get('v62_call_pool_end_min', 870) or 870)
+        if not (start_min <= cur_min_et <= end_min):
+            return
+        if 720 <= cur_min_et < 780:
+            return
+
+        try:
+            if self._check_longbridge_position() > 0:
+                return
+        except Exception:
+            return
+
+        cooldown = int(self.cfg.get('v62_call_pool_cooldown_bars', 5) or 5)
+        current_bar_index = len(self.one_min_candles)
+        if current_bar_index - int(self._v62_call_pool_last_bar) < cooldown:
+            return
+
+        lb = int(self.cfg.get('v62_call_pool_lookback', 3) or 3)
+        cs = self.one_min_candles
+        if len(cs) < lb + 1:
+            return
+
+        entry_price = float(bar.get('close') or 0)
+        if entry_price <= 0:
+            return
+
+        upper = max(float(c.get('high') or 0) for c in cs[-lb-1:-1])
+        if upper <= 0:
+            return
+        gap_up = (entry_price - upper) / upper
+        max_gap = float(self.cfg.get('v62_call_pool_max_gap', 0.0020) or 0.0020)
+        if not (entry_price > upper and gap_up < max_gap):
+            return
+
+        if float(bar.get('close') or 0) < float(bar.get('open') or 0):
+            return
+
+        vol_avg = float(np.mean(self.volume_history[-20:])) if len(self.volume_history) >= 20 else 0.0
+        vol_mult = float(self.cfg.get('v62_call_pool_vol_mult', 0.80) or 0.80)
+        if vol_avg > 0 and float(bar.get('volume') or 0) < vol_avg * vol_mult:
+            return
+
+        min_body = float(self.cfg.get('v62_call_pool_min_body', 0.00015) or 0.00015)
+        body = abs(float(bar.get('close') or 0) - float(bar.get('open') or 0)) / float(bar.get('open') or 1)
+        if body < min_body:
+            return
+
+        if len(self.close_history) >= 50:
+            sma20 = float(np.mean(self.close_history[-20:]))
+            sma50 = float(np.mean(self.close_history[-50:]))
+            if sma20 < sma50 and entry_price < sma20:
+                return
+
+        vwap = float(getattr(self.engine, 'vwap', 0) or 0)
+        if vwap > 0 and entry_price < vwap:
+            return
+
+        context = self._entry_quality_context(entry_price)
+
+        regime = self.day_market_regime or self._classify_day_market_regime(context)
+        regime_type = regime.get('type', '') if isinstance(regime, dict) else ''
+        regime_dir = regime.get('direction', '') if isinstance(regime, dict) else ''
+        if regime_dir == 'put' or regime_type == 'trend_down':
+            return
+        max_price_pos = float(self.cfg.get('v62_call_pool_max_price_pos', 0.85) or 0.85)
+        if regime_type == 'trend_up':
+            max_price_pos = float(self.cfg.get('v62_call_pool_trend_max_price_pos', 0.95) or 0.95)
+        if context.get('price_pos', 0.5) > max_price_pos:
+            return
+        if regime_type == 'range':
+            max_range_pos = float(self.cfg.get('v62_call_pool_range_max_position', 0.40) or 0.40)
+            if float(regime.get('pos', context.get('price_pos', 0.5)) or context.get('price_pos', 0.5)) > max_range_pos:
+                return
+
+        sl_pct = float(self.cfg.get('sl', 0.25) or 0.25)
+        tp_pct = float(self.cfg.get('tp', 0.30) or 0.30)
+        pos_mult = float(self.cfg.get('v62_call_pool_pos_mult', 0.35) or 0.35)
+        sig = {
+            'dir': 'call',
+            'reason': (
+                f'[v6.2 CALL小仓池] v6.2突破{upper:.2f}做多'
+                f'(gap={gap_up*100:.2f}%, LB{lb}, regime={regime_type or "unknown"})'
+            ),
+            'price': entry_price,
+            'sl': entry_price * (1 - sl_pct),
+            'tp': entry_price * (1 + tp_pct),
+            'sl_pct': sl_pct,
+            'tp_partial_pct': self.cfg.get('tp_partial_pct', 1.0),
+            'timeout_bars': int(self.cfg.get('v62_call_pool_timeout_bars', 20) or 20),
+            'pos_mult': pos_mult,
+            'regime': regime_type or 'neutral',
+            'engine': 'v62_call_pool',
+            'raw_engine': 'v62_call_pool',
+            'display_engine': 'Kline_Pattern',
+            'strength': 65,
+            'metadata': {
+                'source': 'v62_call_pool',
+                'upper': upper,
+                'breakout_upper': upper,
+                'gap_pct': gap_up,
+                'volume_ratio': (float(bar.get('volume') or 0) / vol_avg) if vol_avg > 0 else None,
+                'range_position': context.get('price_pos', 0.5),
+                'max_price_position': max_price_pos,
+                'day_market_regime': regime,
+            },
+        }
+
+        if self._should_skip_opening_range_call(sig, 'Kline_Pattern', context):
+            return
+        if self._should_skip_extreme_down_call(sig, 'Kline_Pattern', context):
+            return
+
+        self._v62_call_pool_last_bar = current_bar_index
+        self.daily_signals += 1
+        self.current_signal = sig
+        self._add_event(f"v6.2 CALL小仓池@${entry_price:.2f} | LB{lb} gap={gap_up*100:.2f}%", "signal")
+        print(
+            f"  🎯 v6.2 CALL小仓池 @${entry_price:.2f} | "
+            f"LB{lb} gap={gap_up*100:.2f}% pos_mult={pos_mult:.2f} regime={regime_type}"
+        )
+        self._execute_trade(sig)
 
     def _check_v7_signal(self, cur_min_et: int):
         """v7 多引擎信号检测"""
@@ -3394,7 +3571,11 @@ class QQQLiveTrader:
                 'entry_bar': len(self.one_min_candles),
                 'reason': sig['reason'],
                 'engine': sig.get('engine', ''),
+                'raw_engine': sig.get('raw_engine', ''),
                 'display_engine': sig.get('display_engine') or display_signal_name(sig.get('engine', '')),
+                'source': (sig.get('metadata') or {}).get('source', ''),
+                'entry_metadata': sig.get('metadata') or {},
+                'v62_breakout_upper': (sig.get('metadata') or {}).get('breakout_upper') or (sig.get('metadata') or {}).get('upper'),
                 'shadow_live_order': bool(sig.get('shadow_live_order', False)),
                 'shadow_rejection_reason': sig.get('shadow_rejection_reason', ''),
                 'max_pnl_pct': 0,
@@ -3797,8 +3978,32 @@ class QQQLiveTrader:
 
         # --- 1.2 正股风控（回测v6.3口径，降低期权报价噪声影响）---
         if not ex and not pos.get('half_closed'):
+            # v6.2 breakout entries should fail fast if the breakout cannot hold.
+            if self._is_v62_call_position(pos):
+                v62_fast_bars = int(self.cfg.get('v62_call_pool_fast_fail_bars', 5) or 5)
+                opt_stop = float(self.cfg.get('v62_call_pool_fast_option_stop_pct', 16) or 16)
+                if bars_held >= v62_fast_bars and stock_entry_valid and pnl_pct <= -opt_stop:
+                    upper = float(pos.get('v62_breakout_upper') or 0)
+                    buffer_pct = float(self.cfg.get('v62_call_pool_breakout_fail_buffer_pct', 0.0001) or 0.0001)
+                    vwap = float(getattr(self.engine, 'vwap', 0) or 0)
+                    broke_breakout = upper > 0 and current_stock < upper * (1 - buffer_pct)
+                    broke_vwap = (
+                        self.cfg.get('v62_call_pool_vwap_fail_enabled', True)
+                        and vwap > 0
+                        and current_stock < vwap
+                    )
+                    if broke_breakout or broke_vwap:
+                        reason_parts = []
+                        if broke_breakout:
+                            reason_parts.append(f"breakout<{upper:.2f}")
+                        if broke_vwap:
+                            reason_parts.append(f"vwap<{vwap:.2f}")
+                        ex = (
+                            f"v6.2突破失败快退({bars_held}min, "
+                            f"{'/'.join(reason_parts)}, 期权{pnl_pct:.1f}%)"
+                        )
             fast_bars = int(self.cfg.get('fast_fail_bars', 5) or 5)
-            if bars_held >= fast_bars and stock_entry_valid:
+            if not ex and bars_held >= fast_bars and stock_entry_valid:
                 if signal_name_for_exit == 'VWAP_Breakout':
                     stock_stop = self.cfg.get('vwap_fast_stock_stop_pct', 0.0006) * 100
                     opt_stop = self.cfg.get('vwap_fast_option_stop_pct', 18)
