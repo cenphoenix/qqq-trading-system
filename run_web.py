@@ -7,6 +7,7 @@ Starts:
 2. live trading engine in the same process
 """
 import os
+import socket
 import sys
 import threading
 import time
@@ -62,14 +63,37 @@ def notify_telegram(msg):
         pass
 
 
-def start_web():
+def is_port_available(host="0.0.0.0", port=8080):
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.settimeout(1)
+        test_sock.bind((host, port))
+        test_sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def choose_dashboard_port(preferred=8080):
+    candidates = [preferred, 8084, 8085, 8090, 8091, 18080]
+    for port in candidates:
+        if is_port_available(port=port):
+            return port
+    for port in range(8092, 8120):
+        if is_port_available(port=port):
+            return port
+    return None
+
+
+def start_web(port):
     print("Starting dashboard...", flush=True)
     try:
         os.environ["QQQ_DASHBOARD_STARTED"] = "1"
+        os.environ["QQQ_DASHBOARD_PORT"] = str(port)
         import dashboard_v7
 
         print("dashboard_v7 imported", flush=True)
-        dashboard_v7.run_dashboard("0.0.0.0", 8080)
+        dashboard_v7.run_dashboard("0.0.0.0", port)
     except Exception as e:
         print(f"Dashboard failed: {e}", flush=True)
         import traceback
@@ -98,12 +122,26 @@ def main():
 
     load_env()
 
-    web_thread = threading.Thread(target=start_web, daemon=True)
+    preferred_port = int(os.environ.get("QQQ_DASHBOARD_PORT", "8081") or 8081)
+    dashboard_port = choose_dashboard_port(preferred_port)
+    if dashboard_port is None:
+        msg = "No available dashboard port found. Please close old dashboard/trader processes."
+        print(msg, flush=True)
+        notify_telegram(msg)
+        return
+    if dashboard_port != preferred_port:
+        print(
+            f"Port {preferred_port} unavailable, using Dashboard port {dashboard_port} instead",
+            flush=True,
+        )
+    os.environ["QQQ_DASHBOARD_PORT"] = str(dashboard_port)
+
+    web_thread = threading.Thread(target=start_web, args=(dashboard_port,), daemon=True)
     web_thread.start()
     os.environ["QQQ_DASHBOARD_STARTED"] = "1"
 
     time.sleep(1)
-    print("Dashboard: http://localhost:8080", flush=True)
+    print(f"Dashboard: http://localhost:{dashboard_port}", flush=True)
     print("Notifications: Telegram if configured", flush=True)
     print("-" * 50, flush=True)
 

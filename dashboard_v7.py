@@ -1017,6 +1017,7 @@ def set_connected(connected: bool):
 def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
     import importlib.util
     import socket
+    import subprocess
     import time
     global _server_started
 
@@ -1024,6 +1025,43 @@ def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
         print(f"Dashboard already started in this process, skip duplicate start: http://localhost:{port}")
         return
     _server_started = True
+
+    def port_owner_text():
+        try:
+            output = subprocess.check_output(
+                ["netstat", "-ano"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            owners = []
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[0].upper() != "TCP":
+                    continue
+                local_addr = parts[1]
+                state = parts[3].upper()
+                pid = parts[4]
+                if local_addr.endswith(f":{port}") and state == "LISTENING":
+                    owners.append(pid)
+            if not owners:
+                return "owner=unknown"
+            names = []
+            for pid in sorted(set(owners)):
+                try:
+                    task = subprocess.check_output(
+                        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    ).strip()
+                    name = task.split(",", 1)[0].strip('"') if task and "INFO:" not in task else "unknown"
+                except Exception:
+                    name = "unknown"
+                names.append(f"pid={pid} name={name}")
+            return "; ".join(names)
+        except Exception as exc:
+            return f"owner lookup failed: {exc}"
 
     # Wait for port release after a Windows Ctrl+C/TIME_WAIT shutdown.
     for attempt in range(15):
@@ -1036,11 +1074,11 @@ def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
             break
         except OSError:
             if attempt < 14:
-                print(f"Port {port} busy, waiting 2s... ({attempt + 1}/15)")
+                print(f"Port {port} busy, waiting 2s... ({attempt + 1}/15) [{port_owner_text()}]")
                 time.sleep(2)
             else:
                 _server_started = False
-                print(f"Port {port} still busy, please close the process using it")
+                print(f"Port {port} still busy, please close the process using it [{port_owner_text()}]")
                 return
 
     ws_impl = "wsproto" if importlib.util.find_spec("wsproto") else "websockets"

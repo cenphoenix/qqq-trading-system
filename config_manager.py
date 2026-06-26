@@ -106,6 +106,9 @@ DEFAULT_CONFIG = {
             "Kline OR下破幅度不足",
             "Granville动量过滤",
         ],
+        "shadow_live_block_rejection_keywords": [
+            "质量过滤未通过",
+        ],
         "shadow_live_afternoon_allowed_signals": [
             "VWAP_Breakout",
         ],
@@ -187,6 +190,7 @@ DEFAULT_CONFIG = {
         "granville_min_vwap_dist": 0.0005,
         "granville_min_dist_pct": 0.20,
         "granville_require_day_direction": True,
+        "granville_call_require_explicit_day_direction": True,
         "fast_fail_bars": 7,
         "vwap_retest_enabled": True,
         "vwap_retest_max_wait_bars": 8,

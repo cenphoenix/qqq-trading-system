@@ -115,6 +115,9 @@ def _load_config():
                 'Kline OR下破幅度不足',
                 'Granville动量过滤',
             ],
+            'shadow_live_block_rejection_keywords': [
+                '质量过滤未通过',
+            ],
             'shadow_live_afternoon_allowed_signals': ['VWAP_Breakout'],
             'shadow_live_sl_pct': 0.22,
             'shadow_live_disable_open_stop_widen': True,
@@ -187,6 +190,7 @@ def _load_config():
             'granville_min_vwap_dist': 0.0005,
             'granville_min_dist_pct': 0.20,
             'granville_require_day_direction': True,
+            'granville_call_require_explicit_day_direction': True,
             'trend_quick_trail_activate_pct': 20,
             'trend_quick_trail_drop_pct': 12,
             'profit_take_tiers': [
@@ -1143,8 +1147,8 @@ class QQQLiveTrader:
             if (
                 direction == 'call'
                 and self.cfg.get('granville_require_day_direction', True)
-                and day_direction
                 and day_direction != 'call'
+                and (day_direction or self.cfg.get('granville_call_require_explicit_day_direction', True))
             ):
                 self._last_entry_rejection = f'Granville逆当日方向仅记录: {day_direction}'
                 self._hard_skip_shadow_live = True
@@ -1315,6 +1319,7 @@ class QQQLiveTrader:
 
             self._signal_probe_seq += 1
             entry_time = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
+            day_regime = self.day_market_regime if isinstance(self.day_market_regime, dict) else {}
             probe = {
                 'id': self._signal_probe_seq,
                 'entry_time': entry_time,
@@ -1326,9 +1331,9 @@ class QQQLiveTrader:
                 'contracts': int(contracts),
                 'reason': sig.get('reason', ''),
                 'regime': sig.get('regime', ''),
-                'day_market_regime': sig.get('day_market_regime', ''),
-                'day_market_label': sig.get('day_market_label', ''),
-                'day_market_direction': sig.get('day_market_direction', ''),
+                'day_market_regime': sig.get('day_market_regime') or day_regime.get('type', ''),
+                'day_market_label': sig.get('day_market_label') or day_regime.get('label', ''),
+                'day_market_direction': sig.get('day_market_direction') or day_regime.get('direction', ''),
                 'opening_range': sig.get('opening_range', {}),
                 'source': source,
                 'rejection_reason': rejection_reason,
@@ -1359,6 +1364,10 @@ class QQQLiveTrader:
                 afternoon_allowed = set(self.cfg.get('shadow_live_afternoon_allowed_signals') or [])
                 if cur_min_et >= 780 and afternoon_allowed and signal_name not in afternoon_allowed:
                     print(f"  ⏭️ 下午影子真实单仅允许 {sorted(afternoon_allowed)}，{signal_name} 只记录")
+                    live_orders = False
+                block_keywords = self.cfg.get('shadow_live_block_rejection_keywords') or []
+                if any(str(keyword) and str(keyword) in rejection for keyword in block_keywords):
+                    print(f"  ⛔ shadow live blocked: {signal_name} {sig.get('dir')} | {rejection}")
                     live_orders = False
                 if not live_orders:
                     pass
@@ -2167,13 +2176,15 @@ class QQQLiveTrader:
                 def run_dashboard():
                     try:
                         os.environ['QQQ_DASHBOARD_STARTED'] = '1'
-                        dashboard_v7.run_dashboard("0.0.0.0", 8080)
+                        dashboard_port = int(os.environ.get('QQQ_DASHBOARD_PORT', '8081') or 8081)
+                        dashboard_v7.run_dashboard("0.0.0.0", dashboard_port)
                     except Exception as e:
                         print(f"⚠️ Dashboard运行失败: {e}")
 
                 dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
                 dashboard_thread.start()
-                print("📊 v7 Dashboard已启动: http://localhost:8080")
+                dashboard_port = int(os.environ.get('QQQ_DASHBOARD_PORT', '8081') or 8081)
+                print(f"📊 v7 Dashboard已启动: http://localhost:{dashboard_port}")
             self._add_event("📊 v7 Dashboard已连接", "engine")
             
             # 初始化Dashboard状态
