@@ -108,6 +108,12 @@ DEFAULT_CONFIG = {
         ],
         "shadow_live_block_rejection_keywords": [
             "质量过滤未通过",
+            "Brooks方向冲突",
+        ],
+        "shadow_live_quality_allowed_signals": [
+            "VWAP_Breakout",
+            "Kline_Pattern",
+            "Granville_Pullback",
         ],
         "shadow_live_afternoon_allowed_signals": [
             "VWAP_Breakout",
@@ -173,6 +179,14 @@ DEFAULT_CONFIG = {
         "v62_call_pool_timeout_stage_bars": 12,
         "v62_call_pool_timeout_bars": 20,
         "v62_call_pool_trend_timeout_bars": 28,
+        "or_reversal_pool_enabled": True,
+        "or_reversal_pos_mult": 0.30,
+        "or_reversal_cooldown_bars": 8,
+        "or_reversal_end_min": 720,
+        "or_reversal_edge_pct": 0.22,
+        "or_reversal_min_wick_ratio": 0.45,
+        "or_reversal_min_close_location": 0.62,
+        "or_reversal_min_volume_mult": 0.80,
         "kline_call_live_patterns": [
             "ORB突破",
             "BB挤压突破",
@@ -214,6 +228,9 @@ DEFAULT_CONFIG = {
         ],
         "profit_peak_pullback_pct": 30,
         "trend_timeout_bonus_bars": 4,
+        "profit_runner_enabled": True,
+        "profit_runner_min_pnl_pct": 12,
+        "profit_runner_max_bars": 45,
         "profit_floor_activate_pct": 20,
         "profit_floor_pct": 8,
         "afternoon_put_start_min": 810,

@@ -117,6 +117,12 @@ def _load_config():
             ],
             'shadow_live_block_rejection_keywords': [
                 '质量过滤未通过',
+                'Brooks方向冲突',
+            ],
+            'shadow_live_quality_allowed_signals': [
+                'VWAP_Breakout',
+                'Kline_Pattern',
+                'Granville_Pullback',
             ],
             'shadow_live_afternoon_allowed_signals': ['VWAP_Breakout'],
             'shadow_live_sl_pct': 0.22,
@@ -176,6 +182,14 @@ def _load_config():
             'v62_call_pool_timeout_stage_bars': 12,
             'v62_call_pool_timeout_bars': 20,
             'v62_call_pool_trend_timeout_bars': 28,
+            'or_reversal_pool_enabled': True,
+            'or_reversal_pos_mult': 0.30,
+            'or_reversal_cooldown_bars': 8,
+            'or_reversal_end_min': 720,
+            'or_reversal_edge_pct': 0.22,
+            'or_reversal_min_wick_ratio': 0.45,
+            'or_reversal_min_close_location': 0.62,
+            'or_reversal_min_volume_mult': 0.80,
             'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
             'kline_max_price_pos': 0.82,
             'kline_put_or_break_min_buffer_pct': 0.0020,
@@ -200,6 +214,9 @@ def _load_config():
             ],
             'profit_peak_pullback_pct': 30,
             'trend_timeout_bonus_bars': 4,
+            'profit_runner_enabled': True,
+            'profit_runner_min_pnl_pct': 12,
+            'profit_runner_max_bars': 45,
             'afternoon_put_start_min': 810,
             'afternoon_put_min_vwap_dist': 0.006,
             'afternoon_put_min_sma20_slope_abs': 0.00005,
@@ -300,6 +317,7 @@ class QQQLiveTrader:
         self._last_entry_rejection = ''
         self._hard_skip_shadow_live = False
         self._v62_call_pool_last_bar = -999999
+        self._or_reversal_last_bar = -999999
 
         # 初始化长桥连接
         self._init_api()
@@ -522,6 +540,38 @@ class QQQLiveTrader:
             profile['stage'] += bonus
             profile['hard'] += bonus
         return profile
+
+    def _profit_runner_active(self, pos, current_stock, pnl_pct, bars_held):
+        """Keep profitable trend-aligned positions past hard timeout while trend is intact."""
+        if not self.cfg.get('profit_runner_enabled', True):
+            return False
+        if pnl_pct < float(self.cfg.get('profit_runner_min_pnl_pct', 12) or 12):
+            return False
+        if bars_held >= int(self.cfg.get('profit_runner_max_bars', 45) or 45):
+            return False
+
+        direction = pos.get('dir', '')
+        if direction not in ('call', 'put') or current_stock <= 0:
+            return False
+
+        vwap = float(getattr(self.engine, 'vwap', 0) or 0)
+        sma9 = float(np.mean(self.close_history[-9:])) if len(self.close_history) >= 9 else 0.0
+        if direction == 'call':
+            trend_ok = (vwap <= 0 or current_stock >= vwap) and (sma9 <= 0 or current_stock >= sma9)
+        else:
+            trend_ok = (vwap <= 0 or current_stock <= vwap) and (sma9 <= 0 or current_stock <= sma9)
+        if not trend_ok:
+            return False
+
+        try:
+            pa_state = self.price_action.market_state(self.one_min_candles)
+            pa_direction = pa_state.get('direction', '')
+            if pa_direction and pa_direction != direction:
+                return False
+        except Exception:
+            pass
+
+        return True
 
     def _entry_signal_name(self, sig):
         raw = sig.get('display_engine') or sig.get('engine') or sig.get('raw_engine') or ''
@@ -1366,7 +1416,12 @@ class QQQLiveTrader:
                     print(f"  ⏭️ 下午影子真实单仅允许 {sorted(afternoon_allowed)}，{signal_name} 只记录")
                     live_orders = False
                 block_keywords = self.cfg.get('shadow_live_block_rejection_keywords') or []
-                if any(str(keyword) and str(keyword) in rejection for keyword in block_keywords):
+                quality_allowed = (
+                    '质量过滤未通过' in rejection
+                    and signal_name in set(self.cfg.get('shadow_live_quality_allowed_signals') or [])
+                    and 'Brooks方向冲突' not in rejection
+                )
+                if any(str(keyword) and str(keyword) in rejection for keyword in block_keywords) and not quality_allowed:
                     print(f"  ⛔ shadow live blocked: {signal_name} {sig.get('dir')} | {rejection}")
                     live_orders = False
                 if not live_orders:
@@ -2365,6 +2420,7 @@ class QQQLiveTrader:
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._signal_cooldowns = {}
             self._v62_call_pool_last_bar = -999999
+            self._or_reversal_last_bar = -999999
             self.price_action_state = {'state': 'warming_up', 'direction': '', 'reason': ''}
             self.day_market_regime = {
                 'type': 'warming_up',
@@ -2476,9 +2532,124 @@ class QQQLiveTrader:
             if not self.position:
                 self._check_v7_signal(cur_min_et)
 
+            # Opening range edge reversal pool: earlier entries near first-range extremes.
+            if not self.position:
+                self._check_opening_range_reversal_pool(one_min, cur_min_et)
+
             # v6.2 CALL small-size pool: extra signal source after main engines.
             if not self.position:
                 self._check_v62_call_pool(one_min, cur_min_et)
+
+    def _check_opening_range_reversal_pool(self, bar, cur_min_et: int):
+        """Small-size price-action reversal pool around opening-range extremes."""
+        if not self.cfg.get('or_reversal_pool_enabled', True):
+            return
+        if self.position:
+            return
+
+        s_h, s_m = map(int, self.cfg['start_time'].split(':'))
+        start_min = s_h * 60 + s_m
+        end_min = int(self.cfg.get('or_reversal_end_min', 720) or 720)
+        if not (start_min <= cur_min_et <= end_min):
+            return
+        if 720 <= cur_min_et < 780:
+            return
+
+        try:
+            if self._check_longbridge_position() > 0:
+                return
+        except Exception:
+            return
+
+        cooldown = int(self.cfg.get('or_reversal_cooldown_bars', 8) or 8)
+        current_bar_index = len(self.one_min_candles)
+        if current_bar_index - int(self._or_reversal_last_bar) < cooldown:
+            return
+
+        price = float(bar.get('close') or 0)
+        high = float(bar.get('high') or 0)
+        low = float(bar.get('low') or 0)
+        open_price = float(bar.get('open') or 0)
+        if min(price, high, low, open_price) <= 0 or high <= low:
+            return
+
+        context = self._entry_quality_context(price)
+        or_ctx = self._opening_range_context(price, context)
+        if not or_ctx.get('enabled') or not or_ctx.get('ready'):
+            return
+
+        or_low = float(or_ctx.get('low') or 0)
+        or_high = float(or_ctx.get('high') or 0)
+        or_width = max(or_high - or_low, 1e-9)
+        range_pos = (price - or_low) / or_width
+        edge_pct = float(self.cfg.get('or_reversal_edge_pct', 0.22) or 0.22)
+        min_wick = float(self.cfg.get('or_reversal_min_wick_ratio', 0.45) or 0.45)
+        min_close_loc = float(self.cfg.get('or_reversal_min_close_location', 0.62) or 0.62)
+        vol_mult = float(self.cfg.get('or_reversal_min_volume_mult', 0.80) or 0.80)
+        vol_avg = float(np.mean(self.volume_history[-20:])) if len(self.volume_history) >= 20 else 0.0
+        if vol_avg > 0 and float(bar.get('volume') or 0) < vol_avg * vol_mult:
+            return
+
+        candle_range = max(high - low, 1e-9)
+        close_loc = (price - low) / candle_range
+        lower_wick = (min(open_price, price) - low) / candle_range
+        upper_wick = (high - max(open_price, price)) / candle_range
+
+        direction = ''
+        setup = ''
+        if range_pos <= edge_pct and lower_wick >= min_wick and close_loc >= min_close_loc:
+            direction = 'call'
+            setup = 'OR_Low_Reversal'
+        elif range_pos >= 1 - edge_pct and upper_wick >= min_wick and close_loc <= 1 - min_close_loc:
+            direction = 'put'
+            setup = 'OR_High_Reversal'
+        else:
+            return
+
+        regime = self.day_market_regime or self._classify_day_market_regime(context)
+        regime_type = regime.get('type', '') if isinstance(regime, dict) else ''
+        sl_pct = float(self.cfg.get('sl', 0.25) or 0.25)
+        pos_mult = float(self.cfg.get('or_reversal_pos_mult', 0.30) or 0.30)
+        sig = {
+            'dir': direction,
+            'reason': (
+                f'{setup}: price={price:.2f} OR[{or_low:.2f},{or_high:.2f}] '
+                f'pos={range_pos*100:.0f}% wick={max(lower_wick, upper_wick)*100:.0f}% '
+                f'closeLoc={close_loc*100:.0f}%'
+            ),
+            'price': price,
+            'sl': price * (1 - sl_pct) if direction == 'call' else price * (1 + sl_pct),
+            'tp': price * (1 + self.cfg['tp']) if direction == 'call' else price * (1 - self.cfg['tp']),
+            'sl_pct': sl_pct,
+            'tp_partial_pct': self.cfg.get('tp_partial_pct', 1.0),
+            'timeout_bars': 18,
+            'pos_mult': pos_mult,
+            'regime': regime_type or 'neutral',
+            'engine': 'or_reversal_pool',
+            'raw_engine': 'or_reversal_pool',
+            'display_engine': 'Kline_Pattern',
+            'strength': 62,
+            'metadata': {
+                'source': 'or_reversal_pool',
+                'setup_type': setup,
+                'opening_range': or_ctx,
+                'range_position': range_pos,
+                'day_market_regime': regime,
+            },
+        }
+
+        if self._should_skip_and_track(sig):
+            return
+
+        self._or_reversal_last_bar = current_bar_index
+        self.daily_signals += 1
+        self.current_signal = sig
+        self._add_event(f"OR edge reversal {direction}@${price:.2f} | {setup}", "signal")
+        print(
+            f"  🎯 OR edge reversal {direction} @${price:.2f} | "
+            f"{setup} pos={range_pos*100:.0f}% pos_mult={pos_mult:.2f}"
+        )
+        self._execute_trade(sig)
 
     def _check_v62_call_pool(self, bar, cur_min_et: int):
         """Small-size v6.2-style CALL breakout pool, guarded by current regime filters."""
@@ -4101,7 +4272,10 @@ class QQQLiveTrader:
                     if self.cfg.get('debug', False):
                         print(f"  📈 Always-In {pos['dir']} 延长持仓至 {s3_bars} 分钟")
 
-            if bars_held >= s3_bars:
+            if bars_held >= s3_bars and self._profit_runner_active(pos, current_stock, pnl_pct, bars_held):
+                if self.cfg.get('debug', False):
+                    print(f"  🏃 profit runner active: skip hard timeout at {bars_held}min pnl={pnl_pct:.1f}%")
+            elif bars_held >= s3_bars:
                 ex = f"硬超时({signal_name},{s3_bars}分钟)"
             elif bars_held >= s2_bars and pnl_pct < s2_min:
                 ex = f"阶段超时({signal_name},{s2_bars}min盈利{pnl_pct:.1f}%<{s2_min:.0f}%)"
@@ -4162,7 +4336,10 @@ class QQQLiveTrader:
                 if (pos['dir'] == 'call' and current_stock > sma5) or \
                    (pos['dir'] == 'put' and current_stock < sma5):
                     s3_bars = max(s3_bars, self.cfg.get('trend_extend_timeout_bars', 15))
-            if bars_held >= s3_bars:
+            if bars_held >= s3_bars and self._profit_runner_active(pos, current_stock, pnl_pct, bars_held):
+                if self.cfg.get('debug', False):
+                    print(f"  🏃 profit runner active after partial: skip hard timeout at {bars_held}min pnl={pnl_pct:.1f}%")
+            elif bars_held >= s3_bars:
                 ex = f"硬超时({signal_name},{s3_bars}分钟)"
 
         if ex:
