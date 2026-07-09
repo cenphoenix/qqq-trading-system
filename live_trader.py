@@ -108,7 +108,7 @@ def _load_config():
             'shadow_signal_live_orders': True,
             'shadow_live_order_pos_mult': 0.80,
             'shadow_live_open_pos_mult': 0.50,
-            'shadow_live_rejected_pos_mult': 0.60,
+            'shadow_live_rejected_pos_mult': 0.45,
             'shadow_live_reduced_rejection_keywords': [
                 '质量过滤未通过',
                 'Brooks方向冲突',
@@ -125,7 +125,7 @@ def _load_config():
                 'Granville_Pullback',
             ],
             'shadow_live_afternoon_allowed_signals': ['VWAP_Breakout'],
-            'shadow_live_sl_pct': 0.22,
+            'shadow_live_sl_pct': 0.20,
             'shadow_live_disable_open_stop_widen': True,
             'trend_day_filter_enabled': True,
             'trend_day_min_bars': 30,
@@ -190,6 +190,19 @@ def _load_config():
             'or_reversal_min_wick_ratio': 0.45,
             'or_reversal_min_close_location': 0.62,
             'or_reversal_min_volume_mult': 0.80,
+            'or_reversal_countertrend_block_enabled': True,
+            'profit_reentry_cooldown_enabled': True,
+            'profit_reentry_min_pnl_pct': 25,
+            'profit_reentry_call_cooldown_min': 10,
+            'profit_reentry_put_cooldown_min': 15,
+            'profit_reentry_call_required_wins': 1,
+            'profit_reentry_put_required_wins': 2,
+            'profit_reentry_breakout_buffer_pct': 0.0008,
+            'profit_reentry_retry_fail_lock_min': 20,
+            'scout_live_enabled': True,
+            'scout_live_pos_mult': 0.15,
+            'scout_live_sl_pct': 0.16,
+            'scout_live_signals': ['Kline_Pattern:call', 'RSI_Overbought:put'],
             'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
             'kline_max_price_pos': 0.82,
             'kline_put_or_break_min_buffer_pct': 0.0020,
@@ -287,6 +300,7 @@ class QQQLiveTrader:
         self.put_pnl = 0.0           # PUT方向累计盈亏
         self.loss_cooldown_until = None  # 时间戳冷却：下次允许同向交易的时间
         self.last_loss_dir = None    # 最近一次亏损的方向（'call'或'put'），冷却期间允许反向
+        self._profit_reentry_cooldowns = {}
         self.big_loss_cooldown = 0   # 大亏(>20%)后同方向冷却剩余K线数
         self._big_loss_dir = None    # 大亏冷却的方向
         self.current_price = 0       # 当前正股价格
@@ -571,6 +585,161 @@ class QQQLiveTrader:
         except Exception:
             pass
 
+        return True
+
+    def _record_profit_reentry_cooldown(self, pos, pnl_pct, pnl_usd):
+        if not self.cfg.get('profit_reentry_cooldown_enabled', True):
+            return
+        direction = pos.get('dir')
+        if direction not in ('call', 'put'):
+            return
+        trigger_pnl = max(float(pnl_pct), float(pos.get('max_pnl_pct') or 0))
+        min_pnl = float(self.cfg.get('profit_reentry_min_pnl_pct', 25) or 25)
+        if trigger_pnl < min_pnl:
+            return
+
+        now = datetime.now(TZ_ET)
+        minutes = int(self.cfg.get(
+            'profit_reentry_put_cooldown_min' if direction == 'put' else 'profit_reentry_call_cooldown_min',
+            15 if direction == 'put' else 10,
+        ) or 0)
+        if minutes <= 0:
+            return
+
+        prev = self._profit_reentry_cooldowns.get(direction) or {}
+        prev_until = prev.get('until')
+        prev_count = int(prev.get('win_count') or 0) if prev_until and now < prev_until else 0
+        win_count = prev_count + 1
+        exit_stock = self._current_stock_price() or self.current_price or float(pos.get('entry_price') or 0)
+        self._profit_reentry_cooldowns[direction] = {
+            'until': now + timedelta(minutes=minutes),
+            'exit_stock': float(exit_stock or 0),
+            'pnl_pct': float(pnl_pct),
+            'trigger_pnl_pct': float(trigger_pnl),
+            'pnl_usd': float(pnl_usd),
+            'win_count': win_count,
+            'reason': pos.get('exit_reason', ''),
+            'opt_symbol': pos.get('opt_symbol', ''),
+        }
+        print(
+            f"  ⏳ 盈利后{direction.upper()}二次追单冷却: {minutes}分钟 "
+            f"(盈利{pnl_pct:.1f}%, 峰值{trigger_pnl:.1f}%, 连续大赚{win_count}笔, "
+            f"exit_stock=${float(exit_stock or 0):.2f})"
+        )
+
+    def _should_skip_profit_reentry(self, sig, context=None):
+        if not self.cfg.get('profit_reentry_cooldown_enabled', True):
+            return False
+        direction = sig.get('dir')
+        if direction not in ('call', 'put'):
+            return False
+        info = self._profit_reentry_cooldowns.get(direction)
+        if not info:
+            return False
+
+        now = datetime.now(TZ_ET)
+        until = info.get('until')
+        if not until or now >= until:
+            self._profit_reentry_cooldowns.pop(direction, None)
+            return False
+
+        required_wins = int(self.cfg.get(
+            'profit_reentry_put_required_wins' if direction == 'put' else 'profit_reentry_call_required_wins',
+            2 if direction == 'put' else 1,
+        ) or 1)
+        if int(info.get('win_count') or 0) < required_wins:
+            return False
+
+        price = float(sig.get('price') or self.current_price or 0)
+        exit_stock = float(info.get('exit_stock') or 0)
+        if price <= 0 or exit_stock <= 0:
+            return True
+
+        if info.get('hard_lock'):
+            remaining = int((until - now).total_seconds() / 60) + 1
+            self._last_entry_rejection = f"盈利后{direction.upper()}试错失败硬冷却: 剩余{remaining}分钟"
+            self._hard_skip_shadow_live = True
+            print(f"  ⏳ {self._last_entry_rejection}")
+            return True
+
+        buffer_pct = float(self.cfg.get('profit_reentry_breakout_buffer_pct', 0.0008) or 0.0008)
+        if direction == 'call':
+            breakout_ok = price >= exit_stock * (1 + buffer_pct)
+            needed = exit_stock * (1 + buffer_pct)
+        else:
+            breakout_ok = price <= exit_stock * (1 - buffer_pct)
+            needed = exit_stock * (1 - buffer_pct)
+        if breakout_ok:
+            print(
+                f"  ✅ 盈利后{direction.upper()}冷却破位放行: "
+                f"${price:.2f} vs ${needed:.2f}"
+            )
+            meta = sig.setdefault('metadata', {})
+            meta['profit_reentry_retry'] = True
+            meta['profit_reentry_win_count'] = int(info.get('win_count') or 0)
+            meta['profit_reentry_exit_stock'] = exit_stock
+            self._profit_reentry_cooldowns.pop(direction, None)
+            return False
+
+        remaining = int((until - now).total_seconds() / 60) + 1
+        self._last_entry_rejection = (
+            f"盈利后{direction.upper()}二次追单冷却: 剩余{remaining}分钟, "
+            f"需{'突破' if direction == 'call' else '跌破'}${needed:.2f}, 当前${price:.2f}"
+        )
+        self._hard_skip_shadow_live = True
+        print(f"  ⏳ {self._last_entry_rejection}")
+        return True
+
+    def _record_profit_reentry_retry_result(self, pos, pnl_pct):
+        meta = pos.get('entry_metadata') or {}
+        if not meta.get('profit_reentry_retry'):
+            return
+        direction = pos.get('dir')
+        if direction not in ('call', 'put'):
+            return
+        trigger_pnl = max(float(pnl_pct), float(pos.get('max_pnl_pct') or 0))
+        min_pnl = float(self.cfg.get('profit_reentry_min_pnl_pct', 25) or 25)
+        if trigger_pnl >= min_pnl:
+            return
+        lock_min = int(self.cfg.get('profit_reentry_retry_fail_lock_min', 20) or 20)
+        if lock_min <= 0:
+            return
+        self._profit_reentry_cooldowns[direction] = {
+            'until': datetime.now(TZ_ET) + timedelta(minutes=lock_min),
+            'exit_stock': self._current_stock_price() or self.current_price or float(pos.get('entry_price') or 0),
+            'pnl_pct': float(pnl_pct),
+            'trigger_pnl_pct': float(trigger_pnl),
+            'pnl_usd': float(pos.get('pnl_usd') or 0),
+            'win_count': int(meta.get('profit_reentry_win_count') or 1),
+            'hard_lock': True,
+            'reason': 'profit_reentry_retry_failed',
+            'opt_symbol': pos.get('opt_symbol', ''),
+        }
+        print(f"  ⛔ 盈利后{direction.upper()}破位试错失败，硬冷却{lock_min}分钟")
+
+    def _try_apply_scout_entry(self, sig, signal, direction, rejection_reason):
+        if not self.cfg.get('scout_live_enabled', True):
+            return False
+        key = f"{signal}:{direction}"
+        allowed = set(self.cfg.get('scout_live_signals') or [])
+        if key not in allowed:
+            return False
+        if sig.get('shadow_live_order'):
+            return False
+        sig['scout_live_order'] = True
+        sig['shadow_live_order'] = True
+        sig['shadow_rejection_reason'] = rejection_reason
+        sig['pos_mult'] = min(
+            float(sig.get('pos_mult', 1.0) or 1.0),
+            float(self.cfg.get('scout_live_pos_mult', 0.15) or 0.15),
+        )
+        sig['sl_pct'] = min(
+            float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
+            float(self.cfg.get('scout_live_sl_pct', 0.16) or 0.16),
+        )
+        sig.setdefault('metadata', {})['source'] = 'scout_live'
+        sig['reason'] = f"[小仓Scout|原拒绝:{rejection_reason}] {sig.get('reason', '')}"
+        print(f"  🧪 小仓Scout放行: {key} | {rejection_reason}")
         return True
 
     def _entry_signal_name(self, sig):
@@ -998,8 +1167,17 @@ class QQQLiveTrader:
         disabled_signals = set(self.cfg.get('disabled_entry_signals') or [])
         if signal in disabled_signals:
             self._last_entry_rejection = f'胜率优先禁用信号: {signal}'
+            if self._try_apply_scout_entry(sig, signal, direction, self._last_entry_rejection):
+                disabled_signals = set()
+            else:
+                self._hard_skip_shadow_live = True
+                print(f"  ⛔ 胜率优先禁用信号: {signal}")
+                return True
+        if signal in disabled_signals:
             self._hard_skip_shadow_live = True
             print(f"  ⛔ 胜率优先禁用信号: {signal}")
+            return True
+        if self._should_skip_profit_reentry(sig, context):
             return True
         if self._apply_market_regime_to_signal(sig, signal, direction, context):
             return True
@@ -1149,9 +1327,10 @@ class QQQLiveTrader:
             allowed_patterns = self.cfg.get('kline_call_live_patterns') or []
             if direction == 'call' and allowed_patterns and not any(pat in reason for pat in allowed_patterns):
                 self._last_entry_rejection = 'Kline普通形态仅记录'
-                self._hard_skip_shadow_live = True
-                print(f"  ⛔ Kline普通CALL形态仅记录不下单: {reason}")
-                return True
+                if not self._try_apply_scout_entry(sig, signal, direction, self._last_entry_rejection):
+                    self._hard_skip_shadow_live = True
+                    print(f"  ⛔ Kline普通CALL形态仅记录不下单: {reason}")
+                    return True
             if direction == 'put':
                 or_ctx = self._opening_range_context(float(sig.get('price') or 0), context)
                 min_or_break = float(self.cfg.get('kline_put_or_break_min_buffer_pct', 0.0020) or 0.0020)
@@ -1449,7 +1628,7 @@ class QQQLiveTrader:
                         sig['shadow_rejection_reason'] = rejection
                         sig['sl_pct'] = min(
                             float(sig.get('sl_pct', self.cfg.get('sl', 0.25)) or self.cfg.get('sl', 0.25)),
-                            float(self.cfg.get('shadow_live_sl_pct', 0.22) or 0.22),
+                            float(self.cfg.get('shadow_live_sl_pct', 0.20) or 0.20),
                         )
                         sig['pos_mult'] = min(
                             float(sig.get('pos_mult', 1.0) or 1.0),
@@ -1478,7 +1657,7 @@ class QQQLiveTrader:
             'Brooks方向冲突',
         ]
         if any(str(keyword) and str(keyword) in text for keyword in keywords):
-            return float(self.cfg.get('shadow_live_rejected_pos_mult', 0.60) or 0.60)
+            return float(self.cfg.get('shadow_live_rejected_pos_mult', 0.45) or 0.45)
         return None
 
     def _profit_take_tiers(self):
@@ -2417,6 +2596,7 @@ class QQQLiveTrader:
             self._signal_probe_seq = 0
             self.loss_cooldown_until = None  # 新交易日重置冷却
             self.last_loss_dir = None    # 新交易日重置亏损方向
+            self._profit_reentry_cooldowns = {}
             self.big_loss_cooldown = 0   # 新交易日重置大亏冷却
             self._signal_cooldowns = {}
             self._v62_call_pool_last_bar = -999999
@@ -2637,6 +2817,39 @@ class QQQLiveTrader:
                 'day_market_regime': regime,
             },
         }
+
+        if self.cfg.get('or_reversal_countertrend_block_enabled', True):
+            regime_dir = regime.get('direction', '') if isinstance(regime, dict) else ''
+            is_countertrend = regime_dir in ('call', 'put') and regime_dir != direction
+            vwap = float(getattr(self.engine, 'vwap', 0) or 0)
+            sma20_slope = float(context.get('sma20_slope', 0) or 0)
+            if is_countertrend:
+                reclaimed = (
+                    direction == 'call'
+                    and (vwap <= 0 or price >= vwap)
+                    and sma20_slope >= float(self.cfg.get('trend_day_min_sma20_slope', 0.00015) or 0.00015)
+                ) or (
+                    direction == 'put'
+                    and (vwap <= 0 or price <= vwap)
+                    and sma20_slope <= -float(self.cfg.get('trend_day_min_sma20_slope', 0.00015) or 0.00015)
+                )
+                if not reclaimed:
+                    rejection = (
+                        f"逆势OR反转仅记录: day={regime.get('label', regime.get('type', ''))} "
+                        f"vwap={(price - vwap) / vwap * 100 if vwap else 0:.2f}% "
+                        f"slope={sma20_slope * 100:.3f}%"
+                    )
+                    self._start_signal_probe(
+                        sig=sig,
+                        opt_symbol='',
+                        contracts=0,
+                        entry_price=price,
+                        entry_bar=len(self.one_min_candles),
+                        source='shadow',
+                        rejection_reason=rejection,
+                    )
+                    print(f"  ⛔ {rejection}")
+                    return
 
         if self._should_skip_and_track(sig):
             return
@@ -3426,6 +3639,10 @@ class QQQLiveTrader:
         # ===== PUT每日上限3笔 =====
         if sig.get('dir') == 'put' and self.put_trades >= 3:
             print(f"  ⛔ PUT已达每日上限({self.put_trades}/3)，跳过")
+            return
+        self._last_entry_rejection = ''
+        self._hard_skip_shadow_live = False
+        if self._should_skip_profit_reentry(sig):
             return
         # ===== 防重入锁：防止下单等待期间重复开仓 =====
         if self._should_skip_and_track(sig):
@@ -4878,6 +5095,9 @@ class QQQLiveTrader:
                 if pnl_pct > 0:
                     self.put_wins += 1
 
+            if closing_full:
+                self._record_profit_reentry_retry_result(closed_pos, pnl_pct)
+
             # 更新连续统计
             if pnl_pct > 0:
                 self.consecutive_wins += 1
@@ -4886,6 +5106,8 @@ class QQQLiveTrader:
                 if pnl_usd > self.largest_win_usd:
                     self.largest_win_usd = pnl_usd
                     self.largest_win_pct = pnl_pct
+                if closing_full:
+                    self._record_profit_reentry_cooldown(closed_pos, pnl_pct, pnl_usd)
             else:
                 self.consecutive_losses += 1
                 self.consecutive_wins = 0
