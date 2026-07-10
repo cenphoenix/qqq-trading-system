@@ -14,7 +14,7 @@ RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
 4. 风控：动态止损/半仓止盈/分阶段超时/日亏损熔断/冷却
 5. Telegram推送交易信号 / Web仪表盘
 """
-import os, sys, time, json, signal, math, re
+import os, sys, time, json, signal, re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import numpy as np
@@ -58,6 +58,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
+from trading import NotificationLog, NotificationService, TradeLedger
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -275,6 +276,11 @@ def _maybe_reload_config():
 class QQQLiveTrader:
     def __init__(self, config=None):
         self.cfg = config or CONFIG
+        self.notification_log = NotificationLog(_app_dir(), TZ_ET, _json_default)
+        self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
+        self.notification_service = NotificationService(
+            _app_dir(), TZ_ET, lambda: self.cfg, self._format_notification,
+        )
         self.running = False
         self.position = None
         self.trades_today = []
@@ -1815,98 +1821,24 @@ class QQQLiveTrader:
 
     def _trade_notify_key(self, trade, source='exit'):
         """生成交易通知指纹，避免同一笔平仓重复通知，也避免同合约多次交易被误去重。"""
-        try:
-            sym = str(trade.get('opt_symbol', ''))
-            direction = str(trade.get('dir', ''))
-            contracts = int(float(trade.get('closed_contracts') or trade.get('contracts') or 0))
-            entry = round(float(trade.get('entry_opt_price') or trade.get('entry_price') or 0), 4)
-            exit_price = round(float(trade.get('exit_opt_price') or trade.get('exit_price') or 0), 4)
-            pnl = round(float(trade.get('pnl_usd') or 0), 2)
-            reason = str(trade.get('exit_reason') or trade.get('reason') or '')[:80]
-            return f"{source}|{sym}|{direction}|{contracts}|{entry}|{exit_price}|{pnl}|{reason}"
-        except Exception:
-            return f"{source}|{time.time()}"
+        return self.notification_log.trade_key(trade, source)
 
     def _notification_log_path(self, date_str=None):
-        today_et = date_str or datetime.now(TZ_ET).strftime('%Y-%m-%d')
-        log_dir = os.path.join(_app_dir(), 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, f'notifications_{today_et}.json')
+        return str(self.notification_log.path(date_str))
 
     def _load_notification_keys(self, include_recent_days=False):
-        try:
-            paths = [self._notification_log_path()]
-            if include_recent_days:
-                log_dir = os.path.join(_app_dir(), 'logs')
-                if os.path.isdir(log_dir):
-                    files = sorted(
-                        [os.path.join(log_dir, name) for name in os.listdir(log_dir) if name.startswith('notifications_') and name.endswith('.json')],
-                        reverse=True,
-                    )
-                    paths = list(dict.fromkeys(paths + files[:5]))
-            keys = set()
-            for path in paths:
-                if not os.path.exists(path):
-                    continue
-                with open(path, encoding='utf-8') as f:
-                    data = json.load(f)
-                keys.update(str(item.get('key')) for item in data.get('items', []) if item.get('key'))
-            return keys
-        except Exception:
-            return set()
+        return self.notification_log.load_keys(include_recent_days)
 
     def _load_notification_items(self):
-        try:
-            path = self._notification_log_path()
-            if not os.path.exists(path):
-                return []
-            with open(path, encoding='utf-8') as f:
-                data = json.load(f)
-            return data.get('items', []) if isinstance(data, dict) else []
-        except Exception:
-            return []
+        return self.notification_log.load_items()
 
     def _recent_live_exit_notification_exists(self, opt_symbol, seconds=300):
         """Return True when live exit/partial already notified recently for the same contract."""
-        if not opt_symbol:
-            return False
-        now = datetime.now(TZ_ET)
-        for item in reversed(self._load_notification_items()):
-            if item.get('type') not in ('exit', 'partial'):
-                continue
-            key = str(item.get('key', ''))
-            title = str(item.get('title', ''))
-            if title != opt_symbol and f'|{opt_symbol}|' not in key:
-                continue
-            try:
-                sent_at = datetime.strptime(str(item.get('time', '')), '%Y-%m-%d %H:%M:%S')
-                sent_at = sent_at.replace(tzinfo=TZ_ET)
-            except Exception:
-                return True
-            if 0 <= (now - sent_at).total_seconds() <= seconds:
-                return True
-        return False
+        return self.notification_log.recent_live_exit_exists(opt_symbol, seconds)
 
     def _mark_notification_sent(self, key, msg_type, title=''):
         try:
-            path = self._notification_log_path()
-            data = {'items': []}
-            if os.path.exists(path):
-                with open(path, encoding='utf-8') as f:
-                    data = json.load(f)
-            items = data.setdefault('items', [])
-            if any(str(item.get('key')) == str(key) for item in items):
-                return
-            items.append({
-                'key': key,
-                'type': msg_type,
-                'title': title,
-                'time': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
-            })
-            tmp_path = path + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, path)
+            self.notification_log.mark_sent(key, msg_type, title)
         except Exception as e:
             print(f"  ⚠️ 通知记录写入失败: {e}")
 
@@ -2092,7 +2024,6 @@ class QQQLiveTrader:
                     break
 
             # OAuth 2.0 认证（自动管理 token）
-            import os
             client_id = os.environ.get('LONGBRIDGE_CLIENT_ID')
             if not client_id:
                 raise RuntimeError("缺少 LONGBRIDGE_CLIENT_ID，请在 .env 中配置长桥 OAuth Client ID")
@@ -6657,92 +6588,19 @@ class QQQLiveTrader:
 
     def _save_records_snapshot(self):
         """每次平仓后实时保存当日记录到 records/（不依赖 Gist 同步）"""
-        from zoneinfo import ZoneInfo
-        TZ_ET = ZoneInfo("America/New_York")
-
         if not self.trades_today:
             return
-
         try:
-            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            script_dir = str(_app_dir())
-            records_dir = os.path.join(script_dir, 'records')
-            os.makedirs(records_dir, exist_ok=True)
-            filepath = os.path.join(records_dir, f'{today_et}.json')
-
-            trades = []
-            for t in self.trades_today:
-                if t.get('exit_time') is None:
-                    continue  # 只保存已平仓的交易
-                if not t.get('opt_symbol') or int(t.get('contracts') or 0) <= 0:
-                    continue
-                entry_time = t.get('entry_time')
-                exit_time = t.get('exit_time')
-                if isinstance(entry_time, datetime):
-                    entry_time_str = entry_time.strftime('%H:%M:%S')
-                else:
-                    entry_time_str = str(entry_time)
-                if isinstance(exit_time, datetime):
-                    exit_time_str = exit_time.strftime('%H:%M:%S')
-                else:
-                    exit_time_str = str(exit_time)
-
-                trades.append({
-                    'entry_time': entry_time_str,
-                    'exit_time': exit_time_str,
-                    'dir': t.get('dir', ''),
-                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
-                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
-                    'exit_price': t.get('exit_opt_price') or t.get('exit_price', 0),
-                    'contracts': t.get('cycle_contracts') or t.get('original_contracts') or t.get('contracts', 0),
-                    'pnl_pct': round(t.get('pnl_pct', 0), 2),
-                    'pnl_usd': round(t.get('pnl_usd', 0), 2),
-                    'result': 'win' if t.get('win') else ('lose' if t.get('win') is False else ''),
-                    'reason': t.get('reason', ''),
-                    'exit_reason': t.get('exit_reason', ''),
-                    'opt_symbol': t.get('opt_symbol', ''),
-                    'regime': t.get('regime', 'neutral'),
-                    'atr_at_entry': t.get('atr_at_entry', 0),
-                    'macd_hist_entry': t.get('macd_hist_entry', 0),
-                    'vwap_entry': t.get('vwap_entry', 0),
-                    'sma20_entry': t.get('sma20_entry', 0),
-                    'final_exit_pnl_pct': round(t.get('final_exit_pnl_pct', 0), 2),
-                    'final_exit_pnl_usd': round(t.get('final_exit_pnl_usd', 0), 2),
-                    'partial_exits': list(t.get('partial_exits') or []),
-                    'half_closed': t.get('half_closed', False),
-                    '_source': 'live',
-                })
-
-            if not trades:
+            result = self.trade_ledger.save_live_snapshot(
+                self.trades_today,
+                self._serialize_signal_probes(),
+            )
+            if not result:
                 return
-
-            wins = sum(1 for t in trades if t['result'] == 'win')
-            total_pnl = sum(t['pnl_usd'] for t in trades)
-
-            import json
-            tmp_path = filepath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'date': today_et,
-                    'trades': trades,
-                    'total': len(trades),
-                    'wins': wins,
-                    'win_rate': round(wins / len(trades) * 100, 1) if trades else 0,
-                    'pnl': round(total_pnl, 2),
-                    'signal_probes': self._serialize_signal_probes(),
-                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
-                }, f, ensure_ascii=False, indent=2, default=_json_default)
-            # Windows文件锁定重试机制
-            for attempt in range(5):
-                try:
-                    os.replace(tmp_path, filepath)
-                    break
-                except OSError as e:
-                    if attempt < 4:
-                        time.sleep(0.2)
-                    else:
-                        raise
-            print(f"📋 实时记录已覆盖: {today_et} ({len(trades)}笔, 胜率{wins}/{len(trades)}, ${total_pnl:+,.2f})")
+            print(
+                f"📋 实时记录已覆盖: {result['date']} "
+                f"({result['total']}笔, 胜率{result['wins']}/{result['total']}, ${result['pnl']:+,.2f})"
+            )
         except Exception as e:
             print(f"  ⚠️ 实时记录保存失败: {e}")
 

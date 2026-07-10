@@ -1,46 +1,40 @@
-# 配置文件（包含敏感信息）
+# Sensitive local configuration
 .env
 settings.json
 
-# Python
+# Python environments and generated files
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
-dist/
-build/
-*.spec
-
-# 虚拟环境
-venv/
 .venv/
 .venv-win/
+venv/
 env/
+build/
+dist/
+*.spec
 
-# 日志
-*.log
-logs/
-
-# 运行时数据
+# Runtime state and generated trading data
 state.json
 position_snapshot.json
 longbridge_orders.json
 today.csv
+weekly_sent.flag
+logs/
 data/
 records/
-weekly_sent.flag
+reports/
 
-# 本地备份
+# Local backups
 *.backup
 *_backup
+*.pre_cycle_backup
 
-# IDE
+# Editors and operating systems
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# 系统
 .DS_Store
 Thumbs.db
-/reports

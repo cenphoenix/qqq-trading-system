@@ -2,7 +2,7 @@
 RSI背离引擎 (RSI Divergence)
 价格创新高/新低但RSI未同步，预示趋势反转
 """
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from .base import BaseEngine, Signal, SignalDirection
 
 

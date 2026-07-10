@@ -3,7 +3,7 @@
 收集所有引擎信号，选最强的一个输出
 """
 from typing import Optional, Dict, List
-from .base import BaseEngine, Signal, SignalDirection
+from .base import BaseEngine, Signal
 
 
 class SignalManager:

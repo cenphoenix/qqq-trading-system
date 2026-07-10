@@ -4,10 +4,9 @@
 使用长桥 API，分批拉取，保存为 CSV
 """
 import os
-import sys
 import csv
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # 加载 .env

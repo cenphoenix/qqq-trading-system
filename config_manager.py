@@ -2,7 +2,6 @@
 天才浚浚交易所 - 配置管理模块
 管理 settings.json 的读写，提供默认值和验证
 """
-import os
 import sys
 import json
 import shutil
@@ -493,13 +492,9 @@ class ConfigManager:
 
     @staticmethod
     def has_env_keys():
-        """检查 .env 是否已配置认证（OAuth2: client_id / 旧版: app_key）"""
+        """Return whether the current OAuth2 Client ID is configured."""
         env = ConfigManager.load_env()
-        # OAuth2 (当前)
-        if env.get('LONGBRIDGE_CLIENT_ID'):
-            return True
-        # 旧版 API Key (兼容)
-        return bool(env.get('LONGPORT_APP_KEY') and env.get('LONGPORT_ACCESS_TOKEN'))
+        return bool(env.get('LONGBRIDGE_CLIENT_ID'))
 
 
 # ===== 便捷函数 =====

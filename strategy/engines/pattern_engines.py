@@ -1,5 +1,5 @@
 """Additional v7 signal engines matching the analysis dashboard signal names."""
-from typing import Dict, Optional
+from typing import Optional
 
 from .base import BaseEngine, Signal, SignalDirection
 

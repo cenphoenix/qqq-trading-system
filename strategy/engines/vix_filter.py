@@ -2,7 +2,7 @@
 VIX波动率过滤器
 根据VIX指数水平调整仓位
 """
-from typing import Dict, Optional
+from typing import Dict
 from enum import Enum
 
 
