@@ -150,7 +150,7 @@ class NotificationService:
 
     def notify(self, message: str, msg_type: str = "info", **kwargs: Any) -> bool:
         telegram = self.config.get("telegram", {})
-        print(f"  📨 Telegram推送: enabled={telegram.get('enabled')}, type={msg_type}")
+        print(f"  [Notify] Telegram: enabled={telegram.get('enabled')}, type={msg_type}")
         if self.config.get("feishu", {}).get("enabled", True):
             self.send_feishu(message)
         if telegram.get("enabled", False):

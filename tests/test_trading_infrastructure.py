@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import NotificationLog, TradeLedger
+from trading import NotificationLog, NotificationService, TradeLedger
 
 
 TZ_ET = ZoneInfo("America/New_York")
@@ -62,6 +62,33 @@ class TradeLedgerTests(unittest.TestCase):
             self.assertEqual(payload["trades"][0]["entry_time"], "10:00:00")
             self.assertEqual(payload["trades"][0]["_source"], "live")
             self.assertEqual(payload["signal_probes"], [{"id": 1}])
+
+
+class NotificationServiceTests(unittest.TestCase):
+    def test_disabled_transports_return_false(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = NotificationService(
+                temp_dir,
+                TZ_ET,
+                lambda: {"telegram": {"enabled": False}, "feishu": {"enabled": False}},
+                lambda message, msg_type, **kwargs: message,
+            )
+            self.assertFalse(service.notify("test"))
+
+    def test_repeated_error_is_throttled(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = NotificationService(
+                temp_dir,
+                TZ_ET,
+                lambda: {},
+                lambda message, msg_type, **kwargs: message,
+            )
+            service.notify = lambda message, msg_type="info", **kwargs: sent.append((msg_type, kwargs)) or True
+            self.assertTrue(service.handle_error(TimeoutError("network timeout"), "quotes"))
+            self.assertFalse(service.handle_error(TimeoutError("network timeout"), "quotes"))
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], "network")
 
 
 if __name__ == "__main__":

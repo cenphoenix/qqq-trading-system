@@ -2677,7 +2677,7 @@ class QQQLiveTrader:
             dashboard_v7.update_day_market_regime(self.day_market_regime)
         except Exception:
             pass
-        
+
         # v7 多引擎更新
         et_now = now.astimezone(TZ_ET)
         cur_min_et = et_now.hour * 60 + et_now.minute
@@ -5669,6 +5669,35 @@ class QQQLiveTrader:
 
     def _notify_telegram(self, msg, msg_type='info', **kw):
         """Telegram通知 - 支持HTML格式的消息"""
+        return self.notification_service.send_telegram(msg, msg_type=msg_type, **kw)
+
+    def _format_notification(self, msg, msg_type='info', **kw):
+        """Build notification HTML while business summaries still live on the trader."""
+        formatters = {
+            'entry': self._fmt_entry,
+            'exit': self._fmt_exit,
+            'partial': self._fmt_partial,
+            'alert': self._fmt_alert,
+            'startup': self._fmt_startup,
+            'shutdown': self._fmt_shutdown,
+            'daily_summary': self._fmt_daily_summary,
+            'weekly_summary': self._fmt_weekly_summary,
+            'monthly_summary': self._fmt_monthly_summary,
+            'network': self._fmt_network_alert,
+            'rate_limit': self._fmt_api_rate_limit,
+            'position_anomaly': self._fmt_position_anomaly,
+            'system': self._fmt_system,
+        }
+        formatter = formatters.get(msg_type)
+        if formatter:
+            return formatter(**kw)
+        lines = msg.split('\n')
+        first = lines[0] if lines else msg
+        rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
+        return f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
+
+    def _notify_telegram_legacy(self, msg, msg_type='info', **kw):
+        """Deprecated inline transport kept temporarily for diff review."""
         try:
             import requests
             tg_cfg = self.cfg.get('telegram', {})
@@ -5791,65 +5820,16 @@ class QQQLiveTrader:
 
     def _notify(self, msg, msg_type='info', **kw):
         """统一通知 - 同时发送飞书和Telegram"""
-        tg_cfg = self.cfg.get('telegram', {})
-        print(f"  📨 Telegram推送: enabled={tg_cfg.get('enabled')}, type={msg_type}")
-        sent = False
-        if self.cfg.get('feishu', {}).get('enabled', True):
-            self._notify_feishu(msg)
-        if tg_cfg.get('enabled', False):
-            sent = bool(self._notify_telegram(msg, msg_type=msg_type, **kw))
-        return sent
+        return self.notification_service.notify(msg, msg_type=msg_type, **kw)
 
     def _handle_error_with_notification(self, error, context="", notify_type=None):
         """处理错误并发送通知（避免重复通知）"""
-        error_str = str(error).lower()
-        now = time.time()
-        
-        # 网络错误检测
-        network_keywords = ['connection', 'timeout', 'network', 'socket', 'http', 'ssl', 'dns']
-        is_network_error = any(kw in error_str for kw in network_keywords)
-        
-        # API限流检测
-        rate_limit_keywords = ['429', 'rate limit', 'too many', 'throttle', 'limit']
-        is_rate_limit = any(kw in error_str for kw in rate_limit_keywords)
-        
-        # 避免重复通知（5分钟内相同错误只通知一次）
-        error_key = f"{context}_{type(error).__name__}"
-        if hasattr(self, '_last_error_notify'):
-            if error_key in self._last_error_notify:
-                if now - self._last_error_notify[error_key] < 300:
-                    return  # 5分钟内已通知过
-        else:
-            self._last_error_notify = {}
-        
-        # 发送通知
-        if is_network_error:
-            self._notify(
-                "🌐 网络异常",
-                'network',
-                error_msg=str(error)[:100],
-                retry_count=getattr(self, '_network_retry_count', 0),
-            )
-            self._last_error_notify[error_key] = now
-        elif is_rate_limit:
-            # 从错误信息中提取等待时间
-            wait_seconds = 60  # 默认60秒
-            import re
-            wait_match = re.search(r'(\d+)\s*(?:second|sec|s)', error_str)
-            if wait_match:
-                wait_seconds = int(wait_match.group(1))
-            
-            self._notify(
-                "⏱️ API限流",
-                'rate_limit',
-                api_name=context or "Longbridge API",
-                wait_seconds=wait_seconds,
-            )
-            self._last_error_notify[error_key] = now
-        elif notify_type:
-            # 其他指定类型的通知
-            self._notify(str(error)[:200], notify_type)
-            self._last_error_notify[error_key] = now
+        return self.notification_service.handle_error(
+            error,
+            context=context,
+            notify_type=notify_type,
+            retry_count=getattr(self, '_network_retry_count', 0),
+        )
 
     def _sync_gist(self):
         """实时同步交易记录到Gist（供小程序读取）"""
