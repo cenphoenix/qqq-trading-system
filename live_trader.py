@@ -171,6 +171,7 @@ def _load_config():
             'v62_call_pool_lookback': 3,
             'v62_call_pool_vol_mult': 0.80,
             'v62_call_pool_max_gap': 0.0020,
+            'v62_call_pool_min_gap': 0.0002,
             'v62_call_pool_min_body': 0.00015,
             'v62_call_pool_max_price_pos': 0.85,
             'v62_call_pool_trend_max_price_pos': 0.95,
@@ -198,10 +199,12 @@ def _load_config():
             'profit_reentry_call_required_wins': 1,
             'profit_reentry_put_required_wins': 2,
             'profit_reentry_breakout_buffer_pct': 0.0008,
+            'profit_reentry_min_wait_bars': 2,
             'profit_reentry_retry_fail_lock_min': 20,
             'scout_live_enabled': True,
             'scout_live_pos_mult': 0.15,
             'scout_live_sl_pct': 0.16,
+            'scout_rsi_put_require_reclaim': True,
             'scout_live_signals': ['Kline_Pattern:call', 'RSI_Overbought:put'],
             'kline_call_live_patterns': ['ORB突破', 'BB挤压突破'],
             'kline_max_price_pos': 0.82,
@@ -618,6 +621,7 @@ class QQQLiveTrader:
             'trigger_pnl_pct': float(trigger_pnl),
             'pnl_usd': float(pnl_usd),
             'win_count': win_count,
+            'exit_bar': len(self.one_min_candles),
             'reason': pos.get('exit_reason', ''),
             'opt_symbol': pos.get('opt_symbol', ''),
         }
@@ -642,6 +646,18 @@ class QQQLiveTrader:
         if not until or now >= until:
             self._profit_reentry_cooldowns.pop(direction, None)
             return False
+
+        min_wait_bars = int(self.cfg.get('profit_reentry_min_wait_bars', 2) or 0)
+        exit_bar = int(info.get('exit_bar') or 0)
+        bars_since_exit = len(self.one_min_candles) - exit_bar if exit_bar else min_wait_bars
+        if min_wait_bars > 0 and bars_since_exit < min_wait_bars:
+            remaining_bars = min_wait_bars - bars_since_exit
+            self._last_entry_rejection = (
+                f"盈利后{direction.upper()}重追等待: 还需{remaining_bars}根K线确认"
+            )
+            self._hard_skip_shadow_live = True
+            print(f"  ⏳ {self._last_entry_rejection}")
+            return True
 
         required_wins = int(self.cfg.get(
             'profit_reentry_put_required_wins' if direction == 'put' else 'profit_reentry_call_required_wins',
@@ -711,19 +727,38 @@ class QQQLiveTrader:
             'trigger_pnl_pct': float(trigger_pnl),
             'pnl_usd': float(pos.get('pnl_usd') or 0),
             'win_count': int(meta.get('profit_reentry_win_count') or 1),
+            'exit_bar': len(self.one_min_candles),
             'hard_lock': True,
             'reason': 'profit_reentry_retry_failed',
             'opt_symbol': pos.get('opt_symbol', ''),
         }
         print(f"  ⛔ 盈利后{direction.upper()}破位试错失败，硬冷却{lock_min}分钟")
 
-    def _try_apply_scout_entry(self, sig, signal, direction, rejection_reason):
+    def _try_apply_scout_entry(self, sig, signal, direction, rejection_reason, context=None):
         if not self.cfg.get('scout_live_enabled', True):
             return False
         key = f"{signal}:{direction}"
         allowed = set(self.cfg.get('scout_live_signals') or [])
         if key not in allowed:
             return False
+        if (
+            signal == 'RSI_Overbought'
+            and direction == 'put'
+            and self.cfg.get('scout_rsi_put_require_reclaim', True)
+        ):
+            context = context or self._entry_quality_context(float(sig.get('price') or self.current_price or 0))
+            regime = self.day_market_regime or self._classify_day_market_regime(context)
+            price = float(sig.get('price') or self.current_price or 0)
+            vwap = float(getattr(self.engine, 'vwap', 0) or 0)
+            slope = float(context.get('sma20_slope', 0) or 0)
+            trend_up = isinstance(regime, dict) and regime.get('direction') == 'call'
+            reclaimed = (vwap <= 0 or price < vwap) and slope < 0
+            if trend_up and not reclaimed:
+                self._last_entry_rejection = (
+                    f"趋势上涨RSI PUT仅记录: price=${price:.2f}, vwap=${vwap:.2f}, slope={slope * 100:.3f}%"
+                )
+                print(f"  ⛔ {self._last_entry_rejection}")
+                return False
         if sig.get('shadow_live_order'):
             return False
         sig['scout_live_order'] = True
@@ -1167,7 +1202,7 @@ class QQQLiveTrader:
         disabled_signals = set(self.cfg.get('disabled_entry_signals') or [])
         if signal in disabled_signals:
             self._last_entry_rejection = f'胜率优先禁用信号: {signal}'
-            if self._try_apply_scout_entry(sig, signal, direction, self._last_entry_rejection):
+            if self._try_apply_scout_entry(sig, signal, direction, self._last_entry_rejection, context):
                 disabled_signals = set()
             else:
                 self._hard_skip_shadow_live = True
@@ -1889,6 +1924,7 @@ class QQQLiveTrader:
                 'running': self.running,
                 'current_price': self.current_price,
                 'position': None,
+                'position_checkpoint': None,
                 'trades_today': [],
                 'signal_probes': [],
                 'daily_pnl': self.daily_pnl,
@@ -1919,6 +1955,7 @@ class QQQLiveTrader:
                     'half_closed': self.position.get('half_closed', False),
                     'max_pnl_pct': self.position.get('max_pnl_pct', 0),
                 }
+                state['position_checkpoint'] = dict(self.position)
             for t in self.trades_today:
                 state['trades_today'].append({
                     'time': t.get('time', t.get('entry_time', '')),
@@ -1928,9 +1965,12 @@ class QQQLiveTrader:
                     'exit_price': t.get('exit_opt_price') or t.get('exit_price', 0),
                     'entry_time': t.get('entry_time', ''),
                     'exit_time': t.get('exit_time', ''),
-                    'contracts': t.get('contracts', 0),
+                    'contracts': t.get('cycle_contracts') or t.get('original_contracts') or t.get('contracts', 0),
                     'pnl_pct': round(t.get('pnl_pct', 0), 2),
                     'pnl_usd': round(t.get('pnl_usd', 0), 2),
+                    'final_exit_pnl_pct': round(t.get('final_exit_pnl_pct', 0), 2),
+                    'final_exit_pnl_usd': round(t.get('final_exit_pnl_usd', 0), 2),
+                    'partial_exits': list(t.get('partial_exits') or []),
                     'reason': t.get('reason', ''),
                     'exit_reason': t.get('exit_reason', ''),
                     'result': t.get('result', '') or ('win' if t.get('pnl_pct', 0) > 0 else 'lose' if t.get('pnl_pct', 0) < 0 else ''),
@@ -1999,6 +2039,32 @@ class QQQLiveTrader:
                     os.remove(pos_path)
         except Exception as e:
             print(f"  ⚠️ 状态保存失败: {e}")
+
+    def _restore_position_checkpoint(self, position):
+        """Restore partial-exit bookkeeping after a process restart."""
+        if not position or not os.path.exists(self.state_path):
+            return position
+        try:
+            with open(self.state_path, encoding='utf-8') as f:
+                checkpoint = (json.load(f) or {}).get('position_checkpoint') or {}
+            if str(checkpoint.get('opt_symbol', '')) != str(position.get('opt_symbol', '')):
+                return position
+
+            broker_contracts = int(position.get('contracts') or 0)
+            broker_quantity = int(position.get('quantity') or 0)
+            position.update(checkpoint)
+            position['contracts'] = broker_contracts
+            position['quantity'] = broker_quantity or broker_contracts * self.cfg['contract_multiplier']
+            position['order_status'] = 'restored'
+            position.setdefault('realized_pnl_usd', 0.0)
+            position.setdefault('partial_exits', [])
+            print(
+                f"  Restored position checkpoint: {position.get('opt_symbol')} "
+                f"realized=${float(position.get('realized_pnl_usd') or 0):+.2f}"
+            )
+        except Exception as e:
+            print(f"  Position checkpoint restore skipped: {e}")
+        return position
 
     def _init_api(self):
         """初始化长桥API - 支持WSL和Windows"""
@@ -2244,6 +2310,8 @@ class QQQLiveTrader:
                                             'half_closed_max_pct': 0.0,
                                             'order_status': 'restored',
                                         }
+                                        self._restore_position_checkpoint(self.position)
+                                        self.trades_today.append(self.position.copy())
                                         print(f"  ✅ 已恢复内部持仓状态")
                                         self._subscribe_position_quote(self.position.get('opt_symbol'))
                                         break
@@ -2903,8 +2971,9 @@ class QQQLiveTrader:
         if upper <= 0:
             return
         gap_up = (entry_price - upper) / upper
+        min_gap = float(self.cfg.get('v62_call_pool_min_gap', 0.0002) or 0.0002)
         max_gap = float(self.cfg.get('v62_call_pool_max_gap', 0.0020) or 0.0020)
-        if not (entry_price > upper and gap_up < max_gap):
+        if not (entry_price > upper and min_gap <= gap_up < max_gap):
             return
 
         if float(bar.get('close') or 0) < float(bar.get('open') or 0):
@@ -3980,6 +4049,8 @@ class QQQLiveTrader:
                 'max_pnl_pct': 0,
                 'partial_tiers_done': [],
                 'partial_closed_contracts': 0,
+                'realized_pnl_usd': 0.0,
+                'partial_exits': [],
                 'half_closed': False,  # 动态止盈：是否已平仓一半
                 'half_closed_max_pct': 0.0,  # 半仓后的峰值（用于跟踪止盈）
                 'order_status': 'filled',  # 订单状态
@@ -4770,9 +4841,20 @@ class QQQLiveTrader:
             # 扣除半仓手续费（长桥美股期权：平台费$0.65/张 + 监管费$0.02/张）
             # 半仓平仓只收平仓手续费，不开仓手续费
             option_fee_per_contract = 0.67  # $0.65平台费 + $0.02监管费
-            half_fee = half * option_fee_per_contract  # 只收平仓手续费
+            half_fee = half * option_fee_per_contract * 2  # 已实现部分的开仓+平仓费用
             pnl_usd -= half_fee
             pos['option_fee'] = pos.get('option_fee', 0) + half_fee  # 累计手续费
+            partial_exit = {
+                'time': datetime.now(TZ_ET),
+                'contracts': int(half),
+                'exit_opt_price': float(exit_opt),
+                'pnl_pct': float(pnl_pct),
+                'pnl_usd': float(pnl_usd),
+                'reason': reason,
+                'order_id': str(order_id),
+            }
+            pos.setdefault('partial_exits', []).append(partial_exit)
+            pos['realized_pnl_usd'] = float(pos.get('realized_pnl_usd', 0) or 0) + pnl_usd
             
             self.daily_pnl += pnl_usd
             
@@ -4805,6 +4887,12 @@ class QQQLiveTrader:
             pos['contracts'] -= half
             pos['quantity'] = pos['contracts'] * self.cfg['contract_multiplier']
             pos['partial_closed_contracts'] = int(pos.get('partial_closed_contracts', 0) or 0) + int(half)
+            for trade in reversed(self.trades_today):
+                if str(trade.get('order_id', '')) == str(pos.get('order_id', '')) and trade.get('exit_time') is None:
+                    trade['realized_pnl_usd'] = pos['realized_pnl_usd']
+                    trade['partial_closed_contracts'] = pos['partial_closed_contracts']
+                    trade['partial_exits'] = list(pos.get('partial_exits') or [])
+                    break
             if tier_key:
                 done = list(pos.get('partial_tiers_done') or [])
                 if tier_key not in done:
@@ -5007,13 +5095,21 @@ class QQQLiveTrader:
 
             self.daily_pnl += pnl_usd
             closing_full = close_qty >= requested_qty
+            realized_pnl_usd = float(pos.get('realized_pnl_usd', 0) or 0)
+            cycle_pnl_usd = realized_pnl_usd + pnl_usd
+            original_contracts = int(pos.get('original_contracts') or requested_qty)
+            cycle_cost = original_contracts * self.cfg['contract_multiplier'] * entry_opt
+            cycle_pnl_pct = cycle_pnl_usd / cycle_cost * 100 if cycle_cost > 0 else pnl_pct
             closed_pos = pos.copy()
             closed_pos.update({
-                'win': pnl_pct > 0,
+                'win': cycle_pnl_usd > 0,
                 'exit_opt_price': exit_opt,
                 'exit_time': datetime.now(TZ_ET),
-                'pnl_pct': pnl_pct,
-                'pnl_usd': pnl_usd,
+                'pnl_pct': cycle_pnl_pct,
+                'pnl_usd': cycle_pnl_usd,
+                'final_exit_pnl_pct': pnl_pct,
+                'final_exit_pnl_usd': pnl_usd,
+                'cycle_contracts': original_contracts,
                 'exit_reason': reason,
                 'closed_contracts': close_qty,
             })
@@ -5033,14 +5129,18 @@ class QQQLiveTrader:
                 pos.update(closed_pos)
 
                 # 同步更新 trades_today 中的记录
-                for t in self.trades_today:
-                    if t.get('opt_symbol') == pos['opt_symbol'] and t.get('exit_opt_price') is None:
+                for t in reversed(self.trades_today):
+                    if str(t.get('order_id', '')) == str(pos.get('order_id', '')) and t.get('exit_opt_price') is None:
                         t.update({
-                            'win': closed_pos['win'],
+                            'win': cycle_pnl_usd > 0,
                             'exit_opt_price': exit_opt,
                             'exit_time': closed_pos['exit_time'],
-                            'pnl_pct': pnl_pct,
-                            'pnl_usd': pnl_usd,
+                            'pnl_pct': cycle_pnl_pct,
+                            'pnl_usd': cycle_pnl_usd,
+                            'final_exit_pnl_pct': pnl_pct,
+                            'final_exit_pnl_usd': pnl_usd,
+                            'cycle_contracts': original_contracts,
+                            'partial_exits': list(pos.get('partial_exits') or []),
                             'exit_reason': reason,
                             # 市场上下文（从入场快照继承，已存在position中）
                             'atr_at_entry': pos.get('atr_at_entry', 0),
@@ -6040,12 +6140,15 @@ class QQQLiveTrader:
                     exec_price = float(getattr(o, 'executed_price', 0) or 0)
                     side = '买入' if str(o.side) == 'OrderSide.Buy' else '卖出'
                     orders.append({
+                        'order_id': str(getattr(o, 'order_id', '') or ''),
                         'symbol': str(o.symbol),
                         'side': side,
                         'quantity': int(o.quantity),
                         'executed_qty': exec_qty,
                         'executed_price': exec_price,
                         'status': str(o.status).replace('OrderStatus.', ''),
+                        'submitted_at': str(getattr(o, 'submitted_at', '') or ''),
+                        'updated_at': str(getattr(o, 'updated_at', '') or ''),
                     })
                 except Exception as e:
                     print(f"  ⚠️ 解析订单失败: {e}")
@@ -6591,7 +6694,7 @@ class QQQLiveTrader:
                     # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
                     'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_price': t.get('exit_opt_price') or t.get('exit_price', 0),
-                    'contracts': t.get('contracts', 0),
+                    'contracts': t.get('cycle_contracts') or t.get('original_contracts') or t.get('contracts', 0),
                     'pnl_pct': round(t.get('pnl_pct', 0), 2),
                     'pnl_usd': round(t.get('pnl_usd', 0), 2),
                     'result': 'win' if t.get('win') else ('lose' if t.get('win') is False else ''),
@@ -6603,6 +6706,9 @@ class QQQLiveTrader:
                     'macd_hist_entry': t.get('macd_hist_entry', 0),
                     'vwap_entry': t.get('vwap_entry', 0),
                     'sma20_entry': t.get('sma20_entry', 0),
+                    'final_exit_pnl_pct': round(t.get('final_exit_pnl_pct', 0), 2),
+                    'final_exit_pnl_usd': round(t.get('final_exit_pnl_usd', 0), 2),
+                    'partial_exits': list(t.get('partial_exits') or []),
                     'half_closed': t.get('half_closed', False),
                     '_source': 'live',
                 })
@@ -6710,21 +6816,15 @@ class QQQLiveTrader:
         # broker数据更可靠，作为主源；trades_today补充未平仓的
         seen_symbols = set()
         all_trades = []
-
-        # 先放broker对账数据（完整准确）
-        for bt in broker_trades:
-            key = f"{bt['opt_symbol']}_{bt['contracts']}"
-            if key not in seen_symbols:
-                seen_symbols.add(key)
-                all_trades.append(bt)
+        broker_reconciliation = list(broker_trades)
 
         # 再补internal trades_today中没有被broker覆盖的
         for t in (self.trades_today or []):
             opt_sym = t.get('opt_symbol', '')
-            contracts = t.get('contracts', 0)
+            contracts = t.get('cycle_contracts') or t.get('original_contracts') or t.get('contracts', 0)
             if not opt_sym or int(contracts or 0) <= 0:
                 continue
-            key = f"{opt_sym}_{contracts}"
+            key = str(t.get('order_id') or f"{opt_sym}_{t.get('entry_time', '')}")
             if key not in seen_symbols:
                 # 这笔交易broker没有对账记录，用internal数据
                 entry_time = t.get('entry_time', '')
@@ -6746,10 +6846,13 @@ class QQQLiveTrader:
                     # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
                     'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
                     'exit_price': t.get('exit_opt_price', 0),
-                    'qty': t.get('quantity', 0),
-                    'contracts': t.get('contracts', 0),
+                    'qty': int(contracts) * self.cfg['contract_multiplier'],
+                    'contracts': contracts,
                     'pnl_pct': round(pnl, 2) if pnl else 0,
                     'pnl_usd': round(t.get('pnl_usd', 0), 2),
+                    'final_exit_pnl_pct': round(t.get('final_exit_pnl_pct', 0), 2),
+                    'final_exit_pnl_usd': round(t.get('final_exit_pnl_usd', 0), 2),
+                    'partial_exits': list(t.get('partial_exits') or []),
                     'result': 'win' if t.get('win') else ('lose' if t.get('win') is False else ''),
                     'reason': t.get('reason', ''),
                     'exit_reason': t.get('exit_reason', ''),
@@ -6764,6 +6867,15 @@ class QQQLiveTrader:
                     '_source': 'internal',
                 })
                 seen_symbols.add(key)
+
+        internal_symbols = {str(t.get('opt_symbol', '')) for t in all_trades}
+        for bt in broker_reconciliation:
+            symbol = str(bt.get('opt_symbol', ''))
+            if symbol and symbol not in internal_symbols:
+                recovered = dict(bt)
+                recovered['_source'] = 'broker_unmatched'
+                recovered['reason'] = f"broker_unmatched: {bt.get('reason', '')}"
+                all_trades.append(recovered)
         
         if not all_trades:
             print("📋 今日无交易记录，跳过保存")
@@ -6782,8 +6894,9 @@ class QQQLiveTrader:
             formatted_trades = all_trades
 
             # 从broker对账数据计算总PnL（比self.daily_pnl更准确）
-            broker_pnl = sum(t.get('pnl_usd', 0) for t in formatted_trades if t.get('_source') == 'broker_reconcile')
-            total_pnl = broker_pnl if broker_pnl != 0 else self.daily_pnl
+            broker_pnl = sum(t.get('pnl_usd', 0) for t in broker_reconciliation)
+            internal_pnl = sum(t.get('pnl_usd', 0) for t in formatted_trades)
+            total_pnl = broker_pnl if broker_reconciliation else internal_pnl
 
             # 保存当日文件（用美东日期）
             filepath = os.path.join(records_dir, f'{today}.json')
@@ -6795,6 +6908,9 @@ class QQQLiveTrader:
                     'total': len(formatted_trades),
                     'wins': sum(1 for t in formatted_trades if t.get('result') == 'win'),
                     'pnl': round(total_pnl, 2),
+                    'internal_pnl': round(internal_pnl, 2),
+                    'broker_reconciliation': broker_reconciliation,
+                    'reconciliation_delta': round(total_pnl - internal_pnl, 2),
                     'signal_probes': self._serialize_signal_probes(),
                 }, f, ensure_ascii=False, indent=2, default=_json_default)
             # Windows文件锁定重试机制
@@ -6808,7 +6924,7 @@ class QQQLiveTrader:
                     else:
                         raise
 
-            broker_count = sum(1 for t in formatted_trades if t.get('_source') == 'broker_reconcile')
+            broker_count = len(broker_reconciliation)
             internal_count = sum(1 for t in formatted_trades if t.get('_source') == 'internal')
             print(f"💾 交易记录已保存: {filepath} ({len(formatted_trades)}笔: broker={broker_count}, internal={internal_count})")
             print(f"📊 总盈亏: ${total_pnl:+,.2f}")
