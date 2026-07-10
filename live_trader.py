@@ -58,7 +58,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import NotificationLog, NotificationService, TradeLedger
+from trading import NotificationLog, NotificationService, ReviewSummaryScheduler, TradeLedger
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -280,6 +280,15 @@ class QQQLiveTrader:
         self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
         self.notification_service = NotificationService(
             _app_dir(), TZ_ET, lambda: self.cfg, self._format_notification,
+        )
+        from review_summary import build_review_summary, is_last_weekday_of_month
+        self.review_scheduler = ReviewSummaryScheduler(
+            _app_dir(),
+            TZ_ET,
+            self._notify,
+            build_review_summary,
+            is_last_weekday_of_month,
+            _json_default,
         )
         self.running = False
         self.position = None
@@ -5184,65 +5193,6 @@ class QQQLiveTrader:
             import traceback
             traceback.print_exc()
 
-    def _notify_feishu(self, msg):
-        """飞书通知 - 发送消息到用户"""
-        try:
-            import requests
-            # 读取飞书凭据
-            env_path = os.path.expanduser('~/.hermes/.env')
-            app_id = app_secret = None
-            if os.path.exists(env_path):
-                for line in open(env_path, encoding='utf-8'):
-                    if line.strip().startswith('FEISHU_APP_ID'):
-                        app_id = line.split('=', 1)[1].strip()
-                    elif line.strip().startswith('FEISHU_APP_SECRET'):
-                        app_secret = line.split('=', 1)[1].strip()
-            if not app_id or not app_secret:
-                print(f"  ⚠️ 飞书凭据未配置，写日志: {msg}")
-                log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
-                os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                with open(log_path, 'a', encoding='utf-8') as f:
-                    f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
-                return
-
-            # 获取 token
-            token_resp = requests.post(
-                'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-                json={'app_id': app_id, 'app_secret': app_secret},
-                timeout=10
-            )
-            token_data = token_resp.json()
-            if token_data.get('code') != 0:
-                print(f"  ⚠️ 飞书token获取失败: {token_data}")
-                return
-            token = token_data['tenant_access_token']
-
-            # 发送消息给用户
-            user_open_id = self.cfg.get('feishu', {}).get('open_id', '')
-            payload = {
-                'receive_id': user_open_id,
-                'msg_type': 'text',
-                'content': json.dumps({'text': f"[QQQ Trader]\n{msg}"})
-            }
-            resp = requests.post(
-                'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id',
-                headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-                json=payload,
-                timeout=10
-            )
-            result = resp.json()
-            if result.get('code') == 0:
-                print(f"  ✅ 飞书推送成功")
-            else:
-                print(f"  ⚠️ 飞书推送失败: {result}")
-        except Exception as e:
-            import traceback
-            print(f"  ⚠️ 飞书通知异常: {e}")
-            traceback.print_exc()
-            log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
 
     def _fmt_day_market(self, source=None):
         regime = {}
@@ -5611,61 +5561,31 @@ class QQQLiveTrader:
             return f"<b>月度复盘生成失败</b>\n<code>{str(e)[:180]}</code>"
 
     def _summary_flags_path(self):
-        records_dir = os.path.join(_app_dir(), 'records')
-        os.makedirs(records_dir, exist_ok=True)
-        return os.path.join(records_dir, 'review_summary_sent.json')
+        return str(self.review_scheduler.flags_path)
 
     def _load_summary_flags(self):
-        try:
-            path = self._summary_flags_path()
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8-sig') as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            pass
-        return {}
+        return self.review_scheduler.load_flags()
 
     def _save_summary_flags(self, flags):
         try:
-            path = self._summary_flags_path()
-            tmp = path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(flags, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp, path)
+            self.review_scheduler.save_flags(flags)
         except Exception as e:
             print(f"⚠️ 复盘推送标记保存失败: {e}")
 
     def _send_period_summary_once(self, period, msg_type):
         try:
-            from review_summary import build_review_summary
-            summary = build_review_summary(period, datetime.now(TZ_ET).strftime('%Y-%m-%d'))
-            key = f"{period}:{summary.get('start_date')}:{summary.get('end_date')}"
-            flags = self._load_summary_flags()
-            if flags.get(key):
-                return False
-            sent = self._notify(f"📊 {summary.get('title', '复盘摘要')}", msg_type=msg_type)
-            if sent:
-                flags[key] = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
-                self._save_summary_flags(flags)
-            return sent
+            return self.review_scheduler.send_once(period, msg_type)
         except Exception as e:
             print(f"⚠️ {period}复盘推送失败: {e}")
             return False
 
     def _check_and_send_weekly_summary(self):
         """检查是否需要发送周报/月报（收盘后）"""
-        now = datetime.now(TZ_ET)
-        if not (16 <= now.hour < 17 and now.minute >= 5):
-            return
-        if now.weekday() == 4:
-            self._send_period_summary_once('week', 'weekly_summary')
         try:
-            from review_summary import is_last_weekday_of_month
-            if now.weekday() < 5 and is_last_weekday_of_month(now.date()):
-                self._send_period_summary_once('month', 'monthly_summary')
+            return self.review_scheduler.check()
         except Exception as e:
-            print(f"⚠️ 月报日期检查失败: {e}")
+            print(f"⚠️ 周报/月报日期检查失败: {e}")
+            return []
 
     def _notify_telegram(self, msg, msg_type='info', **kw):
         """Telegram通知 - 支持HTML格式的消息"""
@@ -5696,127 +5616,6 @@ class QQQLiveTrader:
         rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
         return f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
 
-    def _notify_telegram_legacy(self, msg, msg_type='info', **kw):
-        """Deprecated inline transport kept temporarily for diff review."""
-        try:
-            import requests
-            tg_cfg = self.cfg.get('telegram', {})
-            bot_token = tg_cfg.get('bot_token', '')
-            chat_id = tg_cfg.get('chat_id', '')
-            if not bot_token or not chat_id:
-                print(f"  ⚠️ Telegram凭据未配置，写日志: {msg}")
-                log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
-                os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                with open(log_path, 'a', encoding='utf-8') as f:
-                    f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
-                return False
-
-            # 根据消息类型生成格式化文本
-            if msg_type == 'entry' and kw:
-                text = self._fmt_entry(**kw)
-            elif msg_type == 'exit' and kw:
-                text = self._fmt_exit(**kw)
-            elif msg_type == 'partial' and kw:
-                text = self._fmt_partial(**kw)
-            elif msg_type == 'alert' and kw:
-                text = self._fmt_alert(**kw)
-            elif msg_type == 'startup':
-                text = self._fmt_startup()
-            elif msg_type == 'shutdown':
-                text = self._fmt_shutdown(**kw)
-            elif msg_type == 'daily_summary':
-                text = self._fmt_daily_summary()
-            elif msg_type == 'weekly_summary':
-                text = self._fmt_weekly_summary()
-            elif msg_type == 'monthly_summary':
-                text = self._fmt_monthly_summary()
-            elif msg_type == 'network' and kw:
-                text = self._fmt_network_alert(**kw)
-            elif msg_type == 'rate_limit' and kw:
-                text = self._fmt_api_rate_limit(**kw)
-            elif msg_type == 'position_anomaly' and kw:
-                text = self._fmt_position_anomaly(**kw)
-            elif msg_type == 'system' and kw:
-                text = self._fmt_system(**kw)
-            else:
-                # 通用格式：用分隔线和HTML加粗标题
-                lines = msg.split('\n')
-                first = lines[0] if lines else msg
-                rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
-                if 'cancel' in first.lower():
-                    text = f"<b>{first}</b>\n───────────\n{rest}"
-                else:
-                    text = f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
-
-            # 添加页脚
-            footer = f"\n───────────\n<code>QQQ 0DTE v7</code>"
-            full_text = text + footer
-
-            # 代理配置
-            proxies = {}
-            proxy_url = tg_cfg.get('proxy', '')
-            if proxy_url:
-                proxies = {'https': proxy_url, 'http': proxy_url}
-
-            api_url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-
-            def _post_telegram(payload, label):
-                last_error = None
-                for attempt in range(3):
-                    try:
-                        return requests.post(
-                            api_url,
-                            json=payload,
-                            timeout=15,
-                            proxies=proxies,
-                        )
-                    except requests.RequestException as err:
-                        last_error = err
-                        safe_err = str(err).replace(bot_token, '***TOKEN***')
-                        print(f"  ⚠️ Telegram{label}网络异常({attempt + 1}/3): {safe_err[:220]}")
-                        if attempt < 2:
-                            time.sleep(2 * (attempt + 1))
-                raise last_error
-
-            resp = _post_telegram(
-                {'chat_id': chat_id, 'text': full_text, 'parse_mode': 'HTML'},
-                '推送',
-            )
-            result = resp.json()
-            if result.get('ok'):
-                print(f"  ✅ Telegram推送成功")
-                return True
-            else:
-                print(f"  ⚠️ Telegram推送失败: {result}")
-                # 如果HTML解析失败，回退纯文本
-                if 'can\'t parse' in str(result):
-                    resp2 = _post_telegram(
-                        {'chat_id': chat_id, 'text': f"[QQQ Trader]\n{msg}"},
-                        '纯文本回退',
-                    )
-                    try:
-                        fallback = resp2.json()
-                        if fallback.get('ok'):
-                            print(f"  ✅ Telegram纯文本回退成功")
-                            return True
-                        print(f"  ⚠️ Telegram纯文本回退失败: {fallback}")
-                    except Exception:
-                        print(f"  ⚠️ Telegram纯文本回退响应异常: {resp2.text[:200]}")
-                return False
-        except Exception as e:
-            safe_err = str(e)
-            try:
-                bot_token = self.cfg.get('telegram', {}).get('bot_token', '')
-                if bot_token:
-                    safe_err = safe_err.replace(bot_token, '***TOKEN***')
-            except Exception:
-                pass
-            print(f"  ⚠️ Telegram通知失败，已记录到本地，后续会重试: {safe_err[:260]}")
-            log_path = os.path.join(_app_dir(), 'logs', 'trade_log.txt')
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(f'[{datetime.now(TZ_ET):%H:%M}] {msg}\n')
-            return False
 
     def _notify(self, msg, msg_type='info', **kw):
         """统一通知 - 同时发送飞书和Telegram"""

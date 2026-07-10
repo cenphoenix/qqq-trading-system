@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import NotificationLog, NotificationService, TradeLedger
+from trading import NotificationLog, NotificationService, ReviewSummaryScheduler, TradeLedger
 
 
 TZ_ET = ZoneInfo("America/New_York")
@@ -89,6 +89,49 @@ class NotificationServiceTests(unittest.TestCase):
             self.assertFalse(service.handle_error(TimeoutError("network timeout"), "quotes"))
             self.assertEqual(len(sent), 1)
             self.assertEqual(sent[0][0], "network")
+
+
+class ReviewSummarySchedulerTests(unittest.TestCase):
+    def test_friday_close_sends_weekly_summary_once(self):
+        notifications = []
+
+        def notify(message, msg_type="info", **kwargs):
+            notifications.append((message, msg_type))
+            return True
+
+        def build(period, date_str):
+            return {
+                "title": f"{period} review",
+                "start_date": "2026-07-06",
+                "end_date": "2026-07-10",
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scheduler = ReviewSummaryScheduler(
+                temp_dir, TZ_ET, notify, build, lambda date: False,
+            )
+            friday_close = datetime(2026, 7, 10, 16, 5, tzinfo=TZ_ET)
+            self.assertEqual(scheduler.check(friday_close), ["week"])
+            self.assertEqual(scheduler.check(friday_close), [])
+            self.assertEqual(len(notifications), 1)
+
+    def test_last_weekday_can_send_week_and_month(self):
+        notifications = []
+
+        def notify(message, msg_type="info", **kwargs):
+            notifications.append(msg_type)
+            return True
+
+        def build(period, date_str):
+            return {"title": period, "start_date": period, "end_date": date_str}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scheduler = ReviewSummaryScheduler(
+                temp_dir, TZ_ET, notify, build, lambda date: True,
+            )
+            friday_close = datetime(2026, 7, 31, 16, 10, tzinfo=TZ_ET)
+            self.assertEqual(scheduler.check(friday_close), ["week", "month"])
+            self.assertEqual(notifications, ["weekly_summary", "monthly_summary"])
 
 
 if __name__ == "__main__":
