@@ -44,7 +44,7 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 # ===== 策略模块 =====
-from strategy import get_option_symbol, FilterEngine
+from strategy import get_option_symbol, is_option_expiring_on, FilterEngine
 from strategy.entry_policy import EntryPolicy
 from strategy.price_action import PriceActionFilter
 from signal_names import display_signal_name
@@ -59,7 +59,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter
+from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter, TradingSessionPolicy
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -278,6 +278,7 @@ class QQQLiveTrader:
     def __init__(self, config=None):
         self.cfg = config or CONFIG
         self.notification_log = NotificationLog(_app_dir(), TZ_ET, _json_default)
+        self.order_audit_log = OrderAuditLog(_app_dir(), TZ_ET)
         self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
         self.signal_probe_store = SignalProbeStore(_app_dir(), TZ_ET, _json_default)
         self.runtime_state_store = RuntimeStateStore(_app_dir(), _json_default)
@@ -1764,14 +1765,10 @@ class QQQLiveTrader:
         """生成交易通知指纹，避免同一笔平仓重复通知，也避免同合约多次交易被误去重。"""
         return self.notification_log.trade_key(trade, source)
 
-    def _notification_log_path(self, date_str=None):
-        return str(self.notification_log.path(date_str))
 
     def _load_notification_keys(self, include_recent_days=False):
         return self.notification_log.load_keys(include_recent_days)
 
-    def _load_notification_items(self):
-        return self.notification_log.load_items()
 
     def _recent_live_exit_notification_exists(self, opt_symbol, seconds=300):
         """Return True when live exit/partial already notified recently for the same contract."""
@@ -1984,31 +1981,6 @@ class QQQLiveTrader:
         except Exception as e:
             print(f"⚠️ 取消报价订阅失败 {symbols}: {e}")
 
-    def _check_tiered_loss_circuit(self) -> tuple:
-        """P0 #7 阶梯式日亏损熔断 — 返回 (level, msg)
-        level=0: 正常交易
-        level=1: 警告 — 仓位减半
-        level=2: 保守 — 仅trending信号 + 仓位降至25%
-        level=3: 熔断 — 停止所有新交易
-        """
-        loss_pct = abs(self.daily_pnl) / max(self.actual_capital, self.cfg['capital']) * 100 if self.daily_pnl < 0 else 0
-        limit = self.cfg.get('daily_limit', 12)
-        warn_pct = self.cfg.get('daily_limit_warning_pct', 5)
-        cons_pct = self.cfg.get('daily_limit_conservative_pct', 8)
-
-        if loss_pct >= limit:
-            return 3, f'熔断({loss_pct:.1f}%>={limit:.0f}%)'
-        if loss_pct >= cons_pct:
-            if not self._loss_circuit_conservative_fired:
-                self._loss_circuit_conservative_fired = True
-                self._notify(f"日亏损保守级: {loss_pct:.1f}% (>{cons_pct:.0f}%) 仓位降至25%, 只做trending")
-            return 2, f'保守({loss_pct:.1f}%>={cons_pct:.0f}%)'
-        if loss_pct >= warn_pct:
-            if not self._loss_circuit_warning_fired:
-                self._loss_circuit_warning_fired = True
-                self._notify(f"日亏损警告级: {loss_pct:.1f}% (>{warn_pct:.0f}%) 仓位减半")
-            return 1, f'警告({loss_pct:.1f}%>={warn_pct:.0f}%)'
-        return 0, ''
 
     def _subscribe_position_quote(self, opt_symbol):
         """持仓建立/恢复后订阅期权报价，价格变动即触发风控"""
@@ -2379,22 +2351,7 @@ class QQQLiveTrader:
 
     def _is_today_expiry(self, opt_symbol: str) -> bool:
         """检查期权合约是否是当天到期"""
-        try:
-            # 期权代码格式: QQQ{YYMMDD}{C/P}{strike}.US
-            # 例如: QQQ260528C721000.US
-            if not opt_symbol or not opt_symbol.startswith('QQQ'):
-                return False
-            # 提取YYMMDD部分 (位置3-8)
-            date_str = opt_symbol[3:9]
-            # 转换为完整日期
-            year = 2000 + int(date_str[:2])
-            month = int(date_str[2:4])
-            day = int(date_str[4:6])
-            expiry_date = datetime(year, month, day).strftime('%Y-%m-%d')
-            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            return expiry_date == today
-        except (ValueError, TypeError, IndexError):
-            return False
+        return is_option_expiring_on(opt_symbol, datetime.now(TZ_ET).date())
 
     def stop(self, close_on_exit=True):
         """停止交易系统"""
@@ -3794,18 +3751,10 @@ class QQQLiveTrader:
     def _log_order(self, order_id, opt_symbol, direction, contracts, status, executed_qty=0, executed_price=0):
         """记录订单日志（用于追踪所有提交的订单）"""
         try:
-            log_dir = os.path.join(_app_dir(), 'logs')
-            os.makedirs(log_dir, exist_ok=True)
-            today = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            log_file = os.path.join(log_dir, f'orders_{today}.log')
-            
-            timestamp = datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S')
-            log_entry = f"{timestamp} | {order_id} | {opt_symbol} | {direction} | {contracts}张 | {status}"
-            if executed_qty > 0:
-                log_entry += f" | 成交:{executed_qty}张 @{executed_price}"
-            
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(log_entry + '\n')
+            self.order_audit_log.append(
+                order_id, opt_symbol, direction, contracts, status,
+                executed_qty, executed_price,
+            )
         except Exception as e:
             print(f"  ⚠️ 订单日志写入失败: {e}")
 
@@ -4481,7 +4430,7 @@ class QQQLiveTrader:
                 self._mark_notification_sent(self._trade_notify_key(partial_key_trade, 'partial'), 'partial', pos.get('opt_symbol', ''))
 
             self._save_state()
-            self._sync_gist()  # 实时同步到小程序
+            self._save_daily_records()  # 实时保存并同步到小程序
 
         except Exception as e:
             print(f"  ❌ 部分平仓失败: {e}")
@@ -4715,7 +4664,7 @@ class QQQLiveTrader:
             self._save_records_snapshot()
 
             self._save_state()
-            self._sync_gist()  # 实时同步到小程序
+            self._save_daily_records()  # 实时保存并同步到小程序
 
         except Exception as e:
             print(f"  ❌ 平仓失败: {e}（持仓保留，下次重试）")
@@ -4724,24 +4673,9 @@ class QQQLiveTrader:
 
 
 
-    def _summary_flags_path(self):
-        return str(self.review_scheduler.flags_path)
 
-    def _load_summary_flags(self):
-        return self.review_scheduler.load_flags()
 
-    def _save_summary_flags(self, flags):
-        try:
-            self.review_scheduler.save_flags(flags)
-        except Exception as e:
-            print(f"⚠️ 复盘推送标记保存失败: {e}")
 
-    def _send_period_summary_once(self, period, msg_type):
-        try:
-            return self.review_scheduler.send_once(period, msg_type)
-        except Exception as e:
-            print(f"⚠️ {period}复盘推送失败: {e}")
-            return False
 
     def _check_and_send_weekly_summary(self):
         """检查是否需要发送周报/月报（收盘后）"""
@@ -4751,9 +4685,6 @@ class QQQLiveTrader:
             print(f"⚠️ 周报/月报日期检查失败: {e}")
             return []
 
-    def _notify_telegram(self, msg, msg_type='info', **kw):
-        """Telegram通知 - 支持HTML格式的消息"""
-        return self.notification_service.send_telegram(msg, msg_type=msg_type, **kw)
 
 
 
@@ -4770,30 +4701,13 @@ class QQQLiveTrader:
             retry_count=getattr(self, '_network_retry_count', 0),
         )
 
-    def _sync_gist(self):
-        """实时同步交易记录到Gist（供小程序读取）"""
-        try:
-            # 先保存当日记录
-            self._save_daily_records()
-            # 同步到Gist（打包后直接import调用，避免subprocess无法启动子进程）
-            from update_gist import main as sync_gist_main
-            sync_gist_main()
-            print("  📤 Gist同步完成")
-        except Exception as e:
-            print(f"  ⚠️ Gist同步失败: {e}")
-
     def _effective_end_time(self):
         """根据当日盈亏返回动态交易结束时间"""
-        dyn_end = self.cfg['end_time']
-        if self.daily_pnl <= 0:
-            dyn_end = self.cfg.get('extended_end_time', '15:00')
-        return dyn_end
+        return TradingSessionPolicy.effective_end_time(self.cfg, self.daily_pnl)
 
     def _is_extension_window(self, cur_min):
         """判断是否在延长时间窗口内(14:30-15:00)"""
-        e_h, e_m = map(int, self.cfg['end_time'].split(':'))
-        ee_h, ee_m = map(int, self.cfg.get('extended_end_time', '15:00').split(':'))
-        return e_h * 60 + e_m <= cur_min < ee_h * 60 + ee_m
+        return TradingSessionPolicy.is_extension_window(self.cfg, cur_min)
 
     def _print_summary(self):
         """打印今日总结"""

@@ -108,3 +108,14 @@ def get_option_symbol(stock_price: float, direction: str, offset: float = 2.0) -
     expiry = expiry_date.strftime('%y%m%d')
     symbol = f"QQQ{expiry}{option_type}{strike * 1000:06d}.US"
     return symbol
+
+
+def is_option_expiring_on(symbol: str, target_date: date) -> bool:
+    """Return whether a standard QQQ option symbol expires on target_date."""
+    if not symbol or not symbol.startswith("QQQ") or len(symbol) < 9:
+        return False
+    try:
+        expiry = datetime.strptime(symbol[3:9], "%y%m%d").date()
+    except (TypeError, ValueError):
+        return False
+    return expiry == target_date

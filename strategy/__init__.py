@@ -1,7 +1,7 @@
 """
 QQQ 0DTE 交易策略模块
 """
-from .options import get_option_symbol
+from .options import get_option_symbol, is_option_expiring_on
 from .filters import FilterEngine
 
 # v7 engines
@@ -26,6 +26,7 @@ from .engines import (
 __all__ = [
     # v6.5
     'get_option_symbol',
+    'is_option_expiring_on',
     'FilterEngine',
     # v7
     'SignalManager',

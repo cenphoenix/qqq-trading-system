@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger
+from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TradingSessionPolicy
 from strategy.entry_policy import EntryPolicy
 
 
@@ -274,6 +274,14 @@ class LifecycleControllerTests(unittest.TestCase):
         self.assertEqual(lifecycle.state, LifecycleState.STOPPED)
 
 
+class TradingSessionPolicyTests(unittest.TestCase):
+    def test_loss_day_uses_extension_window(self):
+        config = {"end_time": "14:30", "extended_end_time": "15:00"}
+        self.assertEqual(TradingSessionPolicy.effective_end_time(config, -1), "15:00")
+        self.assertTrue(TradingSessionPolicy.is_extension_window(config, 14 * 60 + 45))
+        self.assertFalse(TradingSessionPolicy.is_extension_window(config, 15 * 60))
+
+
 class NotificationLogTests(unittest.TestCase):
     def test_trade_key_distinguishes_repeat_contract_exits(self):
         base = {
@@ -295,6 +303,17 @@ class NotificationLogTests(unittest.TestCase):
             self.assertFalse(log.mark_sent("exit|one", "exit", "QQQ option"))
             self.assertEqual(log.load_keys(), {"exit|one"})
             self.assertEqual(len(log.load_items()), 1)
+
+
+class OrderAuditLogTests(unittest.TestCase):
+    def test_filled_order_is_appended_to_daily_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = OrderAuditLog(temp_dir, TZ_ET).append(
+                "42", "QQQ260710C500000.US", "call", 2, "filled", 2, 1.25,
+            )
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("42 | QQQ260710C500000.US | call | 2张 | filled", text)
+        self.assertIn("成交:2张 @1.25", text)
 
 
 class TradeLedgerTests(unittest.TestCase):
