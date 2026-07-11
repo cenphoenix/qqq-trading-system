@@ -18,6 +18,7 @@ dist/
 # Runtime state and generated trading data
 state.json
 position_snapshot.json
+runtime_orders.json
 longbridge_orders.json
 today.csv
 weekly_sent.flag

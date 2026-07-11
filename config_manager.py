@@ -7,6 +7,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
+from trading.config_safety import validate_config
 
 # 获取exe所在目录（打包后）或脚本所在目录（开发时）
 def get_base_dir():
@@ -395,6 +396,9 @@ class ConfigManager:
 
     def save(self):
         """保存配置到 settings.json"""
+        errors = validate_config(self._config)
+        if errors:
+            raise ValueError("Invalid configuration: " + "; ".join(errors))
         self._config['_last_modified'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         # 原子写入

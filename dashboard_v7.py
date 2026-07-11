@@ -455,6 +455,7 @@ def _coerce_config_value(path: str, value: Any):
 
 
 def _save_config_patch(updates: Dict[str, Any]) -> Dict:
+    from trading.config_safety import validate_config
     if not isinstance(updates, dict):
         raise ValueError("updates must be an object")
     with open(SETTINGS_PATH, "r", encoding="utf-8-sig") as f:
@@ -467,6 +468,9 @@ def _save_config_patch(updates: Dict[str, Any]) -> Dict:
         cfg.setdefault(group, {})
         cfg[group][key] = _coerce_config_value(path, raw_value)
         applied[path] = cfg[group][key]
+    validation_errors = validate_config(cfg)
+    if validation_errors:
+        raise ValueError("; ".join(validation_errors))
     cfg["_last_modified"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     backup_dir = os.path.join(APP_DIR, "config_backups")
     os.makedirs(backup_dir, exist_ok=True)
@@ -684,6 +688,7 @@ class DashboardState:
         self.connected: bool = False
         self.events: List[Dict] = []
         self.filter_status: Dict = {}
+        self.health: Dict = {}
         self.start_time: datetime = datetime.now()
         
     def to_dict(self) -> Dict:
@@ -826,6 +831,7 @@ class DashboardState:
             
             # Filters
             'filters': self.filter_status,
+            'health': self.health,
             
             # Events
             'events': self.events[-30:],
@@ -883,6 +889,12 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/api/state")
 async def get_state():
     return state.to_dict()
+
+
+@app.get("/api/health")
+async def get_health():
+    data = state.to_dict()
+    return _json_safe(data.get("health") or {"status": "unknown", "issues": ["engine_not_connected"]})
 
 
 @app.get("/api/candles")
@@ -1001,6 +1013,9 @@ def update_candle_count(count: int):
 def update_filter_status(filters: Dict):
     state.filter_status = filters
 
+def update_health(health: Dict):
+    state.health = health or {}
+
 def add_event(msg: str, tag: str = 'info'):
     ts = datetime.now().strftime('%H:%M:%S')
     state.events.append({'time': ts, 'msg': msg, 'tag': tag})
@@ -1014,7 +1029,7 @@ def set_connected(connected: bool):
     state.connected = connected
 
 
-def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
+def run_dashboard(host: str = "127.0.0.1", port: int = 8080):
     import importlib.util
     import socket
     import subprocess
@@ -1107,7 +1122,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);min-height:1
 </head>
 <body>
 <div class="wrap">
-  <div class="status-bar"><span><span class="status-dot dot-gray" id="dot-engine"></span><span data-i18n="engine">Engine</span>: <b id="s-engine">--</b></span><span><span class="status-dot dot-gray" id="dot-conn"></span><span data-i18n="connection">Connection</span>: <b id="s-conn">--</b></span><span style="flex:1"></span><label class="lang-switch"><span data-i18n="language">Language</span><select id="lang-select"><option value="zh">Chinese</option><option value="en">English</option></select></label><span id="clock" style="font-family:var(--mono)"></span></div>
+  <div class="status-bar"><span><span class="status-dot dot-gray" id="dot-engine"></span><span data-i18n="engine">Engine</span>: <b id="s-engine">--</b></span><span><span class="status-dot dot-gray" id="dot-conn"></span><span data-i18n="connection">Connection</span>: <b id="s-conn">--</b></span><span id="health-wrap"><span class="status-dot dot-gray" id="dot-health"></span><b id="s-health">--</b></span><span style="flex:1"></span><label class="lang-switch"><span data-i18n="language">Language</span><select id="lang-select"><option value="zh">Chinese</option><option value="en">English</option></select></label><span id="clock" style="font-family:var(--mono)"></span></div>
   <div class="grid-4">
     <div class="card"><div class="card-title" data-i18n="daily_overview">Daily Overview</div><div class="kv"><span class="kv-label" data-i18n="today_pnl">Today's P&L</span><span class="kv-val" id="v-pnl">--</span></div><div class="kv"><span class="kv-label" data-i18n="trade_count">Trades</span><span class="kv-val" id="v-trades">--</span></div><div class="kv"><span class="kv-label" data-i18n="win_rate">Win Rate</span><span class="kv-val" id="v-wr">--</span></div><div class="kv"><span class="kv-label" data-i18n="holding">Position</span><span class="kv-val" id="v-hold">--</span></div></div>
     <div class="card"><div class="card-title" data-i18n="market">Market</div><div class="kv"><span class="kv-label">QQQ</span><span class="kv-val" id="v-qqq">--</span></div><div class="kv"><span class="kv-label">VIX</span><span class="kv-val" id="v-vix">--</span></div><div class="kv"><span class="kv-label" data-i18n="vix_regime">VIX Regime</span><span class="kv-val" id="v-vix-regime">--</span></div><div class="kv"><span class="kv-label" data-i18n="day_market">Day Market</span><span class="kv-val" id="v-day-regime">--</span></div></div>
@@ -1262,6 +1277,8 @@ const renderQuantDrawerLevelsBase=renderQuantDrawer;renderQuantDrawer=function()
 const initLevelsStyleBase=initHighPriorityStyles;initHighPriorityStyles=function(){initLevelsStyleBase();if($('dashboard-level-style'))return;const style=document.createElement('style');style.id='dashboard-level-style';style.textContent='.levels-editor{width:100%;min-height:96px;resize:vertical;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:8px;font-family:var(--mono);font-size:12px;line-height:1.5}';document.head.appendChild(style)}
 loadChartPrefs();
 connect();setupControls();loadI18n();loadSymbols();loadConfig();loadOrders();loadCandles();loadReviewSummary();setRefreshTimer();setInterval(loadOrders,30000);window.addEventListener('resize',()=>drawChart());
+async function refreshHealthBadge(){try{const h=await (await fetch('/api/health')).json(),status=h.status||'unknown',dot=$('dot-health'),label=$('s-health'),wrap=$('health-wrap');if(label)label.textContent=status.toUpperCase();if(dot)dot.className='status-dot '+(status==='healthy'?'dot-green':status==='degraded'?'dot-red':'dot-gray');if(wrap){const ages=h.ages||{},rejects=(h.top_rejections||[]).slice(0,3).map(x=>`${x.reason} (${x.count})`).join('; ');wrap.title=`Quote: ${ages.quote_seconds??'--'}s | Candle: ${ages.candle_seconds??'--'}s | Order sync: ${ages.order_sync_seconds??'--'}s${rejects?' | Rejections: '+rejects:''}`}}catch(e){}}
+refreshHealthBadge();setInterval(refreshHealthBadge,5000);
 </script>
 </body>
 </html>'''

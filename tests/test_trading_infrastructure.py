@@ -1,11 +1,12 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, PositionRiskPolicy, PositionSizer, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TradingSessionPolicy
+from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, PositionRiskPolicy, PositionSizer, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeHealth, RuntimeStateStore, SignalProbeStore, TradeLedger, TradingSessionPolicy, redact_config, resolve_secret, validate_config
 from strategy.entry_policy import EntryPolicy
 
 
@@ -589,6 +590,70 @@ class RuntimeStateStoreTests(unittest.TestCase):
         self.assertEqual(restored["partial_exits"], [{"tier": "30"}])
         self.assertEqual(restored["realized_pnl_usd"], 40)
         self.assertEqual(restored["order_status"], "restored")
+
+
+class ConfigSafetyTests(unittest.TestCase):
+    def test_sensitive_values_are_redacted_recursively(self):
+        safe = redact_config({
+            "telegram": {"bot_token": "123:secret", "chat_id": "42"},
+            "nested": [{"api_key": "key"}],
+        })
+        self.assertEqual(safe["telegram"]["bot_token"], "***REDACTED***")
+        self.assertEqual(safe["telegram"]["chat_id"], "42")
+        self.assertEqual(safe["nested"][0]["api_key"], "***REDACTED***")
+
+    def test_environment_secret_takes_precedence(self):
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "env-token"}):
+            value = resolve_secret(
+                {"telegram": {"bot_token": "file-token"}},
+                "telegram", "bot_token", "TELEGRAM_BOT_TOKEN",
+            )
+        self.assertEqual(value, "env-token")
+
+    def test_cross_field_validation_rejects_dangerous_config(self):
+        errors = validate_config({
+            "trading": {"start_time": "15:30", "end_time": "09:30"},
+            "risk": {
+                "order_pct": 80, "put_order_pct": 8, "daily_limit": 0,
+                "max_contracts_per_trade": 0,
+                "timeout_stage1_bars": 20, "timeout_stage2_bars": 10,
+                "timeout_stage3_bars": 5,
+                "profit_take_tiers": [
+                    {"profit_pct": 60, "close_pct": 0.7},
+                    {"profit_pct": 30, "close_pct": 0.7},
+                ],
+            },
+        })
+        self.assertGreaterEqual(len(errors), 6)
+
+
+class RuntimeHealthTests(unittest.TestCase):
+    def test_health_tracks_rejections_and_failures(self):
+        health = RuntimeHealth(TZ_ET)
+        health.beat("loop")
+        health.beat("order_sync", ok=False, detail="timeout")
+        health.reject("range high call blocked")
+        health.reject("range high call blocked")
+        snapshot = health.snapshot(running=True, market_open=False)
+        self.assertEqual(snapshot["status"], "degraded")
+        self.assertIn("order_sync_failed", snapshot["issues"])
+        self.assertEqual(snapshot["top_rejections"][0]["count"], 2)
+
+    def test_closed_market_does_not_require_quotes(self):
+        health = RuntimeHealth(TZ_ET)
+        health.beat("loop")
+        snapshot = health.snapshot(running=True, market_open=False)
+        self.assertEqual(snapshot["status"], "healthy")
+        self.assertNotIn("market_quote_stale", snapshot["issues"])
+
+    def test_open_market_reports_missing_data_after_startup_grace(self):
+        health = RuntimeHealth(TZ_ET)
+        health.started_at -= timedelta(minutes=5)
+        health.beat("loop")
+        snapshot = health.snapshot(running=True, market_open=True)
+        self.assertEqual(snapshot["status"], "degraded")
+        self.assertIn("market_quote_stale", snapshot["issues"])
+        self.assertIn("market_candle_stale", snapshot["issues"])
 
 
 class NotificationServiceTests(unittest.TestCase):

@@ -67,7 +67,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter, TradingSessionPolicy
+from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeHealth, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter, TradingSessionPolicy
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -290,6 +290,7 @@ class QQQLiveTrader:
         self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
         self.signal_probe_store = SignalProbeStore(_app_dir(), TZ_ET, _json_default)
         self.runtime_state_store = RuntimeStateStore(_app_dir(), _json_default)
+        self.runtime_health = RuntimeHealth(TZ_ET)
         self.lifecycle = LifecycleController()
         self.runtime_rules = StrategyRuntimeRules()
         self.entry_policy = EntryPolicy(
@@ -300,6 +301,7 @@ class QQQLiveTrader:
         self.message_formatter = TraderMessageFormatter(self, TZ_ET)
         self.notification_service = NotificationService(
             _app_dir(), TZ_ET, lambda: self.cfg, self.message_formatter.format,
+            lambda msg_type, ok: self.runtime_health.beat("notification", ok=ok, detail=msg_type),
         )
         from review_summary import build_review_summary, is_last_weekday_of_month
         self.review_scheduler = ReviewSummaryScheduler(
@@ -1573,6 +1575,8 @@ class QQQLiveTrader:
     ):
         """记录入场后5/10/20根K线的正股方向收益，用于分析信号质量。"""
         try:
+            if rejection_reason:
+                self.runtime_health.reject(rejection_reason)
             signal_name = self._entry_signal_name(sig)
             direction = sig.get('dir', '')
             if source == 'shadow':
@@ -1798,6 +1802,12 @@ class QQQLiveTrader:
             minutes, seconds = divmod(remainder, 60)
             uptime_str = f"{hours}h {minutes}m {seconds}s"
 
+            now_et = datetime.now(TZ_ET)
+            current_minutes = now_et.hour * 60 + now_et.minute
+            start_h, start_m = map(int, str(self.cfg.get('start_time', '09:30')).split(':'))
+            end_h, end_m = map(int, str(self.cfg.get('end_time', '16:00')).split(':'))
+            market_open = now_et.weekday() < 5 and start_h * 60 + start_m <= current_minutes <= end_h * 60 + end_m
+            health = self.runtime_health.snapshot(running=self.running, market_open=market_open)
             state = {
                 'connected': True,
                 'running': self.running,
@@ -1822,6 +1832,7 @@ class QQQLiveTrader:
                 'account': self._account_state,
                 'broker_positions': self._broker_positions,
                 'equity': self.account_info.get('equity', self.cfg.get('capital', 100000)),
+                'health': health,
             }
             if self.position:
                 state['position'] = {
@@ -1883,6 +1894,11 @@ class QQQLiveTrader:
                     'completed': p.get('completed', False),
                 })
             self.runtime_state_store.save(state, self.position, self.current_price)
+            try:
+                import dashboard_v7
+                dashboard_v7.update_health(health)
+            except Exception:
+                pass
         except Exception as e:
             print(f"  ⚠️ 状态保存失败: {e}")
 
@@ -2002,6 +2018,7 @@ class QQQLiveTrader:
         price = self._extract_quote_price(event)
         if price <= 0:
             return
+        self.runtime_health.beat("quote")
 
         self.latest_quote_prices[symbol] = price
         
@@ -2342,6 +2359,8 @@ class QQQLiveTrader:
 
         try:
             while self.running:
+                self.runtime_health.beat("loop")
+                self.runtime_health.signal_checks += 1
                 # 配置热重载（检测 settings.json 变化）
                 _maybe_reload_config()
                 # 每20秒检测一次信号
@@ -2404,6 +2423,8 @@ class QQQLiveTrader:
 
         if not self.running:
             return
+
+        self.runtime_health.beat("candle")
 
         now = datetime.now(TZ_ET)
 
@@ -3494,6 +3515,7 @@ class QQQLiveTrader:
 
     def _execute_trade_inner(self, sig):
         """执行期权交易（内部实现）"""
+        self.runtime_health.entry_attempts += 1
         if self.order_execution.has_active_order(buy_only=True):
             print("  ⛔ 长桥仍有活动买单，禁止重复开仓")
             return
@@ -3630,6 +3652,7 @@ class QQQLiveTrader:
         side = OrderSide.Buy  # 买入期权（Call看多/ Put看空，都是Buy开仓）
 
         try:
+            self.runtime_health.orders_submitted += 1
             fill = self.order_execution.submit_and_wait({
                 'symbol': opt_symbol, 'order_type': OrderType.MO, 'side': side,
                 'submitted_quantity': Decimal(str(contracts)),
@@ -4843,6 +4866,7 @@ class QQQLiveTrader:
         try:
             all_orders = self.broker.today_orders()
             if not all_orders:
+                self.runtime_health.beat("order_sync")
                 if not getattr(self, '_warned_empty_orders', False):
                     print("  ⚠️ 长桥返回空订单列表（仅提示一次）")
                     self._warned_empty_orders = True
@@ -4854,7 +4878,9 @@ class QQQLiveTrader:
                 f"  📤 长桥订单已同步: {result['total']}笔 "
                 f"(买入:{result['buy_count']}, 卖出:{result['sell_count']})"
             )
+            self.runtime_health.beat("order_sync")
         except Exception as e:
+            self.runtime_health.beat("order_sync", ok=False, detail=str(e))
             import traceback
             print(f"  ❌ 同步长桥订单失败: {e}")
             print(f"  {traceback.format_exc()}")

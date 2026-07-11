@@ -73,7 +73,7 @@ def notify_telegram(msg):
         pass
 
 
-def is_port_available(host="0.0.0.0", port=8080):
+def is_port_available(host="127.0.0.1", port=8080):
     try:
         test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         test_sock.settimeout(1)
@@ -103,7 +103,8 @@ def start_web(port):
         import dashboard_v7
 
         print("dashboard_v7 imported", flush=True)
-        dashboard_v7.run_dashboard("0.0.0.0", port)
+        dashboard_host = os.environ.get("QQQ_DASHBOARD_HOST", "127.0.0.1")
+        dashboard_v7.run_dashboard(dashboard_host, port)
     except Exception as e:
         print(f"Dashboard failed: {e}", flush=True)
         import traceback

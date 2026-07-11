@@ -10,6 +10,8 @@ from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .config_safety import resolve_secret
+
 
 class NotificationService:
     def __init__(
@@ -18,11 +20,13 @@ class NotificationService:
         timezone: tzinfo,
         config_provider: Callable[[], Mapping[str, Any]],
         formatter: Callable[[str, str], str],
+        status_callback: Callable[[str, bool], None] | None = None,
     ) -> None:
         self._app_dir = Path(app_dir)
         self._timezone = timezone
         self._config_provider = config_provider
         self._formatter = formatter
+        self._status_callback = status_callback
         self._last_error_notify: dict[str, float] = {}
 
     @property
@@ -95,8 +99,8 @@ class NotificationService:
             import requests
 
             telegram = self.config.get("telegram", {})
-            bot_token = telegram.get("bot_token", "")
-            chat_id = telegram.get("chat_id", "")
+            bot_token = resolve_secret(self.config, "telegram", "bot_token", "TELEGRAM_BOT_TOKEN")
+            chat_id = resolve_secret(self.config, "telegram", "chat_id", "TELEGRAM_CHAT_ID")
             if not bot_token or not chat_id:
                 print(f"  ⚠️ Telegram凭据未配置，写日志: {message}")
                 self._write_fallback_log(message)
@@ -151,11 +155,15 @@ class NotificationService:
     def notify(self, message: str, msg_type: str = "info", **kwargs: Any) -> bool:
         telegram = self.config.get("telegram", {})
         print(f"  [Notify] Telegram: enabled={telegram.get('enabled')}, type={msg_type}")
+        results: list[bool] = []
         if self.config.get("feishu", {}).get("enabled", True):
-            self.send_feishu(message)
+            results.append(self.send_feishu(message))
         if telegram.get("enabled", False):
-            return self.send_telegram(message, msg_type=msg_type, **kwargs)
-        return False
+            results.append(self.send_telegram(message, msg_type=msg_type, **kwargs))
+        result = any(results)
+        if self._status_callback and results:
+            self._status_callback(msg_type, result)
+        return result
 
     def handle_error(
         self,
