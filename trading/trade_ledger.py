@@ -176,3 +176,47 @@ class TradeLedger:
                 "_source": "broker_reconcile",
             })
         return reconciled
+
+    @staticmethod
+    def serialize_broker_orders(orders: Iterable[Any]) -> list[dict[str, Any]]:
+        rows = []
+        for order in orders:
+            try:
+                side = "买入" if str(getattr(order, "side", "")) == "OrderSide.Buy" else "卖出"
+                rows.append({
+                    "order_id": str(getattr(order, "order_id", "") or ""),
+                    "symbol": str(getattr(order, "symbol", "") or ""),
+                    "side": side,
+                    "quantity": int(float(getattr(order, "quantity", 0) or 0)),
+                    "executed_qty": float(getattr(order, "executed_quantity", 0) or 0),
+                    "executed_price": float(getattr(order, "executed_price", 0) or 0),
+                    "status": str(getattr(order, "status", "")).replace("OrderStatus.", ""),
+                    "submitted_at": str(getattr(order, "submitted_at", "") or ""),
+                    "updated_at": str(getattr(order, "updated_at", "") or ""),
+                })
+            except (TypeError, ValueError):
+                continue
+        return rows
+
+    def save_broker_orders(self, orders: Iterable[Any]) -> dict[str, Any]:
+        rows = self.serialize_broker_orders(orders)
+        payload = {
+            "orders": rows,
+            "total": len(rows),
+            "buy_count": sum(row["side"] == "买入" for row in rows),
+            "sell_count": sum(row["side"] == "卖出" for row in rows),
+            "updated": datetime.now(self._timezone).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = self._records_dir.parent / "longbridge_orders.json"
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, default=self._json_default)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        return {"path": str(path), **payload}

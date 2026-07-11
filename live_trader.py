@@ -5212,58 +5212,16 @@ class QQQLiveTrader:
             all_orders = self.broker.today_orders()
             if not all_orders:
                 if not getattr(self, '_warned_empty_orders', False):
-                    print(f"  ⚠️ 长桥返回空订单列表（仅提示一次）")
+                    print("  ⚠️ 长桥返回空订单列表（仅提示一次）")
                     self._warned_empty_orders = True
                 return
             self._warned_empty_orders = False
-            
             print(f"  📥 长桥返回 {len(all_orders)} 笔订单")
-            
-            orders = []
-            for o in all_orders:
-                try:
-                    exec_qty = float(getattr(o, 'executed_quantity', 0) or 0)
-                    exec_price = float(getattr(o, 'executed_price', 0) or 0)
-                    side = '买入' if str(o.side) == 'OrderSide.Buy' else '卖出'
-                    orders.append({
-                        'order_id': str(getattr(o, 'order_id', '') or ''),
-                        'symbol': str(o.symbol),
-                        'side': side,
-                        'quantity': int(o.quantity),
-                        'executed_qty': exec_qty,
-                        'executed_price': exec_price,
-                        'status': str(o.status).replace('OrderStatus.', ''),
-                        'submitted_at': str(getattr(o, 'submitted_at', '') or ''),
-                        'updated_at': str(getattr(o, 'updated_at', '') or ''),
-                    })
-                except Exception as e:
-                    print(f"  ⚠️ 解析订单失败: {e}")
-            
-            # 保存到本地文件（原子写入，防止截断）
-            script_dir = str(_app_dir())
-            filepath = os.path.join(script_dir, 'longbridge_orders.json')
-            tmp_path = filepath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'orders': orders,
-                    'total': len(orders),
-                    'buy_count': sum(1 for o in orders if o['side'] == '买入'),
-                    'sell_count': sum(1 for o in orders if o['side'] == '卖出'),
-                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
-                }, f, ensure_ascii=False, indent=2, default=_json_default)
-            # Windows文件锁定重试机制
-            for attempt in range(5):
-                try:
-                    os.replace(tmp_path, filepath)  # 原子替换
-                    break
-                except OSError as e:
-                    if attempt < 4:
-                        time.sleep(0.2)
-                    else:
-                        raise
-            
-            print(f"  📤 长桥订单已同步: {len(orders)}笔 (买入:{sum(1 for o in orders if o['side']=='买入')}, 卖出:{sum(1 for o in orders if o['side']=='卖出')})")
-            
+            result = self.trade_ledger.save_broker_orders(all_orders)
+            print(
+                f"  📤 长桥订单已同步: {result['total']}笔 "
+                f"(买入:{result['buy_count']}, 卖出:{result['sell_count']})"
+            )
         except Exception as e:
             import traceback
             print(f"  ❌ 同步长桥订单失败: {e}")

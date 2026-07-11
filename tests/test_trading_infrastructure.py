@@ -226,6 +226,26 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["contracts"], 2)
         self.assertEqual(rows[0]["pnl_usd"], 100)
 
+    def test_broker_order_snapshot_is_serialized_and_saved(self):
+        order = type("Order", (), {
+            "order_id": "42",
+            "symbol": "QQQ260710C720000.US",
+            "side": "OrderSide.Buy",
+            "quantity": 3,
+            "executed_quantity": 2,
+            "executed_price": 1.25,
+            "status": "OrderStatus.PartialFilled",
+            "submitted_at": "submit",
+            "updated_at": "update",
+        })()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = TradeLedger(temp_dir, TZ_ET).save_broker_orders([order])
+            payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["buy_count"], 1)
+        self.assertEqual(payload["orders"][0]["executed_qty"], 2)
+        self.assertEqual(payload["orders"][0]["status"], "PartialFilled")
+
 
 class NotificationServiceTests(unittest.TestCase):
     def test_disabled_transports_return_false(self):
