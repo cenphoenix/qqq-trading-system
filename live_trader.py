@@ -25,10 +25,17 @@ TZ_ET = ZoneInfo("America/New_York")    # 美东（自动EDT/EST切换）
 
 
 # stdout兜底（打包后 console=False 时可能为 None）
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
+for _stream_name in ('stdout', 'stderr'):
+    _stream = getattr(sys, _stream_name)
+    if _stream is None:
+        setattr(sys, _stream_name, open(os.devnull, 'w', encoding='utf-8', errors='replace'))
+        continue
+    _reconfigure = getattr(_stream, 'reconfigure', None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding='utf-8', errors='replace')
+        except (OSError, ValueError):
+            pass
 
 
 def _json_default(obj):

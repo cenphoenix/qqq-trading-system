@@ -14,6 +14,23 @@ import time
 from pathlib import Path
 
 
+def configure_console_encoding():
+    """Keep Unicode trading logs safe on Windows consoles and redirected pipes."""
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        if stream is None:
+            setattr(sys, stream_name, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+configure_console_encoding()
 print("run_web.py started", flush=True)
 
 if getattr(sys, "frozen", False):
@@ -21,13 +38,6 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = Path(__file__).parent
 os.chdir(BASE_DIR)
-
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w", encoding="utf-8")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w", encoding="utf-8")
-
 
 def load_env():
     print("Loading env...", flush=True)
