@@ -97,6 +97,80 @@ class TradeLedger:
                 time.sleep(0.2)
         return {"path": str(path), **payload}
 
+    def load_daily_record(self, date_str: str | None = None) -> dict[str, Any] | None:
+        """Load one trading day and normalize persisted rows for runtime use."""
+        date_str = date_str or datetime.now(self._timezone).strftime("%Y-%m-%d")
+        path = self._records_dir / f"{date_str}.json"
+        if not path.exists():
+            return None
+        try:
+            with path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+
+        rows = [
+            row for row in payload.get("trades", [])
+            if isinstance(row, Mapping) and row.get("date", date_str) == date_str
+        ]
+        restored = []
+        for row in rows:
+            entry_text = str(row.get("entry_time") or "00:00:00")[:8]
+            exit_text = str(row.get("exit_time") or entry_text)[:8]
+            try:
+                day = datetime.strptime(date_str, "%Y-%m-%d")
+                entry_time = datetime.strptime(entry_text, "%H:%M:%S").replace(
+                    year=day.year, month=day.month, day=day.day, tzinfo=self._timezone,
+                )
+                exit_time = datetime.strptime(exit_text, "%H:%M:%S").replace(
+                    year=day.year, month=day.month, day=day.day, tzinfo=self._timezone,
+                )
+            except (TypeError, ValueError):
+                entry_time = datetime.now(self._timezone)
+                exit_time = entry_time
+            restored.append({
+                "time": entry_text,
+                "dir": row.get("dir", ""),
+                "entry_price": row.get("entry_opt_price") or row.get("entry_price", 0),
+                "exit_opt_price": row.get("exit_price", 0),
+                "exit_price": row.get("exit_price", 0),
+                "contracts": row.get("contracts", 0),
+                "pnl_pct": row.get("pnl_pct", 0),
+                "pnl_usd": row.get("pnl_usd", 0),
+                "reason": row.get("reason", ""),
+                "exit_reason": row.get("exit_reason", ""),
+                "result": row.get("result", ""),
+                "opt_symbol": row.get("opt_symbol", ""),
+                "win": row.get("result") == "win",
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "regime": row.get("regime", "neutral"),
+                "atr_at_entry": row.get("atr_at_entry", 0),
+                "macd_hist_entry": row.get("macd_hist_entry", 0),
+                "vwap_entry": row.get("vwap_entry", 0),
+                "half_closed": row.get("half_closed", False),
+            })
+
+        pnl_values = [float(row.get("pnl_usd", 0) or 0) for row in rows]
+        largest_win = max(rows, key=lambda row: float(row.get("pnl_usd", 0) or 0), default={})
+        largest_loss = min(rows, key=lambda row: float(row.get("pnl_usd", 0) or 0), default={})
+        largest_win_usd = max(0.0, float(largest_win.get("pnl_usd", 0) or 0))
+        largest_loss_usd = min(0.0, float(largest_loss.get("pnl_usd", 0) or 0))
+        return {
+            "path": str(path),
+            "date": date_str,
+            "trades": restored,
+            "total": len(restored),
+            "wins": sum(row.get("result") == "win" for row in rows),
+            "pnl": sum(pnl_values),
+            "call_pnl": sum(value for row, value in zip(rows, pnl_values) if row.get("dir") == "call"),
+            "put_pnl": sum(value for row, value in zip(rows, pnl_values) if row.get("dir") == "put"),
+            "largest_win_usd": largest_win_usd,
+            "largest_loss_usd": largest_loss_usd,
+            "largest_win_pct": float(largest_win.get("pnl_pct", 0) or 0) if largest_win_usd > 0 else 0.0,
+            "largest_loss_pct": float(largest_loss.get("pnl_pct", 0) or 0) if largest_loss_usd < 0 else 0.0,
+        }
+
     def reconcile_broker_orders(self, orders_file: str | os.PathLike[str]) -> list[dict[str, Any]]:
         """Build closed option cycles from filled broker orders using FIFO matching."""
         path = Path(orders_file)

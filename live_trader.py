@@ -5242,106 +5242,31 @@ class QQQLiveTrader:
         return sum(1 for d in symbol_data.values() if d['buys'] > 0 and d['sells'] > 0)
 
     def _load_today_records(self):
-        """恢复今日交易记录（从 records/ 目录，避免重启后数据丢失）"""
-        from zoneinfo import ZoneInfo
-        TZ_ET = ZoneInfo("America/New_York")
-        today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-
-        script_dir = str(_app_dir())
-        records_dir = os.path.join(script_dir, 'records')
-        if not os.path.isdir(records_dir):
-            print("📥 无 records/ 目录，跳过恢复")
-            return
-
-        # 记录文件统一用美东时间命名
-        record_file = os.path.join(records_dir, f'{today_et}.json')
-
-        if not os.path.exists(record_file):
-            print(f"📥 今日({today_et}) 无交易记录文件，跳过恢复")
-            return
-
+        """恢复当日交易记录，避免进程重启后丢失统计。"""
         try:
-            with open(record_file, encoding='utf-8') as f:
-                data = json.load(f)
-
-            trades = data.get('trades', [])
-            if not trades:
-                print(f"📥 今日记录文件存在但无交易，跳过恢复")
+            result = self.trade_ledger.load_daily_record()
+            if not result or not result['trades']:
+                print("📂 今日无交易记录，跳过恢复")
                 return
 
-            # 过滤：只加载 date 字段匹配今天的交易（防止跨天错误写入）
-            trades = [t for t in trades if t.get('date', today_et) == today_et]
-            if not trades:
-                print(f"📥 今日记录文件中无今日交易，跳过恢复")
-                return
+            self.trades_today.extend(result['trades'])
+            self.daily_pnl += result['pnl']
+            self.call_pnl += result['call_pnl']
+            self.put_pnl += result['put_pnl']
+            if result['largest_win_usd'] > self.largest_win_usd:
+                self.largest_win_usd = result['largest_win_usd']
+                self.largest_win_pct = result['largest_win_pct']
+            if result['largest_loss_usd'] < self.largest_loss_usd:
+                self.largest_loss_usd = result['largest_loss_usd']
+                self.largest_loss_pct = result['largest_loss_pct']
 
-            # 恢复 trades_today 和 daily_pnl
-            for t in trades:
-                entry_time_str = t.get('entry_time', '00:00:00')
-                exit_time_str = t.get('exit_time', entry_time_str)
-                try:
-                    entry_time = datetime.strptime(entry_time_str, '%H:%M:%S').replace(
-                        year=datetime.now(TZ_ET).year, month=datetime.now(TZ_ET).month, day=datetime.now(TZ_ET).day,
-                        tzinfo=TZ_ET
-                    )
-                    exit_time = datetime.strptime(exit_time_str, '%H:%M:%S').replace(
-                        year=datetime.now(TZ_ET).year, month=datetime.now(TZ_ET).month, day=datetime.now(TZ_ET).day,
-                        tzinfo=TZ_ET
-                    )
-                except Exception:
-                    entry_time = datetime.now(TZ_ET)
-                    exit_time = datetime.now(TZ_ET)
-
-                restored = {
-                    'time': entry_time_str,  # web 用的 time 字段
-                    'dir': t.get('dir', ''),
-                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
-                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
-                    'exit_opt_price': t.get('exit_price', 0),  # 和 position 里的一致
-                    'exit_price': t.get('exit_price', 0),
-                    'contracts': t.get('contracts', 0),
-                    'pnl_pct': t.get('pnl_pct', 0),
-                    'pnl_usd': t.get('pnl_usd', 0),
-                    'reason': t.get('reason', ''),
-                    'exit_reason': t.get('exit_reason', ''),
-                    'result': t.get('result', ''),
-                    'opt_symbol': t.get('opt_symbol', ''),
-                    'win': t.get('result') == 'win',
-                    'entry_time': entry_time,
-                    'exit_time': exit_time,
-                    'regime': t.get('regime', 'neutral'),
-                    'atr_at_entry': t.get('atr_at_entry', 0),
-                    'macd_hist_entry': t.get('macd_hist_entry', 0),
-                    'vwap_entry': t.get('vwap_entry', 0),
-                    'half_closed': t.get('half_closed', False),
-                }
-                self.trades_today.append(restored)
-                self.daily_pnl += t.get('pnl_usd', 0)
-                # 恢复方向累计盈亏
-                if t.get('dir') == 'call':
-                    self.call_pnl += t.get('pnl_usd', 0)
-                elif t.get('dir') == 'put':
-                    self.put_pnl += t.get('pnl_usd', 0)
-
-            wins = sum(1 for t in trades if t.get('result') == 'win')
-            total = len(trades)
-            
-            # 恢复最大盈亏统计
-            for t in trades:
-                pnl_usd = t.get('pnl_usd', 0)
-                pnl_pct = t.get('pnl_pct', 0)
-                if pnl_usd > self.largest_win_usd:
-                    self.largest_win_usd = pnl_usd
-                    self.largest_win_pct = pnl_pct
-                if pnl_usd < self.largest_loss_usd:
-                    self.largest_loss_usd = pnl_usd
-                    self.largest_loss_pct = pnl_pct
-            
-            print(f"📥 恢复今日交易记录: {total}笔 (胜{wins}/负{total-wins}) 盈亏${self.daily_pnl:+,.2f}")
-
+            print(
+                f"📂 恢复今日交易记录: {result['total']}笔 "
+                f"(胜{result['wins']}/负{result['total'] - result['wins']}) "
+                f"盈亏${self.daily_pnl:+,.2f}"
+            )
         except Exception as e:
             print(f"⚠️ 恢复今日记录失败: {e}")
-            import traceback
             traceback.print_exc()
 
     def _load_today_signal_probes(self):

@@ -226,6 +226,33 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["contracts"], 2)
         self.assertEqual(rows[0]["pnl_usd"], 100)
 
+    def test_daily_record_restores_runtime_trades_and_statistics(self):
+        payload = {
+            "date": "2026-07-10",
+            "trades": [
+                {"date": "2026-07-10", "entry_time": "10:00:00", "exit_time": "10:05:00",
+                 "dir": "call", "entry_price": 1, "exit_price": 1.5, "contracts": 2,
+                 "pnl_pct": 50, "pnl_usd": 100, "result": "win", "opt_symbol": "CALL.US"},
+                {"date": "2026-07-10", "entry_time": "11:00:00", "exit_time": "11:03:00",
+                 "dir": "put", "entry_price": 2, "exit_price": 1.8, "contracts": 1,
+                 "pnl_pct": -10, "pnl_usd": -20, "result": "lose", "opt_symbol": "PUT.US"},
+                {"date": "2026-07-09", "pnl_usd": 999, "result": "win"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            records = Path(temp_dir) / "records"
+            records.mkdir()
+            (records / "2026-07-10.json").write_text(json.dumps(payload), encoding="utf-8")
+            result = TradeLedger(temp_dir, TZ_ET).load_daily_record("2026-07-10")
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["wins"], 1)
+        self.assertEqual(result["pnl"], 80)
+        self.assertEqual(result["call_pnl"], 100)
+        self.assertEqual(result["put_pnl"], -20)
+        self.assertEqual(result["largest_win_pct"], 50)
+        self.assertEqual(result["largest_loss_pct"], -10)
+        self.assertEqual(result["trades"][0]["entry_time"].strftime("%H:%M:%S"), "10:00:00")
+
     def test_broker_order_snapshot_is_serialized_and_saved(self):
         order = type("Order", (), {
             "order_id": "42",
