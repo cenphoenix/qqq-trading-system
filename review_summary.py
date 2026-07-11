@@ -13,6 +13,8 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from trade_review import review_trades_for_day
+
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDS_DIR = os.path.join(APP_DIR, "records")
@@ -101,7 +103,8 @@ def _normalize_trade(trade: Dict, record_date: date) -> Dict:
     item["pnl_pct"] = _to_float(item.get("pnl_pct"))
     item["contracts"] = int(_to_float(item.get("contracts", item.get("qty", 0))))
     item["dir"] = str(item.get("dir") or "").lower()
-    item["signal"] = item.get("signal") or item.get("regime") or _signal_from_reason(item.get("reason", ""))
+    parsed_signal = _signal_from_reason(item.get("reason", ""))
+    item["signal"] = item.get("signal") or (parsed_signal if parsed_signal != "Unknown" else None) or item.get("regime") or "Unknown"
     item["result"] = result
     item["date"] = str(item.get("date") or record_date.isoformat())[:10]
     item["entry_time"] = str(item.get("entry_time") or item.get("time") or "")
@@ -111,9 +114,19 @@ def _normalize_trade(trade: Dict, record_date: date) -> Dict:
 
 def _signal_from_reason(reason: Any) -> str:
     text = str(reason or "")
+    known = (
+        "VWAP_Breakout", "Granville_Pullback", "Kline_Pattern", "EMA_Cross",
+        "RSI_Reversal", "RSI_Overbought", "Chan_First_Buy", "Momentum_Death",
+        "OR_High_Reversal", "OR_Low_Reversal", "Failed_Breakout", "VWAP_Reversion",
+    )
+    for name in known:
+        if name in text:
+            return name
+    if "v6.2突破" in text:
+        return "Kline_Pattern"
     if ":" in text:
         prefix = text.split(":", 1)[0].strip()
-        if 2 <= len(prefix) <= 40:
+        if 2 <= len(prefix) <= 40 and "[" not in prefix:
             return prefix.split()[-1]
     return "Unknown"
 
@@ -313,6 +326,7 @@ def build_review_summary(period: str = "day", anchor: Optional[str] = None) -> D
     day_rows = []
     for day in _date_iter(start, end):
         day_trades = _load_trades_for_day(day)
+        day_trades = review_trades_for_day(day_trades, day)
         day_probes = _load_probes_for_day(day)
         if day_trades or day_probes:
             wins = len([t for t in day_trades if t.get("result") == "win" or _to_float(t.get("pnl_usd")) > 0])
@@ -331,6 +345,15 @@ def build_review_summary(period: str = "day", anchor: Optional[str] = None) -> D
     total = len(trades)
     pnl = sum(_to_float(t.get("pnl_usd")) for t in trades)
     signal_rows = _group_signal_stats(trades, probes)
+    winners_by_pnl = sorted(
+        [t for t in trades if _to_float(t.get("pnl_usd")) > 0],
+        key=lambda t: _to_float(t.get("pnl_usd")),
+        reverse=True,
+    )
+    losers_by_pnl = sorted(
+        [t for t in trades if _to_float(t.get("pnl_usd")) < 0],
+        key=lambda t: _to_float(t.get("pnl_usd")),
+    )
     best_trades = sorted(trades, key=lambda t: _to_float(t.get("pnl_usd")), reverse=True)[:5]
     worst_trades = sorted(trades, key=lambda t: _to_float(t.get("pnl_usd")))[:5]
     best_signals = signal_rows[:5]
@@ -354,6 +377,8 @@ def build_review_summary(period: str = "day", anchor: Optional[str] = None) -> D
         "directions": _direction_stats(trades),
         "best_trades": _compact_trades(best_trades),
         "worst_trades": _compact_trades(worst_trades),
+        "winner_reviews": _compact_trades(winners_by_pnl[:5]),
+        "loser_reviews": _compact_trades(losers_by_pnl[:5]),
         "best_signals": best_signals,
         "worst_signals": worst_signals,
         "issue_tags": issue_tags,
@@ -377,6 +402,13 @@ def _compact_trades(trades: List[Dict]) -> List[Dict]:
             "pnl_usd": round(_to_float(t.get("pnl_usd")), 2),
             "pnl_pct": round(_to_float(t.get("pnl_pct")), 2),
             "exit_reason": t.get("exit_reason", ""),
+            "entry_verdict": t.get("entry_verdict", ""),
+            "exit_verdict": t.get("exit_verdict", ""),
+            "entry_tags": list(t.get("entry_tags") or []),
+            "stock_mfe_pct": t.get("stock_mfe_pct"),
+            "stock_mae_pct": t.get("stock_mae_pct"),
+            "post_exit_5_pct": t.get("post_exit_5_pct"),
+            "post_exit_10_pct": t.get("post_exit_10_pct"),
         })
     return rows
 
@@ -423,6 +455,27 @@ def format_telegram_summary(summary: Dict) -> str:
             lines.append("最佳 " + _line_trade(summary["best_trades"][0]))
         if summary.get("worst_trades"):
             lines.append("最差 " + _line_trade(summary["worst_trades"][0]))
+    winner_reviews = summary.get("winner_reviews") or []
+    loser_reviews = summary.get("loser_reviews") or []
+    if winner_reviews:
+        winner = winner_reviews[0]
+        lines += [
+            "────────────",
+            "<b>盈利单复盘</b>",
+            _line_trade(winner),
+            html.escape(str(winner.get("entry_verdict") or "")),
+            html.escape(str(winner.get("exit_verdict") or "")),
+        ]
+    if loser_reviews:
+        loser = loser_reviews[0]
+        tags = " / ".join(loser.get("entry_tags") or []) or "无明显追价标签"
+        lines += [
+            "────────────",
+            "<b>亏损单复盘</b>",
+            _line_trade(loser),
+            html.escape(str(loser.get("entry_verdict") or "")) + " | " + html.escape(tags),
+            html.escape(str(loser.get("exit_verdict") or "")),
+        ]
     issue_tags = summary.get("issue_tags") or []
     if issue_tags:
         lines += ["────────────", "<b>Loss Tags</b>"]

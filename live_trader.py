@@ -14,7 +14,7 @@ RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
 4. 风控：动态止损/半仓止盈/分阶段超时/日亏损熔断/冷却
 5. Telegram推送交易信号 / Web仪表盘
 """
-import os, sys, time, json, signal, re
+import os, sys, time, json, signal
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import numpy as np
@@ -58,7 +58,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import NotificationLog, NotificationService, ReviewSummaryScheduler, TradeLedger
+from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, TradeLedger, TraderMessageFormatter
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -278,8 +278,9 @@ class QQQLiveTrader:
         self.cfg = config or CONFIG
         self.notification_log = NotificationLog(_app_dir(), TZ_ET, _json_default)
         self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
+        self.message_formatter = TraderMessageFormatter(self, TZ_ET)
         self.notification_service = NotificationService(
-            _app_dir(), TZ_ET, lambda: self.cfg, self._format_notification,
+            _app_dir(), TZ_ET, lambda: self.cfg, self.message_formatter.format,
         )
         from review_summary import build_review_summary, is_last_weekday_of_month
         self.review_scheduler = ReviewSummaryScheduler(
@@ -353,6 +354,10 @@ class QQQLiveTrader:
 
         # 初始化长桥连接
         self._init_api()
+        self.broker = LongbridgeBroker(self.quote_ctx, self.trade_ctx)
+        self.order_execution = OrderExecution(self.broker)
+        self.position_book = PositionBook(self.broker)
+        self.account_service = AccountSnapshotService()
 
     def _calc_rsi(self, period=14):
         """计算RSI指标（Wilder平滑法）
@@ -489,7 +494,7 @@ class QQQLiveTrader:
         except Exception:
             pass
         try:
-            stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
+            stock_quotes = self.broker.quote([self.cfg['symbol']])
             if stock_quotes and float(stock_quotes[0].last_done) > 100:
                 return float(stock_quotes[0].last_done)
         except Exception:
@@ -2216,49 +2221,9 @@ class QQQLiveTrader:
             sma = np.mean(self.close_history[-20:]) if len(self.close_history) >= 20 else 0
             vol_avg = np.mean(self.volume_history[-20:]) if len(self.volume_history) >= 20 else 0
             print(f"  📊 价格${self.current_price:.2f} | SMA20:{sma:.2f} | 均量:{vol_avg:,.0f}")
-
             # ===== 检查长桥现有持仓，避免重复下单 =====
-            print(f"  🔍 检查长桥持仓...")
-            try:
-                stock_positions = self.trade_ctx.stock_positions()
-                has_position = False
-                if stock_positions and hasattr(stock_positions, 'channels'):
-                    for channel in stock_positions.channels:
-                        if hasattr(channel, 'positions'):
-                            for pos in channel.positions:
-                                if hasattr(pos, 'symbol') and 'QQQ' in str(pos.symbol) and 'US' in str(pos.symbol):
-                                    qty = int(getattr(pos, 'quantity', 0) or 0)
-                                    if qty > 0:
-                                        has_position = True
-                                        print(f"  ⚠️ 发现长桥持仓: {pos.symbol} x {qty}张")
-                                        # 恢复内部持仓状态
-                                        self.position = {
-                                            'order_id': 'restored',
-                                            'dir': 'call' if 'C' in str(pos.symbol) else 'put',
-                                            'entry_price': float(getattr(pos, 'cost_price', 0) or 0),
-                                            'opt_symbol': str(pos.symbol),
-                                            'entry_opt_price': float(getattr(pos, 'cost_price', 0) or 0),
-                                            'sl_pct': self.cfg['sl'],
-                                            'tp_pct': self.cfg['tp'],
-                                            'contracts': qty,
-                                            'quantity': qty * self.cfg['contract_multiplier'],
-                                            'entry_time': datetime.now(TZ_ET),
-                                            'entry_bar': len(self.one_min_candles),
-                                            'reason': '重启恢复持仓',
-                                            'max_pnl_pct': 0,
-                                            'half_closed': False,
-                                            'half_closed_max_pct': 0.0,
-                                            'order_status': 'restored',
-                                        }
-                                        self._restore_position_checkpoint(self.position)
-                                        self.trades_today.append(self.position.copy())
-                                        print(f"  ✅ 已恢复内部持仓状态")
-                                        self._subscribe_position_quote(self.position.get('opt_symbol'))
-                                        break
-                        if has_position:
-                            break
-            except Exception as e:
-                print(f"  ⚠️ 检查持仓失败: {e}")
+            print("  🔍 检查长桥持仓...")
+            self._recover_broker_position()
 
             # ===== 回放信号检测（仅在无持仓时）=====
             if len(self.one_min_candles) >= self.cfg['lookback'] + 1:
@@ -2295,76 +2260,77 @@ class QQQLiveTrader:
             print(f"⚠️ 预加载失败: {e}（不影响正常运行）")
 
     def _recover_broker_position(self):
-        """启动时从长桥同步实际持仓，接管被手动关闭后遗留的仓位"""
-        if self.position: # 如果内存已有，跳过
+        """启动时从长桥同步实际持仓，接管遗留的当日0DTE仓位"""
+        if self.position:
             return
 
         try:
-            res = self.trade_ctx.stock_positions()
-            if not res or not getattr(res, 'channels', None):
+            today_code = datetime.now(TZ_ET).strftime('%y%m%d')
+            broker_position = next(
+                (
+                    position for position in self.position_book.load()
+                    if position.quantity > 0
+                    and position.symbol.startswith('QQQ')
+                    and today_code in position.symbol
+                    and position.is_option
+                ),
+                None,
+            )
+            if not broker_position:
                 return
 
-            now_et = datetime.now(TZ_ET).strftime('%y%m%d') # 260513
+            symbol = broker_position.symbol
+            qty = broker_position.quantity
+            cost = broker_position.cost_price
+            direction = broker_position.option_direction
+            stock_entry = self._current_stock_price()
+            stock_exit_enabled = stock_entry > 100
+            now = datetime.now(TZ_ET)
 
-            for channel in res.channels:
-                if not getattr(channel, 'positions', None):
-                    continue
-                for p in channel.positions:
-                    symbol = str(p.symbol)
-                    qty = int(p.quantity)
-                    # 检查是否是今天的 0DTE 期权持仓
-                    if qty > 0 and 'QQQ' in symbol and now_et in symbol:
-                        cost = float(getattr(p, 'cost_price', 0))
-                        direction = 'call' if 'C' in symbol.upper() else 'put'
-                        stock_entry = self._current_stock_price()
-                        stock_exit_enabled = stock_entry > 100
-
-                        print(f"🔍 发现长桥持仓: {symbol} x{qty}")
-                        print(f"📥 正在接管并同步到系统...")
-
-                        # 恢复内存持仓对象
-                        self.position = {
-                            'dir': direction,
-                            'contracts': qty,
-                            'entry_opt_price': cost,          # 期权成本价（显式）
-                            'opt_symbol': symbol,
-                            'entry_price': stock_entry if stock_exit_enabled else 0,
-                            # 设为当前时间，防止被误判超时直接平仓
-                            'entry_time': datetime.now(TZ_ET),
-                            'stock_peak': 0,       # 等待报价更新
-                            'stock_valley': 0,
-                            'stock_peak': stock_entry if stock_exit_enabled else 0,
-                            'stock_exit_enabled': stock_exit_enabled,
-                            'half_closed': False,  # 假设未半仓
-                            'max_pnl_pct': 0,
-                            'max_pnl_abs': 0,
-                            'sl_pct': self.cfg.get('sl', 0.25),
-                            'reason': '系统重启恢复',
-                            '_is_recovered': True
-                        }
-
-                        # 同步到交易记录（防止 Web 端数据丢失）
-                        self.trades_today.append({
-                            'time': datetime.now(TZ_ET).strftime('%H:%M:%S'),
-                            'entry_time': datetime.now(TZ_ET),
-                            'dir': direction,
-                            'contracts': qty,
-                            'opt_symbol': symbol,
-                            'entry_opt_price': cost,
-                            'entry_price': stock_entry if stock_exit_enabled else 0,
-                            'pnl_pct': 0,
-                            'pnl_usd': 0,
-                            'win': None,
-                            'reason': '系统重启恢复',
-                            'exit_reason': '',
-                        })
-
-                        # 启动报价订阅
-                        self._subscribe_position_quote(symbol)
-                        self._save_state()
-                        self._add_event(f"✅ 接管成功: {symbol}", "info")
-                        return # 只接管单腿（单边持仓）
-
+            print(f"🔍 发现长桥持仓: {symbol} x{qty}")
+            print("📥 正在接管并同步到系统...")
+            self.position = {
+                'order_id': 'restored',
+                'dir': direction,
+                'contracts': qty,
+                'quantity': qty * self.cfg['contract_multiplier'],
+                'entry_opt_price': cost,
+                'opt_symbol': symbol,
+                'entry_price': stock_entry if stock_exit_enabled else 0,
+                'entry_time': now,
+                'entry_bar': len(self.one_min_candles),
+                'stock_peak': stock_entry if stock_exit_enabled else 0,
+                'stock_valley': stock_entry if stock_exit_enabled else 0,
+                'stock_exit_enabled': stock_exit_enabled,
+                'half_closed': False,
+                'half_closed_max_pct': 0.0,
+                'max_pnl_pct': 0,
+                'max_pnl_abs': 0,
+                'sl_pct': self.cfg.get('sl', 0.25),
+                'tp_pct': self.cfg.get('tp', 0.30),
+                'reason': '系统重启恢复',
+                'order_status': 'restored',
+                '_is_recovered': True,
+            }
+            self._restore_position_checkpoint(self.position)
+            self.trades_today.append({
+                'time': now.strftime('%H:%M:%S'),
+                'entry_time': now,
+                'dir': direction,
+                'contracts': qty,
+                'quantity': qty * self.cfg['contract_multiplier'],
+                'opt_symbol': symbol,
+                'entry_opt_price': cost,
+                'entry_price': stock_entry if stock_exit_enabled else 0,
+                'pnl_pct': 0,
+                'pnl_usd': 0,
+                'win': None,
+                'reason': '系统重启恢复',
+                'exit_reason': '',
+            })
+            self._subscribe_position_quote(symbol)
+            self._save_state()
+            self._add_event(f"✅ 接管成功: {symbol}", "info")
         except Exception as e:
             print(f"⚠️ 自动恢复持仓失败: {e}")
 
@@ -3084,7 +3050,7 @@ class QQQLiveTrader:
 
         # 获取当前正股价格
         try:
-            quotes = self.quote_ctx.quote([self.cfg['symbol']])
+            quotes = self.broker.quote([self.cfg['symbol']])
             if not quotes:
                 return
             current_price = float(quotes[0].last_done)
@@ -3616,24 +3582,15 @@ class QQQLiveTrader:
         if now - self._lb_pos_cache_time < 30:
             return self._lb_pos_cache
         try:
-            stock_positions = self.trade_ctx.stock_positions()
-            if not stock_positions or not hasattr(stock_positions, 'channels'):
-                self._lb_pos_cache = 0
-                self._lb_pos_cache_time = now
-                return 0
-            
             today_str = datetime.now(TZ_ET).strftime('%y%m%d')  # 今日到期日
-            total_contracts = 0
-            for channel in stock_positions.channels:
-                if not hasattr(channel, 'positions'):
-                    continue
-                for pos in channel.positions:
-                    symbol = str(getattr(pos, 'symbol', ''))
-                    qty = int(getattr(pos, 'quantity', 0) or 0)
-                    # 只统计今日到期的QQQ期权（精确匹配0DTE）
-                    if qty > 0 and 'QQQ' in symbol and '.US' in symbol and today_str in symbol:
-                        total_contracts += qty
-                        print(f"  📊 长桥持仓: {symbol} x {qty}张")
+            positions = self.position_book.load()
+            matched = [
+                pos for pos in positions
+                if pos.quantity > 0 and 'QQQ' in pos.symbol and '.US' in pos.symbol and today_str in pos.symbol
+            ]
+            total_contracts = sum(pos.quantity for pos in matched)
+            for pos in matched:
+                print(f"  📊 长桥持仓: {pos.symbol} x {pos.quantity}张")
             self._lb_pos_cache = total_contracts
             self._lb_pos_cache_time = now
             return total_contracts
@@ -3681,7 +3638,7 @@ class QQQLiveTrader:
 
         # ===== 获取实际账户余额（自动识别货币，统一转USD）=====
         try:
-            assets = self.trade_ctx.account_balance()
+            assets = self.broker.account_balance()
             total_cash = 0
             equity = 0
             buying_power = 0
@@ -3734,7 +3691,7 @@ class QQQLiveTrader:
         # ===== 获取期权当前价格 =====
         opt_price = None
         try:
-            opt_quotes = self.quote_ctx.quote([opt_symbol])
+            opt_quotes = self.broker.quote([opt_symbol])
             if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
                 opt_price = float(opt_quotes[0].last_done)
                 print(f"  📊 期权价格: ${opt_price:.2f}")
@@ -3830,7 +3787,7 @@ class QQQLiveTrader:
         side = OrderSide.Buy  # 买入期权（Call看多/ Put看空，都是Buy开仓）
 
         try:
-            resp = self.trade_ctx.submit_order(
+            resp = self.broker.submit_order(
                 symbol=opt_symbol,
                 order_type=OrderType.MO,
                 side=side,
@@ -3855,52 +3812,20 @@ class QQQLiveTrader:
             executed_qty = 0
             executed_price = 0
 
-            for attempt in range(max_retries):
-                time.sleep(retry_interval)
+            for attempt, snapshot in self.order_execution.poll(
+                order_id, retries=max_retries, interval=retry_interval,
+            ):
                 try:
-                    # 查询订单状态 - 使用多种方式
-                    order_info = None
-                    
-                    # 方式1: 查询所有今日订单，遍历查找
-                    try:
-                        all_orders = self.trade_ctx.today_orders()
-                        print(f"  🔍 查询到 {len(all_orders)} 个今日订单")
-                        for o in all_orders:
-                            # 打印每个订单的ID用于调试
-                            o_id = getattr(o, 'order_id', None)
-                            if o_id:
-                                print(f"    订单ID: {o_id} (类型: {type(o_id).__name__})")
-                            # 比较时转换类型
-                            if str(o_id) == str(order_id):
-                                order_info = o
-                                print(f"  ✅ 找到匹配订单!")
-                                break
-                    except Exception as e1:
-                        print(f"  ⚠️ 查询今日订单失败: {e1}")
+                    order_info = snapshot.order if snapshot else None
                     
                     if order_info:
-                        # 获取订单状态
-                        order_status = getattr(order_info, 'status', None)
-                        executed_qty = float(getattr(order_info, 'executed_quantity', 0) or 0)
-                        executed_price = float(getattr(order_info, 'executed_price', 0) or 0)
+                        order_status = snapshot.status
+                        executed_qty = snapshot.quantity
+                        executed_price = snapshot.price
                         
                         # 🔧 调试：打印订单所有关键字段
                         print(f"  📋 订单详情: ID={order_id}, status={order_status}, exec_qty={executed_qty}, exec_price={executed_price}")
                         print(f"     订单字段: {[a for a in dir(order_info) if not a.startswith('_') and 'price' in a.lower() or 'done' in a.lower() or 'exec' in a.lower()]}")
-                        
-                        # 🔧 如果 executed_price 为 0 但订单已成交/部分成交，用 last_done 作为补充
-                        if executed_price <= 0 and executed_qty > 0:
-                            last_done = getattr(order_info, 'last_done', 0)
-                            if last_done and float(last_done) > 0:
-                                executed_price = float(last_done)
-                                print(f"  ℹ️  使用 last_done 作为成交价: ${executed_price}")
-                        
-                        # 🔧 如果还是没有，尝试用订单的 price 字段（限价单价格）
-                        if executed_price <= 0 and executed_qty > 0:
-                            order_price = getattr(order_info, 'price', 0)
-                            if order_price and float(order_price) > 0:
-                                executed_price = float(order_price)
-                                print(f"  ℹ️  使用订单 price 作为成交价: ${executed_price}")
                         
                         print(f"  📊 订单状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
                         
@@ -3917,7 +3842,7 @@ class QQQLiveTrader:
                                 # 最后一次重试，取消剩余订单
                                 print(f"  ❌ 部分成交超时，取消剩余订单")
                                 try:
-                                    self.trade_ctx.cancel_order(order_id)
+                                    self.broker.cancel_order(order_id)
                                     self._log_order(order_id, opt_symbol, sig['dir'], contracts, 'cancelled_partial')
                                     print(f"  🚫 已取消剩余订单")
                                 except Exception as cancel_err:
@@ -3937,7 +3862,7 @@ class QQQLiveTrader:
                                 # 最后一次重试仍未成交，取消订单
                                 print(f"  ❌ 订单超时未成交，取消订单")
                                 try:
-                                    self.trade_ctx.cancel_order(order_id)
+                                    self.broker.cancel_order(order_id)
                                     self._log_order(order_id, opt_symbol, sig['dir'], contracts, 'cancelled_timeout')
                                     print(f"  🚫 已取消订单")
                                 except Exception as cancel_err:
@@ -4044,7 +3969,7 @@ class QQQLiveTrader:
             if self.position['entry_opt_price'] is None:
                 time.sleep(1)
                 try:
-                    opt_q = self.quote_ctx.quote([opt_symbol])
+                    opt_q = self.broker.quote([opt_symbol])
                     if opt_q and opt_q[0].last_done > 0:
                         self.position['entry_opt_price'] = float(opt_q[0].last_done)
                         # 同步更新 trades_today 中的记录
@@ -4111,45 +4036,32 @@ class QQQLiveTrader:
         try:
             time.sleep(2)  # 等待持仓更新
             
-            # 查询股票持仓
-            stock_positions = self.trade_ctx.stock_positions()
-            if stock_positions and hasattr(stock_positions, 'channels'):
-                for channel in stock_positions.channels:
-                    if hasattr(channel, 'positions'):
-                        for pos in channel.positions:
-                            if hasattr(pos, 'symbol') and pos.symbol == opt_symbol:
-                                actual_qty = int(getattr(pos, 'quantity', 0) or 0)
-                                done_qty = actual_qty
-                                print(f"  📊 找到期权持仓: {pos.symbol}")
-                                print(f"  📊 持仓数量: {actual_qty} | 已成交: {done_qty}")
-                                
-                                if done_qty >= expected_qty:
-                                    print(f"  ✅ 持仓验证通过!")
-                                    return True
-                                else:
-                                    print(f"  ⚠️ 持仓不足: 期望{expected_qty}, 实际{done_qty}")
-                                    # 更新实际持仓数量
-                                    if self.position:
-                                        self.position['contracts'] = done_qty
-                                        self.position['quantity'] = done_qty * self.cfg['contract_multiplier']
-                                        print(f"  📝 已更新持仓数量为: {done_qty}张")
-                                    # 发送持仓不一致通知
-                                    self._notify(
-                                        "⚠️ 持仓数量不一致",
-                                        'position_anomaly',
-                                        anomaly_type='mismatch',
-                                        details=f"期权 <code>{opt_symbol}</code>\n期望 <b>{expected_qty}</b>张\n实际 <b>{done_qty}</b>张",
-                                    )
-                                    return True
+            positions = self.position_book.load()
+            broker_position = next((pos for pos in positions if pos.symbol == opt_symbol), None)
+            if broker_position:
+                done_qty = broker_position.quantity
+                print(f"  📊 找到期权持仓: {broker_position.symbol}")
+                print(f"  📊 持仓数量: {done_qty} | 已成交: {done_qty}")
+                if done_qty >= expected_qty:
+                    print(f"  ✅ 持仓验证通过!")
+                    return True
+                print(f"  ⚠️ 持仓不足: 期望{expected_qty}, 实际{done_qty}")
+                if self.position:
+                    self.position['contracts'] = done_qty
+                    self.position['quantity'] = done_qty * self.cfg['contract_multiplier']
+                    print(f"  📝 已更新持仓数量为: {done_qty}张")
+                self._notify(
+                    "⚠️ 持仓数量不一致",
+                    'position_anomaly',
+                    anomaly_type='mismatch',
+                    details=f"期权 <code>{opt_symbol}</code>\n期望 <b>{expected_qty}</b>张\n实际 <b>{done_qty}</b>张",
+                )
+                return True
             
             # 如果没找到，尝试查询所有持仓
             print(f"  ⚠️ 未在持仓中找到 {opt_symbol}，查询所有持仓...")
-            if stock_positions and hasattr(stock_positions, 'channels'):
-                for channel in stock_positions.channels:
-                    if hasattr(channel, 'positions'):
-                        for pos in channel.positions:
-                            if hasattr(pos, 'symbol'):
-                                print(f"  📊 持仓: {pos.symbol} x {getattr(pos, 'quantity', 0)}")
+            for pos in positions:
+                print(f"  📊 持仓: {pos.symbol} x {pos.quantity}")
             
             print(f"  ⚠️ 持仓验证未找到匹配项，但订单已确认成交")
             # 发送持仓丢失通知
@@ -4176,60 +4088,53 @@ class QQQLiveTrader:
     def _sync_position_from_longbridge(self):
         """从长桥同步持仓到内部状态"""
         try:
-            stock_positions = self.trade_ctx.stock_positions()
-            if not stock_positions or not hasattr(stock_positions, 'channels'):
-                return
-            
-            for channel in stock_positions.channels:
-                if not hasattr(channel, 'positions'):
+            for broker_position in self.position_book.load():
+                symbol = broker_position.symbol
+                qty = broker_position.quantity
+                cost = broker_position.cost_price
+                is_qqq_option = (
+                    qty > 0
+                    and symbol.startswith('QQQ')
+                    and symbol.endswith('.US')
+                    and ('C' in symbol[9:] or 'P' in symbol[9:])
+                )
+                if not is_qqq_option:
                     continue
-                for pos in channel.positions:
-                    symbol = getattr(pos, 'symbol', '')
-                    qty = int(getattr(pos, 'quantity', 0) or 0)
-                    cost = float(getattr(pos, 'cost_price', 0) or 0)
-                    
-                    # 只处理QQQ期权持仓
-                    if qty > 0 and 'QQQ' in str(symbol) and '.US' in str(symbol) and ('C' in str(symbol) or 'P' in str(symbol)):
-                        # 获取当前价格
-                        try:
-                            opt_quotes = self.quote_ctx.quote([symbol])
-                            if opt_quotes and opt_quotes[0].last_done > 0:
-                                current_price = float(opt_quotes[0].last_done)
-                            else:
-                                current_price = cost
-                        except:
-                            current_price = cost
-                        
-                        # 计算盈亏
-                        pnl_pct = (current_price - cost) / cost * 100 if cost > 0 else 0
-                        stock_entry = self._current_stock_price()
-                        stock_exit_enabled = stock_entry > 100
-                        
-                        # 恢复内部持仓状态
-                        self.position = {
-                            'order_id': 'synced',
-                            'dir': 'call' if 'C' in str(symbol) else 'put',
-                            'entry_opt_price': cost,          # 期权成本
-                            'opt_symbol': symbol,
-                            'entry_price': stock_entry if stock_exit_enabled else 0,
-                            'sl_pct': self.cfg['sl'],
-                            'tp_pct': self.cfg['tp'],
-                            'contracts': qty,
-                            'quantity': qty * self.cfg['contract_multiplier'],
-                'entry_time': datetime.now(TZ_ET),
-                            'entry_bar': len(self.one_min_candles),
-                            'reason': '长桥持仓同步',
-                            'max_pnl_pct': pnl_pct,
-                            'half_closed': False,
-                            'half_closed_max_pct': 0.0,
-                            'stock_peak': stock_entry if stock_exit_enabled else 0,
-                            'stock_exit_enabled': stock_exit_enabled,
-                            'order_status': 'synced',
-                        }
-                        print(f"  🔄 从长桥同步持仓: {symbol} x {qty}张, 成本${cost:.2f}, 盈亏{pnl_pct:+.1f}%")
-                        self._subscribe_position_quote(symbol)
-                        self._save_state()
-                        return
+
+                try:
+                    quotes = self.broker.quote([symbol])
+                    current_price = float(quotes[0].last_done) if quotes and quotes[0].last_done > 0 else cost
+                except Exception:
+                    current_price = cost
+
+                pnl_pct = (current_price - cost) / cost * 100 if cost > 0 else 0
+                stock_entry = self._current_stock_price()
+                stock_exit_enabled = stock_entry > 100
+                option_type = symbol.replace('.US', '')[9:10]
+                self.position = {
+                    'order_id': 'synced',
+                    'dir': 'call' if option_type == 'C' else 'put',
+                    'entry_opt_price': cost,
+                    'opt_symbol': symbol,
+                    'entry_price': stock_entry if stock_exit_enabled else 0,
+                    'sl_pct': self.cfg['sl'],
+                    'tp_pct': self.cfg['tp'],
+                    'contracts': qty,
+                    'quantity': qty * self.cfg['contract_multiplier'],
+                    'entry_time': datetime.now(TZ_ET),
+                    'entry_bar': len(self.one_min_candles),
+                    'reason': '长桥持仓同步',
+                    'max_pnl_pct': pnl_pct,
+                    'half_closed': False,
+                    'half_closed_max_pct': 0.0,
+                    'stock_peak': stock_entry if stock_exit_enabled else 0,
+                    'stock_exit_enabled': stock_exit_enabled,
+                    'order_status': 'synced',
+                }
+                print(f"  🔄 从长桥同步持仓: {symbol} x {qty}张, 成本${cost:.2f}, 盈亏{pnl_pct:+.1f}%")
+                self._subscribe_position_quote(symbol)
+                self._save_state()
+                return
         except Exception as e:
             print(f"  ⚠️ 长桥持仓同步失败: {e}")
 
@@ -4286,7 +4191,7 @@ class QQQLiveTrader:
             current_stock = self.latest_quote_prices.get(self.cfg['symbol']) or self.current_price or None
         if current_stock is None:
             try:
-                stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
+                stock_quotes = self.broker.quote([self.cfg['symbol']])
                 if not stock_quotes:
                     return
                 current_stock = float(stock_quotes[0].last_done)
@@ -4299,7 +4204,7 @@ class QQQLiveTrader:
             opt_price = self.latest_quote_prices.get(pos['opt_symbol'])
         if opt_price is None and not triggered_by_push:
             try:
-                opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
+                opt_quotes = self.broker.quote([pos['opt_symbol']])
                 if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
                     opt_price = float(opt_quotes[0].last_done)
             except:
@@ -4587,76 +4492,61 @@ class QQQLiveTrader:
         """同步验证长桥实际持仓与内部持仓是否一致"""
         if not self.position:
             return
-        
+
         pos = self.position
         opt_symbol = pos['opt_symbol']
         expected_qty = pos['contracts']
-        
+
         try:
-            stock_positions = self.trade_ctx.stock_positions()
-            if stock_positions and hasattr(stock_positions, 'channels'):
-                for channel in stock_positions.channels:
-                    if hasattr(channel, 'positions'):
-                        for p in channel.positions:
-                            if hasattr(p, 'symbol') and p.symbol == opt_symbol:
-                                actual_qty = int(getattr(p, 'quantity', 0) or 0)
-                                if actual_qty != expected_qty:
-                                    print(f"  ⚠️ 持仓不一致! 内部:{expected_qty}张, 长桥:{actual_qty}张")
-                                    # 更新为实际数量
-                                    pos['contracts'] = actual_qty
-                                    pos['quantity'] = actual_qty * self.cfg['contract_multiplier']
-                                    print(f"  📝 已同步持仓数量为: {actual_qty}张")
-                                    
-                                    # 如果实际持仓为0，说明被强平或出错
-                                    if actual_qty == 0:
-                                        print(f"  ❌ 持仓已清空! 清除内部持仓")
-                                        self._unsubscribe_quotes([pos.get('opt_symbol')])
-                                        self.position = None
-                                        self._save_state()
-                                        # 发送持仓被清空通知
-                                        self._notify(
-                                            "🔴 持仓被清空",
-                                            'position_anomaly',
-                                            anomaly_type='cleared',
-                                            details=f"期权 <code>{opt_symbol}</code>\n系统持仓已被清空\n可能是被强平或异常操作",
-                                        )
-                                    else:
-                                        # 发送持仓不一致通知
-                                        self._notify(
-                                            "⚠️ 持仓数量不一致",
-                                            'position_anomaly',
-                                            anomaly_type='mismatch',
-                                            details=f"期权 <code>{opt_symbol}</code>\n内部 <b>{expected_qty}</b>张\n长桥 <b>{actual_qty}</b>张",
-                                        )
-                                    return
-                                else:
-                                    # 数量一致，持仓正常
-                                    self._missing_position_count = 0  # 重置未找到计数
-                                    return
-                # 如果遍历完没找到
-                # ⚠️ 不要立即清空持仓！可能是网络延迟或持仓尚未更新
-                # 记录警告，下次验证时再检查
-                print(f"  ⚠️ 长桥未找到 {opt_symbol} 持仓（可能是网络延迟，等待下次验证）")
-                if not hasattr(self, '_missing_position_count'):
+            broker_position = self.position_book.find(opt_symbol)
+            if broker_position:
+                actual_qty = broker_position.quantity
+                if actual_qty == expected_qty:
                     self._missing_position_count = 0
-                self._missing_position_count += 1
-                # 连续3次（3分钟）都找不到才清空持仓
-                if self._missing_position_count >= 3:
-                    print(f"  ❌ 连续{self._missing_position_count}次未找到持仓，清除内部持仓")
+                    return
+
+                print(f"  ⚠️ 持仓不一致! 内部:{expected_qty}张, 长桥:{actual_qty}张")
+                pos['contracts'] = actual_qty
+                pos['quantity'] = actual_qty * self.cfg['contract_multiplier']
+                print(f"  📝 已同步持仓数量为: {actual_qty}张")
+                if actual_qty == 0:
+                    print("  ❌ 持仓已清空! 清除内部持仓")
                     self._unsubscribe_quotes([pos.get('opt_symbol')])
                     self.position = None
                     self._save_state()
-                    self._missing_position_count = 0
-                    print(f"  📝 已清除内部持仓")
-                    # 发送持仓丢失通知
                     self._notify(
-                        "❌ 持仓丢失",
+                        "🔴 持仓被清空",
                         'position_anomaly',
-                        anomaly_type='missing',
-                        details=f"期权 <code>{opt_symbol}</code>\n连续{3}次未找到持仓\n已自动清除内部持仓",
+                        anomaly_type='cleared',
+                        details=f"期权 <code>{opt_symbol}</code>\n系统持仓已被清空\n可能是被强平或异常操作",
                     )
                 else:
-                    print(f"  ⏳ 第{self._missing_position_count}/3次未找到，继续保留持仓")
+                    self._notify(
+                        "⚠️ 持仓数量不一致",
+                        'position_anomaly',
+                        anomaly_type='mismatch',
+                        details=f"期权 <code>{opt_symbol}</code>\n内部 <b>{expected_qty}</b>张\n长桥 <b>{actual_qty}</b>张",
+                    )
+                return
+
+            print(f"  ⚠️ 长桥未找到 {opt_symbol} 持仓（可能是网络延迟，等待下次验证）")
+            self._missing_position_count += 1
+            if self._missing_position_count >= 3:
+                missing_count = self._missing_position_count
+                print(f"  ❌ 连续{missing_count}次未找到持仓，清除内部持仓")
+                self._unsubscribe_quotes([pos.get('opt_symbol')])
+                self.position = None
+                self._save_state()
+                self._missing_position_count = 0
+                print("  📝 已清除内部持仓")
+                self._notify(
+                    "❌ 持仓丢失",
+                    'position_anomaly',
+                    anomaly_type='missing',
+                    details=f"期权 <code>{opt_symbol}</code>\n连续{missing_count}次未找到持仓\n已自动清除内部持仓",
+                )
+            else:
+                print(f"  ⏳ 第{self._missing_position_count}/3次未找到，继续保留持仓")
         except Exception as e:
             print(f"  ⚠️ 持仓同步验证失败: {e}")
 
@@ -4679,7 +4569,7 @@ class QQQLiveTrader:
         side = OrderSide.Sell  # 卖出平仓
 
         try:
-            resp = self.trade_ctx.submit_order(
+            resp = self.broker.submit_order(
                 symbol=pos['opt_symbol'],
                 order_type=OrderType.MO,
                 side=side,
@@ -4698,34 +4588,19 @@ class QQQLiveTrader:
             max_retries = 5
             retry_interval = 3
 
-            for attempt in range(max_retries):
-                time.sleep(retry_interval)
+            for attempt, snapshot in self.order_execution.poll(
+                order_id, retries=max_retries, interval=retry_interval,
+            ):
                 try:
-                    order_info = None
-                    try:
-                        orders = self.trade_ctx.today_orders(order_id=order_id)
-                        if orders:
-                            order_info = orders[0]
-                    except Exception as e1:
-                        print(f"  ⚠️ 半仓查询失败(方式1): {e1}")
-
-                    if not order_info:
-                        try:
-                            all_orders = self.trade_ctx.today_orders()
-                            for o in all_orders:
-                                if str(getattr(o, 'order_id', None)) == str(order_id):
-                                    order_info = o
-                                    break
-                        except Exception as e2:
-                            print(f"  ⚠️ 半仓查询失败(方式2): {e2}")
+                    order_info = snapshot.order if snapshot else None
 
                     if not order_info:
                         print(f"  ⚠️ 未找到半仓订单: {order_id} ({attempt + 1}/{max_retries})")
                         continue
 
-                    order_status = getattr(order_info, 'status', None)
-                    executed_qty = float(getattr(order_info, 'executed_quantity', 0) or 0)
-                    executed_price = float(getattr(order_info, 'executed_price', 0) or 0)
+                    order_status = snapshot.status
+                    executed_qty = snapshot.quantity
+                    executed_price = snapshot.price
                     print(f"  📊 半仓状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
 
                     if str(order_status) == 'OrderStatus.Rejected':
@@ -4745,7 +4620,7 @@ class QQQLiveTrader:
 
                     if attempt == max_retries - 1:
                         try:
-                            self.trade_ctx.cancel_order(order_id)
+                            self.broker.cancel_order(order_id)
                             print(f"  🚫 半仓订单超时未成交，已尝试取消")
                         except Exception as cancel_err:
                             print(f"  ⚠️ 半仓订单取消失败: {cancel_err}")
@@ -4763,7 +4638,7 @@ class QQQLiveTrader:
             exit_opt = float(executed_price) if executed_price > 0 else 0
             if exit_opt <= 0:
                 try:
-                    opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
+                    opt_quotes = self.broker.quote([pos['opt_symbol']])
                     if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
                         exit_opt = float(opt_quotes[0].last_done)
                     else:
@@ -4814,7 +4689,7 @@ class QQQLiveTrader:
 
             # 计算整体持仓在平仓时的盈亏（用于设置半仓后的跟踪止损基准）
             try:
-                opt_quotes_all = self.quote_ctx.quote([pos['opt_symbol']])
+                opt_quotes_all = self.broker.quote([pos['opt_symbol']])
                 if opt_quotes_all and hasattr(opt_quotes_all[0], 'last_done') and opt_quotes_all[0].last_done > 0:
                     overall_opt_price = float(opt_quotes_all[0].last_done)
                 else:
@@ -4843,7 +4718,7 @@ class QQQLiveTrader:
             pos['half_closed_max_pct'] = overall_pnl_pct   # 用整体盈亏作基准，而非已平仓半张的盈亏
             # 重置正股峰值：剩余仓位的跟踪止损从当前正股价格开始计算
             try:
-                stock_quotes = self.quote_ctx.quote([self.cfg['symbol']])
+                stock_quotes = self.broker.quote([self.cfg['symbol']])
                 if stock_quotes:
                     current_stock = float(stock_quotes[0].last_done)
                     pos['stock_peak'] = current_stock
@@ -4896,7 +4771,7 @@ class QQQLiveTrader:
         side = OrderSide.Sell  # 卖出平仓（不管Call还是Put，都是Sell平仓）
 
         try:
-            resp = self.trade_ctx.submit_order(
+            resp = self.broker.submit_order(
                 symbol=pos['opt_symbol'],  # 使用期权代码平仓
                 order_type=OrderType.MO,
                 side=side,
@@ -4917,35 +4792,16 @@ class QQQLiveTrader:
             close_qty = 0
             requested_qty = int(pos['contracts'])
 
-            for attempt in range(max_retries):
-                time.sleep(retry_interval)
+            for attempt, snapshot in self.order_execution.poll(
+                order_id, retries=max_retries, interval=retry_interval,
+            ):
                 try:
-                    # 查询订单状态
-                    order_info = None
-                    
-                    # 方式1: 通过order_id查询
-                    try:
-                        orders = self.trade_ctx.today_orders(order_id=order_id)
-                        if orders:
-                            order_info = orders[0]
-                    except Exception as e1:
-                        print(f"  ⚠️ 平仓查询失败(方式1): {e1}")
-                    
-                    # 方式2: 查询所有今日订单
-                    if not order_info:
-                        try:
-                            all_orders = self.trade_ctx.today_orders()
-                            for o in all_orders:
-                                if hasattr(o, 'order_id') and o.order_id == order_id:
-                                    order_info = o
-                                    break
-                        except Exception as e2:
-                            print(f"  ⚠️ 平仓查询失败(方式2): {e2}")
+                    order_info = snapshot.order if snapshot else None
                     
                     if order_info:
-                        order_status = getattr(order_info, 'status', None)
-                        executed_qty = float(getattr(order_info, 'executed_quantity', 0) or 0)
-                        executed_price = float(getattr(order_info, 'executed_price', 0) or 0)
+                        order_status = snapshot.status
+                        executed_qty = snapshot.quantity
+                        executed_price = snapshot.price
                         
                         print(f"  📊 平仓状态: {order_status} | 已成交: {executed_qty}张 @ ${executed_price}")
                         
@@ -4979,7 +4835,7 @@ class QQQLiveTrader:
                             if attempt == max_retries - 1:
                                 print(f"  ❌ 平仓超时，尝试取消")
                                 try:
-                                    self.trade_ctx.cancel_order(order_id)
+                                    self.broker.cancel_order(order_id)
                                 except:
                                     pass
                     else:
@@ -4996,7 +4852,7 @@ class QQQLiveTrader:
             if not close_filled:
                 print(f"  ⚠️ 平仓订单未成交（可能超时/取消），尝试获取当前价格")
                 try:
-                    opt_quotes = self.quote_ctx.quote([pos['opt_symbol']])
+                    opt_quotes = self.broker.quote([pos['opt_symbol']])
                     if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
                         exit_opt = float(opt_quotes[0].last_done)
                         print(f"  📈 获取到期权当前价: ${exit_opt:.2f}")
@@ -5194,371 +5050,6 @@ class QQQLiveTrader:
             traceback.print_exc()
 
 
-    def _fmt_day_market(self, source=None):
-        regime = {}
-        if isinstance(source, dict):
-            raw = source.get('metadata', {}).get('day_market_regime') if isinstance(source.get('metadata'), dict) else None
-            if isinstance(raw, dict):
-                regime = raw
-            else:
-                regime = {
-                    'type': source.get('day_market_regime', ''),
-                    'label': source.get('day_market_label', ''),
-                }
-        if not regime:
-            regime = self.day_market_regime if isinstance(self.day_market_regime, dict) else {}
-        label = regime.get('label') or regime.get('type') or '--'
-        direction = regime.get('direction') or ''
-        reason = regime.get('reason') or ''
-        direction_text = {'call': '偏多', 'put': '偏空'}.get(direction, '中性')
-        if reason:
-            return f"当日行情 <b>{label}</b> ({direction_text})\n<code>{reason}</code>\n"
-        return f"当日行情 <b>{label}</b> ({direction_text})\n"
-
-    def _fmt_entry(self, sig, opt_symbol, price, contracts, qty, order_id):
-        """格式化开仓通知"""
-        dir_emoji = '🟢' if sig['dir'] == 'call' else '🔴'
-        dir_text = '做多 CALL' if sig['dir'] == 'call' else '做空 PUT'
-        regime = sig.get('regime', '--')
-        reason = sig.get('reason', '--')
-        entry_opt = self.position.get('entry_opt_price', 0) if self.position else 0
-        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
-        total = len(closed_trades)
-        wins = sum(1 for t in closed_trades if t.get('win'))
-        wr = wins/total*100 if total > 0 else 0
-        return (
-            f"<b>🎯 开仓 #{len(self.trades_today)}</b>\n"
-            f"───────────\n"
-            f"{dir_emoji} <b>{dir_text}</b>\n"
-            f"<code>{opt_symbol}</code>\n"
-            f"───────────\n"
-            f"正股 <b>${price:.2f}</b> | 期权 <b>${entry_opt:.2f}</b>\n"
-            f"数量 <b>{contracts}</b>张 ({qty}股)\n"
-            f"策略行情 <b>{regime}</b>\n"
-            f"{self._fmt_day_market(sig)}"
-            f"理由 {reason}\n"
-            f"订单 {order_id}\n"
-            f"───────────\n"
-            f"📈 今日统计\n"
-            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
-            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
-        )
-
-    def _fmt_exit(self, pos, reason, entry_opt, exit_opt, pnl_pct, pnl_usd, order_id='--'):
-        """格式化平仓通知"""
-        emoji = '✅' if pnl_pct > 0 else '❌'
-        dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
-        dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
-        label = '盈利' if pnl_pct > 0 else '亏损'
-        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
-        total = len(closed_trades)
-        wins = sum(1 for t in closed_trades if t.get('win'))
-        wr = wins/total*100 if total > 0 else 0
-        return (
-            f"<b>🏁 平仓 #{len(self.trades_today)}</b>\n"
-            f"───────────\n"
-            f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
-            f"原因 <b>{reason}</b>\n"
-            f"───────────\n"
-            f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
-            f"{emoji} {label} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
-            f"{self._fmt_day_market(pos)}"
-            f"订单 {order_id}\n"
-            f"───────────\n"
-            f"📈 今日统计\n"
-            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
-            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
-        )
-
-    def _fmt_partial(self, pos, reason, entry_opt, exit_opt, half, remaining, pnl_pct, pnl_usd):
-        """格式化部分平仓通知"""
-        emoji = '✅' if pnl_pct > 0 else '❌'
-        dir_emoji = '🟢' if pos.get('dir') == 'call' else '🔴'
-        dir_text = 'CALL' if pos.get('dir') == 'call' else 'PUT'
-        return (
-            f"<b>✂️ 部分平仓</b>\n"
-            f"───────────\n"
-            f"{dir_emoji} <b>{dir_text}</b> <code>{pos.get('opt_symbol','')}</code>\n"
-            f"原因 <b>{reason}</b>\n"
-            f"───────────\n"
-            f"入场 ${entry_opt:.2f} → 平仓 ${exit_opt:.2f}\n"
-            f"{emoji} <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
-            f"{self._fmt_day_market(pos)}"
-            f"平掉 <b>{half}</b>张 | 剩余 <b>{remaining}</b>张"
-        )
-
-    def _fmt_alert(self, level, loss_pct, threshold):
-        """格式化熔断/警告通知"""
-        icons = {1: '⚠️', 2: '🔶', 3: '🔴'}
-        labels = {1: '警告', 2: '保守', 3: '熔断'}
-        icon = icons.get(level, '⚠️')
-        desc = ''
-        if level >= 1: desc += ' 仓位减半'
-        if level >= 2: desc += ' | 只做trending'
-        if level >= 3: desc += ' | 停止所有交易'
-        return (
-            f"<b>{icon} 亏损{labels.get(level,'通知')}</b>\n"
-            f"───────────\n"
-            f"当前亏损 <b>{loss_pct:.1f}%</b> (阈值 {threshold:.0f}%)\n"
-            f"{desc}"
-        )
-
-    def _fmt_system(self, event_type, **kw):
-        """格式化系统事件"""
-        if event_type == 'exit':
-            return (
-                f"<b>⚠️ 系统退出</b>\n"
-                f"───────────\n"
-                f"原因 <b>{kw.get('sig_name','')}</b>\n"
-                f"时间 {kw.get('time','')}\n"
-                f"今日交易 <b>{kw.get('trades',0)}</b>笔\n"
-                f"盈亏 <b>{kw.get('pnl',0):+,.2f}</b>"
-            )
-        elif event_type == 'crash':
-            return (
-                f"<b>❌ 系统异常</b>\n"
-                f"───────────\n"
-                f"时间 {kw.get('time','')}\n"
-                f"错误 <code>{kw.get('error','')}</code>"
-            )
-        elif event_type == 'cancel':
-            return (
-                f"<b>⏰ 订单超时取消</b>\n"
-                f"───────────\n"
-                f"期权 <code>{kw.get('symbol','')}</code>"
-            )
-        return ''
-
-    def _fmt_startup(self):
-        """格式化启动通知"""
-        return (
-            f"<b>🚀 系统启动</b>\n"
-            f"───────────\n"
-            f"版本 <code>v7 Multi-Engine</code>\n"
-            f"时间 <code>{datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M ET')}</code>\n"
-            f"账户 <b>${self.actual_capital:,.2f}</b>\n"
-            f"昨日盈亏 <b>${self.yesterday_pnl:+,.2f}</b> ({self.yesterday_trades}笔, 胜率{self.yesterday_wr:.0f}%)"
-        )
-
-    def _fmt_shutdown(self, reason='未知'):
-        """格式化停止通知"""
-        runtime = datetime.now(TZ_ET) - self.start_time
-        hours = int(runtime.total_seconds() // 3600)
-        mins = int((runtime.total_seconds() % 3600) // 60)
-        total = len(self.trades_today)
-        wins = sum(1 for t in self.trades_today if t.get('win'))
-        return (
-            f"<b>⏹️ 系统停止</b>\n"
-            f"───────────\n"
-            f"原因 <b>{reason}</b>\n"
-            f"运行时长 <b>{hours}h {mins}m</b>\n"
-            f"今日交易 <b>{total}</b>笔 | 盈利<b>{wins}</b> | 亏损<b>{total-wins}</b>\n"
-            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>"
-        )
-
-    def _fmt_daily_summary(self):
-        """格式化日终总结通知"""
-        try:
-            self._save_daily_records()
-            from review_summary import build_review_summary
-            return build_review_summary('day', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
-        except Exception as e:
-            print(f"⚠️ 新版日终复盘生成失败，回退旧版: {e}")
-        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
-        total = len(closed_trades)
-        wins = sum(1 for t in closed_trades if t.get('win'))
-        wr = wins/total*100 if total > 0 else 0
-        
-        call_cnt = sum(1 for t in closed_trades if t.get('dir')=='call')
-        put_cnt = total - call_cnt
-        call_win = sum(1 for t in closed_trades if t.get('dir')=='call' and t.get('win'))
-        put_win = sum(1 for t in closed_trades if t.get('dir')=='put' and t.get('win'))
-        call_wr = call_win/call_cnt*100 if call_cnt > 0 else 0
-        put_wr = put_win/put_cnt*100 if put_cnt > 0 else 0
-        
-        return (
-            f"<b>📊 日终总结 {datetime.now(TZ_ET).strftime('%Y-%m-%d')}</b>\n"
-            f"───────────\n"
-            f"总交易 <b>{total}</b>笔 | 盈利<b>{wins}</b> | 亏损<b>{total-wins}</b>\n"
-            f"胜率 <b>{wr:.1f}%</b>\n"
-            f"盈亏 <b>${self.daily_pnl:+,.2f}</b>\n"
-            f"───────────\n"
-            f"方向分布\n"
-            f"🟢 CALL <b>{call_cnt}</b>笔 (胜率{call_wr:.0f}%, ${self.call_pnl:+,.2f})\n"
-            f"🔴 PUT  <b>{put_cnt}</b>笔 (胜率{put_wr:.0f}%, ${self.put_pnl:+,.2f})\n"
-            f"───────────\n"
-            f"连续统计\n"
-            f"🔥 最长连胜 <b>{self.max_consecutive_wins}</b>笔\n"
-            f"❄️ 最长连亏 <b>{self.max_consecutive_losses}</b>笔\n"
-            f"───────────\n"
-            f"单笔最佳\n"
-            f"✅ 最大盈利 <b>+${self.largest_win_usd:,.2f}</b> ({self.largest_win_pct:+.1f}%)\n"
-            f"❌ 最大亏损 <b>-${abs(self.largest_loss_usd):,.2f}</b> ({self.largest_loss_pct:+.1f}%)"
-        )
-
-    def _get_today_stats_html(self):
-        """获取今日统计HTML片段（用于开仓/平仓通知底部）"""
-        closed_trades = [t for t in self.trades_today if t.get('win') is not None]
-        total = len(closed_trades)
-        wins = sum(1 for t in closed_trades if t.get('win'))
-        wr = wins/total*100 if total > 0 else 0
-        
-        return (
-            f"📈 今日统计\n"
-            f"交易 <b>{total}</b>笔 | 胜率<b>{wr:.0f}%</b> | 盈亏<b>${self.daily_pnl:+,.2f}</b>\n"
-            f"🔥 连胜{self.max_consecutive_wins} | ❄️ 连亏{self.max_consecutive_losses}"
-        )
-
-    def _fmt_weekly_summary(self):
-        """格式化周度收益汇总通知"""
-        try:
-            from review_summary import build_review_summary
-            return build_review_summary('week', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
-        except Exception as e:
-            print(f"⚠️ 新版周度复盘生成失败，回退旧版: {e}")
-        from datetime import timedelta
-        import json
-        
-        today = datetime.now(TZ_ET).date()
-        # 计算本周一
-        monday = today - timedelta(days=today.weekday())
-        
-        weekly_trades = []
-        weekly_pnl = 0
-        weekly_wins = 0
-        weekly_total = 0
-        daily_summaries = []
-        
-        # 读取本周所有交易记录
-        records_dir = os.path.join(_app_dir(), 'records')
-        for i in range(5):  # 周一到周五
-            day = monday + timedelta(days=i)
-            filepath = os.path.join(records_dir, f'{day.strftime("%Y-%m-%d")}.json')
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    day_trades = data.get('trades', [])
-                    day_pnl = data.get('pnl', 0)
-                    day_wins = data.get('wins', 0)
-                    day_total = data.get('total', 0)
-                    
-                    weekly_trades.extend(day_trades)
-                    weekly_pnl += day_pnl
-                    weekly_wins += day_wins
-                    weekly_total += day_total
-                    
-                    daily_summaries.append({
-                        'date': day.strftime('%m/%d'),
-                        'trades': day_total,
-                        'wins': day_wins,
-                        'pnl': day_pnl,
-                    })
-                except Exception:
-                    pass
-        
-        if weekly_total == 0:
-            return "<b>📊 周度总结</b>\n───────────\n本周无交易记录"
-        
-        weekly_wr = weekly_wins / weekly_total * 100 if weekly_total > 0 else 0
-        
-        # 计算方向分布
-        call_cnt = sum(1 for t in weekly_trades if t.get('dir') == 'call')
-        put_cnt = weekly_total - call_cnt
-        call_win = sum(1 for t in weekly_trades if t.get('dir') == 'call' and t.get('result') == 'win')
-        put_win = sum(1 for t in weekly_trades if t.get('dir') == 'put' and t.get('result') == 'win')
-        call_wr = call_win / call_cnt * 100 if call_cnt > 0 else 0
-        put_wr = put_win / put_cnt * 100 if put_cnt > 0 else 0
-        call_pnl = sum(t.get('pnl_usd', 0) for t in weekly_trades if t.get('dir') == 'call')
-        put_pnl = sum(t.get('pnl_usd', 0) for t in weekly_trades if t.get('dir') == 'put')
-        
-        # 找出最佳/最差交易
-        best_trade = max(weekly_trades, key=lambda t: t.get('pnl_usd', 0))
-        worst_trade = min(weekly_trades, key=lambda t: t.get('pnl_usd', 0))
-        
-        # 每日明细
-        daily_detail = ""
-        for d in daily_summaries:
-            emoji = "✅" if d['pnl'] > 0 else "❌" if d['pnl'] < 0 else "➖"
-            daily_detail += f"{emoji} {d['date']} {d['trades']}笔 {d['wins']}胜 ${d['pnl']:+,.2f}\n"
-        
-        return (
-            f"<b>📊 周度总结 {monday.strftime('%m/%d')}~{today.strftime('%m/%d')}</b>\n"
-            f"───────────\n"
-            f"总交易 <b>{weekly_total}</b>笔 | 盈利<b>{weekly_wins}</b> | 亏损<b>{weekly_total - weekly_wins}</b>\n"
-            f"胜率 <b>{weekly_wr:.1f}%</b>\n"
-            f"盈亏 <b>${weekly_pnl:+,.2f}</b>\n"
-            f"───────────\n"
-            f"方向分布\n"
-            f"🟢 CALL <b>{call_cnt}</b>笔 (胜率{call_wr:.0f}%, ${call_pnl:+,.2f})\n"
-            f"🔴 PUT  <b>{put_cnt}</b>笔 (胜率{put_wr:.0f}%, ${put_pnl:+,.2f})\n"
-            f"───────────\n"
-            f"每日明细\n"
-            f"{daily_detail}"
-            f"───────────\n"
-            f"最佳交易\n"
-            f"✅ <code>{best_trade.get('opt_symbol', '--')}</code> ${best_trade.get('pnl_usd', 0):+,.2f}\n"
-            f"最差交易\n"
-            f"❌ <code>{worst_trade.get('opt_symbol', '--')}</code> ${worst_trade.get('pnl_usd', 0):+,.2f}"
-        )
-
-    def _fmt_network_alert(self, error_msg, retry_count=0):
-        """格式化网络断连告警"""
-        return (
-            f"<b>🌐 网络异常</b>\n"
-            f"───────────\n"
-            f"错误 <code>{error_msg[:100]}</code>\n"
-            f"重试次数 <b>{retry_count}</b>\n"
-            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
-            f"───────────\n"
-            f"系统将自动重连，请关注后续通知"
-        )
-
-    def _fmt_api_rate_limit(self, api_name, wait_seconds):
-        """格式化API限流告警"""
-        return (
-            f"<b>⏱️ API限流</b>\n"
-            f"───────────\n"
-            f"接口 <b>{api_name}</b>\n"
-            f"等待 <b>{wait_seconds}</b>秒后重试\n"
-            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
-            f"───────────\n"
-            f"交易暂停，等待限流解除"
-        )
-
-    def _fmt_position_anomaly(self, anomaly_type, details):
-        """格式化持仓异常告警"""
-        icons = {
-            'mismatch': '⚠️',
-            'missing': '❌',
-            'cleared': '🔴',
-            'verify_failed': '❗',
-        }
-        labels = {
-            'mismatch': '持仓数量不一致',
-            'missing': '持仓丢失',
-            'cleared': '持仓被清空',
-            'verify_failed': '持仓验证失败',
-        }
-        icon = icons.get(anomaly_type, '⚠️')
-        label = labels.get(anomaly_type, '持仓异常')
-        
-        return (
-            f"<b>{icon} {label}</b>\n"
-            f"───────────\n"
-            f"{details}\n"
-            f"时间 {datetime.now(TZ_ET).strftime('%H:%M:%S ET')}\n"
-            f"───────────\n"
-            f"请检查账户状态"
-        )
-
-    def _fmt_monthly_summary(self):
-        """格式化月度复盘通知"""
-        try:
-            from review_summary import build_review_summary
-            return build_review_summary('month', datetime.now(TZ_ET).strftime('%Y-%m-%d')).get('telegram_html', '')
-        except Exception as e:
-            return f"<b>月度复盘生成失败</b>\n<code>{str(e)[:180]}</code>"
 
     def _summary_flags_path(self):
         return str(self.review_scheduler.flags_path)
@@ -5591,30 +5082,6 @@ class QQQLiveTrader:
         """Telegram通知 - 支持HTML格式的消息"""
         return self.notification_service.send_telegram(msg, msg_type=msg_type, **kw)
 
-    def _format_notification(self, msg, msg_type='info', **kw):
-        """Build notification HTML while business summaries still live on the trader."""
-        formatters = {
-            'entry': self._fmt_entry,
-            'exit': self._fmt_exit,
-            'partial': self._fmt_partial,
-            'alert': self._fmt_alert,
-            'startup': self._fmt_startup,
-            'shutdown': self._fmt_shutdown,
-            'daily_summary': self._fmt_daily_summary,
-            'weekly_summary': self._fmt_weekly_summary,
-            'monthly_summary': self._fmt_monthly_summary,
-            'network': self._fmt_network_alert,
-            'rate_limit': self._fmt_api_rate_limit,
-            'position_anomaly': self._fmt_position_anomaly,
-            'system': self._fmt_system,
-        }
-        formatter = formatters.get(msg_type)
-        if formatter:
-            return formatter(**kw)
-        lines = msg.split('\n')
-        first = lines[0] if lines else msg
-        rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
-        return f"<b>{first}</b>\n───────────\n{rest}" if rest else f"<b>{first}</b>"
 
 
     def _notify(self, msg, msg_type='info', **kw):
@@ -5677,131 +5144,40 @@ class QQQLiveTrader:
 
             # 1. 拉取账户资金
             try:
-                balance = self.trade_ctx.account_balance()
+                balance = self.broker.account_balance()
                 if balance:
-                    # balance 本身就是一个 list
-                    currencies_list = list(balance) if isinstance(balance, (list, tuple)) else (getattr(balance, 'currencies', None) or [])
-                    # 累加器：合并所有币种，统一为 USD
-                    total_net_assets_usd = 0.0
-                    total_cash_usd = 0.0
-                    total_buying_power_usd = 0.0
-                    
-                    for cur in currencies_list:
-                        currency = str(getattr(cur, 'currency', 'unknown') or 'unknown')
-                        net_assets = float(getattr(cur, 'net_assets', 0) or 0)
-                        total_cash_val = float(getattr(cur, 'total_cash', 0) or 0)
-                        # cash 字段在 SDK 4.x 中不存在，直接用 total_cash 更可靠
-                        cash = 0.0
-                        cash_attr = getattr(cur, 'cash', None)
-                        if cash_attr is not None:
-                            cash = float(cash_attr or 0)
-                        else:
-                            cash = total_cash_val
-                        market_value = float(getattr(cur, 'market_value', 0) or 0)
-                        # buy_power 在 SDK 4.x 中叫 buy_power，旧版叫 buying_power
-                        buying_power = 0.0
-                        for bp_attr in ['buy_power', 'buying_power', 'max_power', 'power', 'available_funds', 'max_power_long']:
-                            bp_val = getattr(cur, bp_attr, None)
-                            if bp_val is not None:
-                                buying_power = float(bp_val or 0)
-                                if buying_power > 0:
-                                    break
-                        if buying_power == 0:
-                            buying_power = cash
-                        
-                        # 转换为 USD
-                        if currency == 'HKD':
-                            rate = 7.8
-                            net_assets_usd = net_assets / rate
-                            cash_usd = cash / rate
-                            total_cash_usd += total_cash_val / rate
-                            buying_power_usd = buying_power / rate
-                        elif currency == 'CNY':
-                            rate = 7.2  # 人民币汇率，可根据需要调整
-                            net_assets_usd = net_assets / rate
-                            cash_usd = cash / rate
-                            total_cash_usd += total_cash_val / rate
-                            buying_power_usd = buying_power / rate
-                        else:
-                            # USD 或其他货币（如 SGD、EUR 等），暂按 1:1
-                            net_assets_usd = net_assets
-                            cash_usd = cash
-                            total_cash_usd += total_cash_val
-                            buying_power_usd = buying_power
-                        
-                        total_net_assets_usd += net_assets_usd
-                        total_cash_usd += cash_usd
-                        total_buying_power_usd += buying_power_usd
-                    
-                    # 保存合并后的扁平结构（Web 用）
-                    account_info = {
-                        'net_assets': total_net_assets_usd,
-                        'cash': total_buying_power_usd,
-                        'buying_power': total_cash_usd,
-                    }
-                    
-                    # 打印日志（仅首次启动时）
+                    account_info = self.account_service.normalize(balance)
+                    net_assets = float(account_info.get('net_assets', 0) or 0)
+                    if net_assets > 0:
+                        self.actual_capital = net_assets
                     if not silent:
-                        print(f"💰 账户资金 (USD): 净值=${total_net_assets_usd:,.0f} 现金=${total_buying_power_usd:,.0f} 购买力=${total_cash_usd:,.0f}")
-                    # 兜底
-                    if not currencies_list:
-                        for attr in ['total_assets', 'net_assets', 'cash', 'market_value']:
-                            val = getattr(balance, attr, None)
-                            if val is not None and val != 0:
-                                account_info['_direct'] = account_info.get('_direct', {})
-                                account_info['_direct'][attr] = float(val or 0)
-
-                    if account_info:
-                        # 更新实际资金（用于通知/风控计算）
-                        if total_net_assets_usd > 0:
-                            self.actual_capital = total_net_assets_usd
-                        # 修复: account_info 值可能是 float (net_assets/cash) 或 dict (_direct)
-                        if not silent:
-                            summary_parts = []
-                            for k, v in account_info.items():
-                                if isinstance(v, dict):
-                                    summary_parts.append(f"{k}=${v.get('net_assets',0):,.0f}")
-                                else:
-                                    summary_parts.append(f"{k}=${v:,.0f}")
-                            summary = ', '.join(summary_parts)
-                            print(f"💰 账户资金: {summary}")
-                    else:
-                        if not silent:
-                            print(f"  ⚠️ account_balance 返回空: {type(balance).__name__} {dir(balance)}")
+                        print(
+                            f"💰 账户资金 (USD): 净值${net_assets:,.0f} "
+                            f"现金${account_info.get('cash', 0):,.0f} "
+                            f"购买力${account_info.get('buying_power', 0):,.0f}"
+                        )
+                elif not silent:
+                    print("  ⚠️ account_balance 返回空")
             except Exception as e:
                 if not silent:
                     print(f"  ⚠️ 拉取账户资金失败: {e}")
 
             # 2. 拉取实际持仓（含期权+正股）
             try:
-                lb_pos = self.trade_ctx.stock_positions()
-                if lb_pos:
-                    for ch in getattr(lb_pos, 'channels', []) or []:
-                        for p in getattr(ch, 'positions', []) or []:
-                            symbol = str(getattr(p, 'symbol', '') or '')
-                            if not symbol:
-                                continue
-                            qty = float(getattr(p, 'quantity', 0) or 0)
-                            if qty <= 0:
-                                continue
-                            available = float(getattr(p, 'available_quantity', qty) or qty)
-                            cost = float(getattr(p, 'cost_price', 0) or 0)
-                            channel = str(getattr(ch, 'name', '') or str(getattr(ch, 'channel', '')))
-                            opt_match = re.search(r'\d{6}([CP])', symbol.upper())
-                            direction = ''
-                            if opt_match:
-                                direction = 'call' if opt_match.group(1) == 'C' else 'put'
-                            positions.append({
-                                'symbol': symbol,
-                                'opt_symbol': symbol,
-                                'dir': direction,
-                                'qty': int(qty),
-                                'contracts': int(qty),
-                                'available': int(available),
-                                'cost': cost,
-                                'entry_opt_price': cost,
-                                'channel': channel,
-                            })
+                for broker_position in self.position_book.load():
+                    if broker_position.quantity <= 0 or not broker_position.symbol:
+                        continue
+                    positions.append({
+                        'symbol': broker_position.symbol,
+                        'opt_symbol': broker_position.symbol,
+                        'dir': broker_position.option_direction,
+                        'qty': broker_position.quantity,
+                        'contracts': broker_position.quantity,
+                        'available': broker_position.available,
+                        'cost': broker_position.cost_price,
+                        'entry_opt_price': broker_position.cost_price,
+                        'channel': broker_position.channel,
+                    })
             except Exception as e:
                 print(f"  ⚠️ 拉取持仓失败: {e}")
 
@@ -5833,7 +5209,7 @@ class QQQLiveTrader:
     def _sync_longbridge_orders(self):
         """从长桥同步今日所有订单信息，保存到本地文件供web端读取"""
         try:
-            all_orders = self.trade_ctx.today_orders()
+            all_orders = self.broker.today_orders()
             if not all_orders:
                 if not getattr(self, '_warned_empty_orders', False):
                     print(f"  ⚠️ 长桥返回空订单列表（仅提示一次）")
@@ -6250,120 +5626,9 @@ class QQQLiveTrader:
 
     def _reconcile_trades_from_broker(self):
         """从 longbridge_orders.json 对账重建今日交易记录（FIFO配对）"""
-        from collections import defaultdict
-        from zoneinfo import ZoneInfo
-        TZ_ET = ZoneInfo("America/New_York")
-
-        script_dir = str(_app_dir())
-        lb_file = os.path.join(script_dir, 'longbridge_orders.json')
-        if not os.path.exists(lb_file):
-            return []
-
-        try:
-            with open(lb_file, encoding='utf-8') as f:
-                lb_data = json.load(f)
-        except:
-            return []
-
-        orders = lb_data.get('orders', [])
-        # 只处理 Filled 的订单
-        filled = [o for o in orders if o.get('status') == 'Filled']
-        if not filled:
-            return []
-
-        # 按合约分组，FIFO配对买卖
-        symbol_data = defaultdict(lambda: {'buys': [], 'sells': []})
-        for o in filled:
-            sym = o['symbol']
-            qty = float(o.get('executed_qty', 0) or o.get('quantity', 0))
-            price = float(o.get('executed_price', 0) or 0)
-            if o.get('side') == '买入':
-                symbol_data[sym]['buys'].append({'qty': qty, 'price': price})
-            elif o.get('side') == '卖出':
-                symbol_data[sym]['sells'].append({'qty': qty, 'price': price})
-
-        # 获取美东时间的今天日期
-        today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-
-        reconciled = []
-        for sym in sorted(symbol_data.keys()):
-            d = symbol_data[sym]
-            buys = list(d['buys'])
-            sells = list(d['sells'])
-
-            # 只处理有买有卖的（已平仓）
-            if not sells:
-                continue
-
-            total_buy_qty = sum(b['qty'] for b in buys)
-            total_sell_qty = sum(s['qty'] for s in sells)
-            if total_buy_qty <= 0 or total_sell_qty <= 0:
-                continue
-
-            # FIFO配对计算盈亏
-            unmatched_buys = list(buys)
-            total_pnl = 0
-            matched_qty = 0
-            avg_buy = sum(b['qty'] * b['price'] for b in buys) / total_buy_qty
-            avg_sell = sum(s['qty'] * s['price'] for s in sells) / total_sell_qty
-
-            for sell in sells:
-                sq = sell['qty']
-                sp = sell['price']
-                while sq > 0 and unmatched_buys:
-                    buy = unmatched_buys[0]
-                    match = min(sq, buy['qty'])
-                    pnl = match * (sp - buy['price']) * 100  # 期权乘数100
-                    total_pnl += pnl
-                    matched_qty += match
-                    buy['qty'] -= match
-                    sq -= match
-                    if buy['qty'] <= 0:
-                        unmatched_buys.pop(0)
-
-            # 判断方向：从期权代码提取
-            # QQQ260429C662000.US → C = Call, P = Put
-            opt_code = sym.replace('.US', '')
-            date_part = opt_code[3:9]  # 260429
-            rest = opt_code[9:]  # C662000 or P655000
-            opt_type = rest[0]  # C or P
-            strike = float(rest[1:]) / 1000  # 662000 → 662.0
-            direction = 'call' if opt_type == 'C' else 'put'
-
-            # 提取到期日 → 入场时间估算
-            # 260429 = 2026-04-29 到期，说明是4月29日的交易
-            try:
-                exp_year = 2000 + int(date_part[:2])
-                exp_month = int(date_part[2:4])
-                exp_day = int(date_part[4:6])
-                trade_date = f"{exp_year}-{exp_month:02d}-{exp_day:02d}"
-            except:
-                trade_date = today_et
-
-            # 计算盈亏百分比
-            pnl_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0
-            matched_contracts = int(matched_qty)
-
-            reconciled.append({
-                'date': trade_date,
-                'entry_time': today_et,
-                'exit_time': today_et,
-                'dir': direction,
-                'entry_price': round(avg_buy, 2),
-                'exit_price': avg_sell,
-                'qty': matched_contracts * 100,
-                'contracts': matched_contracts,
-                'pnl_pct': round(pnl_pct, 2),
-                'pnl_usd': round(total_pnl, 2),
-                'result': 'win' if total_pnl > 0 else 'lose' if total_pnl < 0 else '',
-                'reason': f'broker对账({len(buys)}买/{len(sells)}卖,配对{matched_contracts}张)',
-                'exit_reason': 'broker对账',
-                'opt_symbol': sym,
-                'entry_opt_price': round(avg_buy, 2),
-                '_source': 'broker_reconcile',
-            })
-
-        return reconciled
+        return self.trade_ledger.reconcile_broker_orders(
+            os.path.join(_app_dir(), 'longbridge_orders.json')
+        )
 
     def _save_records_snapshot(self):
         """每次平仓后实时保存当日记录到 records/（不依赖 Gist 同步）"""
