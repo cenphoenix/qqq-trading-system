@@ -5,7 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, SignalProbeStore, TradeLedger
+from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger
+from strategy.entry_policy import EntryPolicy
 
 
 TZ_ET = ZoneInfo("America/New_York")
@@ -100,6 +101,49 @@ class OrderExecutionTests(unittest.TestCase):
         self.assertEqual(results, [(0, None), (1, None), (2, None)])
         self.assertEqual(sleeps, [2, 2, 2])
 
+    def test_submit_and_wait_returns_partial_fill_and_cancels_remainder(self):
+        order = type("Order", (), {
+            "order_id": "7", "status": "OrderStatus.PartialFilled",
+            "executed_quantity": 2, "executed_price": 1.25,
+        })()
+
+        class Broker:
+            def submit_order(self, **kwargs):
+                return type("Response", (), {"order_id": "7"})()
+
+            def today_orders(self, *args, **kwargs):
+                return [order]
+
+            def cancel_order(self, order_id):
+                self.canceled = order_id
+
+        broker = Broker()
+        execution = OrderExecution(broker, sleep_fn=lambda _: None)
+        result = execution.submit_and_wait({"symbol": "TEST"}, 3, retries=1, interval=0)
+        self.assertTrue(result.filled)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.executed_quantity, 2)
+        self.assertEqual(broker.canceled, "7")
+
+    def test_submit_and_wait_preserves_rejection(self):
+        order = type("Order", (), {
+            "order_id": "8", "status": "OrderStatus.Rejected",
+            "executed_quantity": 0, "executed_price": 0,
+        })()
+
+        class Broker:
+            def submit_order(self, **kwargs):
+                return type("Response", (), {"order_id": "8"})()
+
+            def today_orders(self, *args, **kwargs):
+                return [order]
+
+        result = OrderExecution(Broker(), sleep_fn=lambda _: None).submit_and_wait(
+            {"symbol": "TEST"}, 3, retries=1, interval=0,
+        )
+        self.assertTrue(result.rejected)
+        self.assertFalse(result.filled)
+
 
 class PositionBookTests(unittest.TestCase):
     def test_positions_are_normalized_and_searchable(self):
@@ -155,6 +199,79 @@ class PositionBookTests(unittest.TestCase):
         position = PositionBook(Broker()).load()[0]
         self.assertEqual(position.option_direction, "put")
         self.assertTrue(position.is_option)
+
+
+class PositionSizerTests(unittest.TestCase):
+    def test_put_and_afternoon_caps_are_applied(self):
+        result = PositionSizer.calculate(100000, 1, "put", 1, {
+            "order_pct": 20, "put_order_pct": 8, "contract_multiplier": 100,
+            "max_contracts_per_trade": 400, "max_afternoon_contracts": 30,
+        }, afternoon=True)
+        self.assertEqual(result.effective_pct, 4)
+        self.assertEqual(result.contracts, 30)
+        self.assertEqual(result.quantity, 3000)
+
+    def test_blocked_late_session_size_is_zero(self):
+        result = PositionSizer.calculate(100000, 1, "call", 1, {
+            "order_pct": 20, "contract_multiplier": 100,
+        }, blocked=True)
+        self.assertEqual(result.contracts, 0)
+        self.assertEqual(result.quantity, 0)
+
+
+class PositionRiskPolicyTests(unittest.TestCase):
+    def test_put_measurement_updates_option_and_stock_peaks(self):
+        position = {
+            "dir": "put", "entry_opt_price": 1, "entry_price": 500,
+            "entry_bar": 10, "max_pnl_pct": 0, "stock_peak": 500,
+            "half_closed": False,
+        }
+        result = PositionRiskPolicy.measure(position, 1.2, 495, 15, True)
+        self.assertAlmostEqual(result.option_pnl_pct, 20)
+        self.assertAlmostEqual(result.stock_pnl_pct, 1)
+        self.assertEqual(result.bars_held, 5)
+        self.assertEqual(position["stock_peak"], 495)
+        self.assertAlmostEqual(position["max_stock_pnl_pct"], 1)
+
+    def test_v62_trend_timeout_keeps_existing_profile(self):
+        profile = PositionRiskPolicy.timeout_profile(
+            {"reason": "v6.2", "timeout_bars": 10}, {
+                "v62_call_pool_timeout_stage_bars": 12,
+                "v62_call_pool_timeout_bars": 20,
+                "v62_call_pool_trend_timeout_bars": 28,
+                "trend_timeout_bonus_bars": 4,
+            }, "VWAP_Breakout", True, True,
+        )
+        self.assertEqual(profile["stage"], 12)
+        self.assertEqual(profile["hard"], 16)
+
+    def test_profit_tiers_are_sorted_and_normalized(self):
+        tiers = PositionRiskPolicy.profit_tiers({"profit_take_tiers": [
+            {"profit_pct": 60, "close_pct": 0.3},
+            {"profit_pct": 30, "close_pct": 0.3},
+        ]})
+        self.assertEqual([tier["profit_pct"] for tier in tiers], [30, 60])
+
+
+class EntryPolicyTests(unittest.TestCase):
+    def test_rejection_is_returned_as_structured_decision(self):
+        policy = EntryPolicy(lambda signal: True, lambda: "range high", lambda: True)
+        decision = policy.evaluate({"dir": "call"})
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "range high")
+        self.assertTrue(decision.hard_rejection)
+
+
+class LifecycleControllerTests(unittest.TestCase):
+    def test_start_and_stop_are_idempotent(self):
+        lifecycle = LifecycleController()
+        self.assertTrue(lifecycle.begin_start())
+        self.assertFalse(lifecycle.begin_start())
+        lifecycle.mark_running()
+        self.assertTrue(lifecycle.begin_stop())
+        self.assertFalse(lifecycle.begin_stop())
+        lifecycle.mark_stopped()
+        self.assertEqual(lifecycle.state, LifecycleState.STOPPED)
 
 
 class NotificationLogTests(unittest.TestCase):
@@ -253,6 +370,25 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(result["largest_loss_pct"], -10)
         self.assertEqual(result["trades"][0]["entry_time"].strftime("%H:%M:%S"), "10:00:00")
 
+    def test_pending_record_is_recovered_from_broker_snapshot(self):
+        orders = {"orders": [
+            {"status": "Filled", "symbol": "QQQ260710C720000.US", "side": "买入",
+             "executed_qty": 2, "executed_price": 1.0},
+            {"status": "Filled", "symbol": "QQQ260710C720000.US", "side": "卖出",
+             "executed_qty": 2, "executed_price": 1.5},
+        ]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "longbridge_orders.json"
+            path.write_text(json.dumps(orders, ensure_ascii=False), encoding="utf-8")
+            ledger = TradeLedger(temp_dir, TZ_ET)
+            result = ledger.recover_pending_record(path, "2026-07-11")
+            payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+            second = ledger.recover_pending_record(path, "2026-07-11")
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["pnl"], 100)
+        self.assertEqual(second["status"], "complete")
+
     def test_broker_order_snapshot_is_serialized_and_saved(self):
         order = type("Order", (), {
             "order_id": "42",
@@ -299,6 +435,8 @@ class SignalProbeStoreTests(unittest.TestCase):
         probe = {
             "id": 7, "entry_time": "2026-07-10 10:00:00", "entry_bar": 20,
             "signal": "VWAP_Breakout", "dir": "call", "entry_price": 500,
+            "day_market_regime": "trend", "day_market_direction": "up",
+            "opening_range": {"high": 501, "low": 498},
             "milestones": {5: {"pct": 0.2}, 10: None, 20: None},
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -310,6 +448,28 @@ class SignalProbeStoreTests(unittest.TestCase):
         self.assertEqual(restored[0]["id"], 7)
         self.assertEqual(restored[0]["milestones"][5], {"pct": 0.2})
         self.assertIn(20, restored[0]["milestones"])
+        self.assertEqual(restored[0]["day_market_regime"], "trend")
+        self.assertEqual(restored[0]["opening_range"]["high"], 501)
+
+
+class RuntimeStateStoreTests(unittest.TestCase):
+    def test_checkpoint_restores_bookkeeping_but_preserves_broker_quantity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RuntimeStateStore(temp_dir)
+            checkpoint = {
+                "opt_symbol": "QQQ260710C720000.US", "contracts": 5,
+                "quantity": 500, "partial_exits": [{"tier": "30"}],
+                "realized_pnl_usd": 40,
+            }
+            store.save({"position_checkpoint": checkpoint}, checkpoint, 501)
+            restored = store.restore_checkpoint({
+                "opt_symbol": "QQQ260710C720000.US", "contracts": 2, "quantity": 200,
+            }, 100)
+        self.assertEqual(restored["contracts"], 2)
+        self.assertEqual(restored["quantity"], 200)
+        self.assertEqual(restored["partial_exits"], [{"tier": "30"}])
+        self.assertEqual(restored["realized_pnl_usd"], 40)
+        self.assertEqual(restored["order_status"], "restored")
 
 
 class NotificationServiceTests(unittest.TestCase):

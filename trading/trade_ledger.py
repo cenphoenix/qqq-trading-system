@@ -181,7 +181,15 @@ class TradeLedger:
                 data = json.load(stream)
         except (OSError, json.JSONDecodeError):
             return []
-        filled = [order for order in data.get("orders", []) if order.get("status") == "Filled"]
+        return self.reconcile_order_rows(data.get("orders", []))
+
+    def reconcile_order_rows(
+        self,
+        orders: Iterable[Mapping[str, Any]],
+        source: str = "broker_reconcile",
+        reason_prefix: str = "broker对账",
+    ) -> list[dict[str, Any]]:
+        filled = [order for order in orders if order.get("status") == "Filled"]
         grouped: dict[str, dict[str, list[dict[str, float]]]] = defaultdict(lambda: {"buys": [], "sells": []})
         for order in filled:
             symbol = str(order.get("symbol") or "")
@@ -243,13 +251,79 @@ class TradeLedger:
                 "pnl_pct": round(pnl_pct, 2),
                 "pnl_usd": round(pnl, 2),
                 "result": "win" if pnl > 0 else "lose" if pnl < 0 else "",
-                "reason": f"broker对账({buy_count}买/{sell_count}卖,配对{contracts}张)",
-                "exit_reason": "broker对账",
+                "reason": f"{reason_prefix}({buy_count}买/{sell_count}卖,配对{contracts}张)",
+                "exit_reason": reason_prefix,
                 "opt_symbol": symbol,
                 "entry_opt_price": round(avg_buy, 2),
-                "_source": "broker_reconcile",
+                "_source": source,
             })
         return reconciled
+
+    def recover_pending_record(
+        self,
+        orders_file: str | os.PathLike[str],
+        current_date: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Recover a missing or incomplete daily record from a broker snapshot."""
+        path = Path(orders_file)
+        if not path.exists():
+            return None
+        try:
+            with path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        trades = self.reconcile_order_rows(
+            payload.get("orders", []), "startup_reconcile", "启动对账",
+        )
+        if not trades:
+            return None
+        dates = [str(trade.get("date", "")) for trade in trades if trade.get("date")]
+        if not dates:
+            return None
+        trade_date = Counter(dates).most_common(1)[0][0]
+        current_date = current_date or datetime.now(self._timezone).strftime("%Y-%m-%d")
+        if trade_date > current_date:
+            return None
+
+        record_path = self._records_dir / f"{trade_date}.json"
+        existing_count = 0
+        if record_path.exists():
+            try:
+                with record_path.open(encoding="utf-8") as stream:
+                    existing_count = len(json.load(stream).get("trades", []))
+            except (OSError, json.JSONDecodeError, TypeError):
+                existing_count = 0
+        if existing_count >= len(trades):
+            return {
+                "status": "complete", "path": str(record_path), "date": trade_date,
+                "total": existing_count, "expected": len(trades),
+            }
+
+        total_pnl = sum(float(trade.get("pnl_usd", 0) or 0) for trade in trades)
+        recovered = {
+            "date": trade_date,
+            "trades": trades,
+            "total": len(trades),
+            "wins": sum(trade.get("result") == "win" for trade in trades),
+            "pnl": round(total_pnl, 2),
+        }
+        self._records_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = record_path.with_suffix(record_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(recovered, stream, ensure_ascii=False, indent=2, default=self._json_default)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, record_path)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        return {
+            "status": "recovered", "path": str(record_path), "date": trade_date,
+            "total": len(trades), "expected": len(trades), "pnl": round(total_pnl, 2),
+        }
 
     @staticmethod
     def serialize_broker_orders(orders: Iterable[Any]) -> list[dict[str, Any]]:
