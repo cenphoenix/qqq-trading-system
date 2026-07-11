@@ -36,7 +36,8 @@ class NotificationLog:
             exit_price = round(float(trade.get("exit_opt_price") or trade.get("exit_price") or 0), 4)
             pnl = round(float(trade.get("pnl_usd") or 0), 2)
             reason = str(trade.get("exit_reason") or trade.get("reason") or "")[:80]
-            return f"{source}|{symbol}|{direction}|{contracts}|{entry}|{exit_price}|{pnl}|{reason}"
+            cycle_id = str(trade.get("trade_cycle_id", "") or "")
+            return f"{source}|{cycle_id}|{symbol}|{direction}|{contracts}|{entry}|{exit_price}|{pnl}|{reason}"
         except Exception:
             return f"{source}|{time.time()}"
 

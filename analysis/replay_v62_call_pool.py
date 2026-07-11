@@ -11,14 +11,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from strategy import StrategyRuntimeRules
 
 
 DEFAULTS = {
@@ -528,7 +532,7 @@ def run_matrix(paths: list[Path], base_cfg: dict) -> None:
             },
         ),
     ]
-    lock_bars = int(base_cfg.get("timeout_stage3_bars", 20) or 20)
+    lock_bars = StrategyRuntimeRules.v62_lock_bars(base_cfg)
     print("variant                         independent                       lock20")
     print("-" * 92)
     for name, changes in variants:
@@ -567,7 +571,7 @@ def main() -> None:
     events, rejects = replay(paths, cfg, lock_bars=0)
     summarize(events, rejects, "independent signal quality")
 
-    lock_bars = int(cfg.get("timeout_stage3_bars", 20) or 20)
+    lock_bars = StrategyRuntimeRules.v62_lock_bars(cfg)
     locked_events, locked_rejects = replay(paths, cfg, lock_bars=lock_bars)
     summarize(locked_events, locked_rejects, f"self position lock {lock_bars} bars")
 

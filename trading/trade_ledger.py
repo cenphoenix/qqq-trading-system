@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime, tzinfo
 from pathlib import Path
@@ -47,11 +48,19 @@ class TradeLedger:
                     "reason": trade.get("reason", ""),
                     "exit_reason": trade.get("exit_reason", ""),
                     "opt_symbol": trade.get("opt_symbol", ""),
+                    "trade_cycle_id": trade.get("trade_cycle_id", ""),
+                    "entry_order_id": str(trade.get("order_id", "") or ""),
                     "regime": trade.get("regime", "neutral"),
                     "atr_at_entry": trade.get("atr_at_entry", 0),
                     "macd_hist_entry": trade.get("macd_hist_entry", 0),
                     "vwap_entry": trade.get("vwap_entry", 0),
                     "sma20_entry": trade.get("sma20_entry", 0),
+                    "entry_bid": trade.get("entry_bid", 0),
+                    "entry_ask": trade.get("entry_ask", 0),
+                    "entry_mid": trade.get("entry_mid", 0),
+                    "entry_spread_pct": trade.get("entry_spread_pct", 0),
+                    "entry_quote_age_seconds": trade.get("entry_quote_age_seconds"),
+                    "entry_slippage": trade.get("entry_slippage", 0),
                     "final_exit_pnl_pct": round(trade.get("final_exit_pnl_pct", 0), 2),
                     "final_exit_pnl_usd": round(trade.get("final_exit_pnl_usd", 0), 2),
                     "partial_exits": list(trade.get("partial_exits") or []),
@@ -141,6 +150,8 @@ class TradeLedger:
                 "exit_reason": row.get("exit_reason", ""),
                 "result": row.get("result", ""),
                 "opt_symbol": row.get("opt_symbol", ""),
+                "trade_cycle_id": row.get("trade_cycle_id", ""),
+                "order_id": row.get("entry_order_id") or row.get("order_id", ""),
                 "win": row.get("result") == "win",
                 "entry_time": entry_time,
                 "exit_time": exit_time,
@@ -149,6 +160,15 @@ class TradeLedger:
                 "macd_hist_entry": row.get("macd_hist_entry", 0),
                 "vwap_entry": row.get("vwap_entry", 0),
                 "half_closed": row.get("half_closed", False),
+                "partial_exits": list(row.get("partial_exits") or []),
+                "final_exit_pnl_pct": row.get("final_exit_pnl_pct", 0),
+                "final_exit_pnl_usd": row.get("final_exit_pnl_usd", 0),
+                "entry_bid": row.get("entry_bid", 0),
+                "entry_ask": row.get("entry_ask", 0),
+                "entry_mid": row.get("entry_mid", 0),
+                "entry_spread_pct": row.get("entry_spread_pct", 0),
+                "entry_quote_age_seconds": row.get("entry_quote_age_seconds"),
+                "entry_slippage": row.get("entry_slippage", 0),
             })
 
         pnl_values = [float(row.get("pnl_usd", 0) or 0) for row in rows]
@@ -189,45 +209,20 @@ class TradeLedger:
         source: str = "broker_reconcile",
         reason_prefix: str = "broker对账",
     ) -> list[dict[str, Any]]:
-        filled = [order for order in orders if order.get("status") == "Filled"]
-        grouped: dict[str, dict[str, list[dict[str, float]]]] = defaultdict(lambda: {"buys": [], "sells": []})
-        for order in filled:
+        grouped: dict[str, list[tuple[int, Mapping[str, Any]]]] = defaultdict(list)
+        for index, order in enumerate(orders):
+            if order.get("status") != "Filled":
+                continue
             symbol = str(order.get("symbol") or "")
             quantity = float(order.get("executed_qty", 0) or order.get("quantity", 0) or 0)
             price = float(order.get("executed_price", 0) or 0)
-            if not symbol or quantity <= 0 or price <= 0:
+            if not symbol or quantity <= 0 or price <= 0 or order.get("side") not in ("买入", "卖出"):
                 continue
-            target = "buys" if order.get("side") == "买入" else "sells" if order.get("side") == "卖出" else ""
-            if target:
-                grouped[symbol][target].append({"qty": quantity, "price": price})
+            grouped[symbol].append((index, order))
 
         today = datetime.now(self._timezone).strftime("%Y-%m-%d")
         reconciled = []
         for symbol in sorted(grouped):
-            buys = [dict(item) for item in grouped[symbol]["buys"]]
-            sells = [dict(item) for item in grouped[symbol]["sells"]]
-            buy_count, sell_count = len(buys), len(sells)
-            total_buy = sum(item["qty"] for item in buys)
-            total_sell = sum(item["qty"] for item in sells)
-            if not buys or not sells or total_buy <= 0 or total_sell <= 0:
-                continue
-            avg_buy = sum(item["qty"] * item["price"] for item in buys) / total_buy
-            avg_sell = sum(item["qty"] * item["price"] for item in sells) / total_sell
-            unmatched = buys
-            pnl = matched = 0.0
-            for sell in sells:
-                remaining = sell["qty"]
-                while remaining > 0 and unmatched:
-                    buy = unmatched[0]
-                    quantity = min(remaining, buy["qty"])
-                    pnl += quantity * (sell["price"] - buy["price"]) * 100
-                    matched += quantity
-                    buy["qty"] -= quantity
-                    remaining -= quantity
-                    if buy["qty"] <= 0:
-                        unmatched.pop(0)
-            if matched <= 0:
-                continue
             code = symbol.replace(".US", "")
             try:
                 date_part = code[3:9]
@@ -237,26 +232,91 @@ class TradeLedger:
             except (ValueError, IndexError):
                 trade_date = today
                 direction = ""
-            contracts = int(matched)
-            pnl_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy else 0.0
-            reconciled.append({
-                "date": trade_date,
-                "entry_time": today,
-                "exit_time": today,
-                "dir": direction,
-                "entry_price": round(avg_buy, 2),
-                "exit_price": avg_sell,
-                "qty": contracts * 100,
-                "contracts": contracts,
-                "pnl_pct": round(pnl_pct, 2),
-                "pnl_usd": round(pnl, 2),
-                "result": "win" if pnl > 0 else "lose" if pnl < 0 else "",
-                "reason": f"{reason_prefix}({buy_count}买/{sell_count}卖,配对{contracts}张)",
-                "exit_reason": reason_prefix,
-                "opt_symbol": symbol,
-                "entry_opt_price": round(avg_buy, 2),
-                "_source": source,
-            })
+
+            def sort_key(item):
+                index, order = item
+                timestamp = str(order.get("submitted_at") or order.get("updated_at") or "")
+                return timestamp, index
+
+            open_lots = []
+            cycle = None
+
+            def emit_cycle(closed):
+                nonlocal cycle
+                if not cycle or cycle["matched_qty"] <= 0:
+                    return
+                matched = cycle["matched_qty"]
+                avg_buy = cycle["matched_buy_cost"] / matched
+                avg_sell = cycle["sell_revenue"] / matched
+                pnl = (cycle["sell_revenue"] - cycle["matched_buy_cost"]) * 100
+                contracts = int(round(matched))
+                raw_id = f"{symbol}|{cycle['entry_ids'][0]}|{cycle['exit_ids'][-1]}"
+                cycle_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()[:20]
+                reconciled.append({
+                    "date": trade_date,
+                    "entry_time": cycle["entry_time"] or today,
+                    "exit_time": cycle["exit_time"] or today,
+                    "dir": direction,
+                    "entry_price": round(avg_buy, 2),
+                    "exit_price": avg_sell,
+                    "qty": contracts * 100,
+                    "contracts": contracts,
+                    "pnl_pct": round((avg_sell - avg_buy) / avg_buy * 100, 2) if avg_buy else 0.0,
+                    "pnl_usd": round(pnl, 2),
+                    "result": "win" if pnl > 0 else "lose" if pnl < 0 else "",
+                    "reason": (
+                        f"{reason_prefix}({cycle['buy_count']}买/{cycle['sell_count']}卖,"
+                        f"配对{contracts}张,{'已闭合' if closed else '部分平仓'})"
+                    ),
+                    "exit_reason": reason_prefix,
+                    "opt_symbol": symbol,
+                    "entry_opt_price": round(avg_buy, 2),
+                    "trade_cycle_id": cycle_id,
+                    "cycle_closed": closed,
+                    "entry_order_ids": list(cycle["entry_ids"]),
+                    "exit_order_ids": list(cycle["exit_ids"]),
+                    "_source": source,
+                })
+                cycle = None
+
+            for _, order in sorted(grouped[symbol], key=sort_key):
+                quantity = float(order.get("executed_qty", 0) or order.get("quantity", 0) or 0)
+                price = float(order.get("executed_price", 0) or 0)
+                order_id = str(order.get("order_id") or f"row-{len(reconciled)}")
+                timestamp = str(order.get("submitted_at") or order.get("updated_at") or "")
+                if order.get("side") == "买入":
+                    if cycle is None:
+                        cycle = {
+                            "entry_time": timestamp, "exit_time": "", "entry_ids": [],
+                            "exit_ids": [], "buy_count": 0, "sell_count": 0,
+                            "matched_qty": 0.0, "matched_buy_cost": 0.0, "sell_revenue": 0.0,
+                        }
+                    cycle["buy_count"] += 1
+                    cycle["entry_ids"].append(order_id)
+                    open_lots.append({"qty": quantity, "price": price})
+                    continue
+                if cycle is None or not open_lots:
+                    continue
+                remaining = quantity
+                matched_this_order = 0.0
+                while remaining > 0 and open_lots:
+                    lot = open_lots[0]
+                    matched_qty = min(remaining, lot["qty"])
+                    cycle["matched_qty"] += matched_qty
+                    cycle["matched_buy_cost"] += matched_qty * lot["price"]
+                    cycle["sell_revenue"] += matched_qty * price
+                    matched_this_order += matched_qty
+                    lot["qty"] -= matched_qty
+                    remaining -= matched_qty
+                    if lot["qty"] <= 1e-9:
+                        open_lots.pop(0)
+                if matched_this_order > 0:
+                    cycle["sell_count"] += 1
+                    cycle["exit_ids"].append(order_id)
+                    cycle["exit_time"] = timestamp
+                if not open_lots:
+                    emit_cycle(True)
+            emit_cycle(False)
         return reconciled
 
     def recover_pending_record(
@@ -393,6 +453,8 @@ class TradeLedger:
             "reason": trade.get("reason", ""),
             "exit_reason": trade.get("exit_reason", ""),
             "opt_symbol": symbol,
+            "trade_cycle_id": trade.get("trade_cycle_id", ""),
+            "entry_order_id": str(trade.get("order_id", "") or ""),
             "regime": trade.get("regime", "neutral"),
             "day_market_regime": trade.get("day_market_regime", ""),
             "day_market_label": trade.get("day_market_label", ""),
@@ -400,6 +462,12 @@ class TradeLedger:
             "atr_at_entry": trade.get("atr_at_entry", 0),
             "macd_hist_entry": trade.get("macd_hist_entry", 0),
             "vwap_entry": trade.get("vwap_entry", 0),
+            "entry_bid": trade.get("entry_bid", 0),
+            "entry_ask": trade.get("entry_ask", 0),
+            "entry_mid": trade.get("entry_mid", 0),
+            "entry_spread_pct": trade.get("entry_spread_pct", 0),
+            "entry_quote_age_seconds": trade.get("entry_quote_age_seconds"),
+            "entry_slippage": trade.get("entry_slippage", 0),
             "_source": "internal",
         }
 
@@ -421,10 +489,25 @@ class TradeLedger:
             if serialized:
                 rows.append(serialized)
                 seen.add(key)
+        internal_cycle_ids = {row["trade_cycle_id"] for row in rows if row.get("trade_cycle_id")}
+        internal_order_ids = {row["entry_order_id"] for row in rows if row.get("entry_order_id")}
         internal_symbols = {row["opt_symbol"] for row in rows}
         for broker_trade in broker_rows:
             symbol = str(broker_trade.get("opt_symbol", ""))
-            if symbol and symbol not in internal_symbols:
+            cycle_id = str(broker_trade.get("trade_cycle_id", "") or "")
+            broker_entry_ids = {
+                str(order_id) for order_id in broker_trade.get("entry_order_ids", []) if order_id
+            }
+            matched_internal = (
+                (cycle_id and cycle_id in internal_cycle_ids)
+                or bool(broker_entry_ids & internal_order_ids)
+                or (
+                    not cycle_id
+                    and not broker_entry_ids
+                    and symbol in internal_symbols
+                )
+            )
+            if symbol and not matched_internal:
                 recovered = dict(broker_trade)
                 recovered["_source"] = "broker_unmatched"
                 recovered["reason"] = f"broker_unmatched: {broker_trade.get('reason', '')}"

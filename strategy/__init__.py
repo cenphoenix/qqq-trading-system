@@ -3,6 +3,7 @@ QQQ 0DTE 交易策略模块
 """
 from .options import get_option_symbol, is_option_expiring_on
 from .filters import FilterEngine
+from .runtime_rules import StrategyRuntimeRules
 
 # v7 engines
 from .engines import (
@@ -28,6 +29,7 @@ __all__ = [
     'get_option_symbol',
     'is_option_expiring_on',
     'FilterEngine',
+    'StrategyRuntimeRules',
     # v7
     'SignalManager',
     'Signal',

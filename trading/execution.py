@@ -39,9 +39,21 @@ class FillResult:
 
 
 class OrderExecution:
-    def __init__(self, broker, sleep_fn=time.sleep) -> None:
+    def __init__(self, broker, sleep_fn=time.sleep, state_store=None) -> None:
         self.broker = broker
         self._sleep = sleep_fn
+        self.state_store = state_store
+
+    def recover_active_orders(self):
+        orders = self.broker.today_orders() or []
+        return self.state_store.sync(orders) if self.state_store else []
+
+    def has_active_order(self, symbol: str | None = None, buy_only: bool = True) -> bool:
+        try:
+            self.recover_active_orders()
+        except Exception:
+            pass
+        return bool(self.state_store and self.state_store.active(symbol, buy_only))
 
     def find_order(self, order_id) -> Any | None:
         """Find an order through the filtered API, then the full-day list."""
@@ -87,11 +99,20 @@ class OrderExecution:
     ) -> FillResult:
         response = self.broker.submit_order(**submit_kwargs)
         order_id = str(response.order_id)
+        symbol = str(submit_kwargs.get("symbol", ""))
+        side = submit_kwargs.get("side", "")
+        if self.state_store:
+            self.state_store.record(order_id, symbol, side, requested_quantity, "submitted")
         latest = None
         for _, snapshot in self.poll(order_id, retries=retries, interval=interval):
             if snapshot is None:
                 continue
             latest = snapshot
+            if self.state_store:
+                self.state_store.record(
+                    order_id, symbol, side, requested_quantity,
+                    snapshot.status, snapshot.quantity, snapshot.price,
+                )
             if snapshot.rejected:
                 return FillResult(
                     order_id, requested_quantity, int(snapshot.quantity),
@@ -110,6 +131,11 @@ class OrderExecution:
             try:
                 self.broker.cancel_order(order_id)
                 canceled = True
+                if self.state_store:
+                    self.state_store.record(
+                        order_id, symbol, side, requested_quantity,
+                        "canceled", quantity, price,
+                    )
             except Exception:
                 canceled = False
         return FillResult(

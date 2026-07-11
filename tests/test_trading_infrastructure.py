@@ -1,11 +1,11 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TradingSessionPolicy
+from trading import AccountSnapshotService, LifecycleController, LifecycleState, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, PositionRiskPolicy, PositionSizer, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TradingSessionPolicy
 from strategy.entry_policy import EntryPolicy
 
 
@@ -40,6 +40,9 @@ class BrokerGatewayTests(unittest.TestCase):
             def quote(self, symbols):
                 return ["quote", symbols]
 
+            def depth(self, symbol):
+                return ["depth", symbol]
+
         class TradeContext:
             def stock_positions(self):
                 return "positions"
@@ -58,6 +61,7 @@ class BrokerGatewayTests(unittest.TestCase):
 
         broker = LongbridgeBroker(QuoteContext(), TradeContext())
         self.assertEqual(broker.quote(["QQQ.US"]), ["quote", ["QQQ.US"]])
+        self.assertEqual(broker.depth("QQQ.US"), ["depth", "QQQ.US"])
         self.assertEqual(broker.positions(), "positions")
         self.assertEqual(broker.account_balance(), "balance")
         self.assertEqual(broker.submit_order(symbol="QQQ.US"), {"symbol": "QQQ.US"})
@@ -144,6 +148,26 @@ class OrderExecutionTests(unittest.TestCase):
         self.assertTrue(result.rejected)
         self.assertFalse(result.filled)
 
+    def test_restart_recovers_active_buy_order(self):
+        order = type("Order", (), {
+            "order_id": "active-1", "symbol": "QQQ260710C500000.US",
+            "side": "OrderSide.Buy", "quantity": 2,
+            "executed_quantity": 0, "executed_price": 0,
+            "status": "OrderStatus.New",
+        })()
+
+        class Broker:
+            def today_orders(self, *args, **kwargs):
+                return [order]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = OrderStateStore(temp_dir, TZ_ET)
+            execution = OrderExecution(Broker(), sleep_fn=lambda _: None, state_store=store)
+            active = execution.recover_active_orders()
+            restored = OrderStateStore(temp_dir, TZ_ET)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(restored.active(buy_only=True)[0]["order_id"], "active-1")
+
 
 class PositionBookTests(unittest.TestCase):
     def test_positions_are_normalized_and_searchable(self):
@@ -217,6 +241,41 @@ class PositionSizerTests(unittest.TestCase):
         }, blocked=True)
         self.assertEqual(result.contracts, 0)
         self.assertEqual(result.quantity, 0)
+
+
+class QuoteQualityPolicyTests(unittest.TestCase):
+    def test_depth_supplies_bid_and_ask_when_quote_has_only_last_price(self):
+        quote = type("Quote", (), {
+            "last_done": 1.0, "timestamp": datetime.now(timezone.utc),
+        })()
+        level = lambda price: type("Level", (), {"price": price})()
+        depth = type("Depth", (), {"bids": [level(0.98)], "asks": [level(1.02)]})()
+        result = QuoteQualityPolicy.evaluate(quote, depth=depth)
+        self.assertTrue(result.allowed)
+        self.assertAlmostEqual(result.spread_pct, 0.04)
+
+    def test_wide_spread_is_rejected(self):
+        quote = type("Quote", (), {
+            "last_done": 1.0, "bid_price": 0.7, "ask_price": 1.3,
+            "timestamp": datetime.now(timezone.utc),
+        })()
+        result = QuoteQualityPolicy.evaluate(quote, max_spread_pct=0.30)
+        self.assertFalse(result.allowed)
+        self.assertIn("wide spread", result.reason)
+
+    def test_stale_quote_is_rejected_and_valid_quote_keeps_mid(self):
+        stale = type("Quote", (), {
+            "last_done": 1.0, "bid_price": 0.95, "ask_price": 1.05,
+            "timestamp": datetime.now(timezone.utc) - timedelta(seconds=60),
+        })()
+        self.assertFalse(QuoteQualityPolicy.evaluate(stale, max_age_seconds=30).allowed)
+        fresh = type("Quote", (), {
+            "last_done": 1.01, "bid_price": 0.98, "ask_price": 1.02,
+            "timestamp": datetime.now(timezone.utc),
+        })()
+        result = QuoteQualityPolicy.evaluate(fresh)
+        self.assertTrue(result.allowed)
+        self.assertAlmostEqual(result.mid, 1.0)
 
 
 class PositionRiskPolicyTests(unittest.TestCase):
@@ -361,6 +420,26 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["dir"], "put")
         self.assertEqual(rows[0]["contracts"], 2)
         self.assertEqual(rows[0]["pnl_usd"], 100)
+        self.assertFalse(rows[0]["cycle_closed"])
+
+    def test_repeated_contract_orders_are_separate_trade_cycles(self):
+        orders = [
+            {"order_id": "b1", "status": "Filled", "symbol": "QQQ260710C720000.US",
+             "side": "买入", "executed_qty": 1, "executed_price": 1.0, "submitted_at": "2026-07-10 10:00:00"},
+            {"order_id": "s1", "status": "Filled", "symbol": "QQQ260710C720000.US",
+             "side": "卖出", "executed_qty": 1, "executed_price": 1.5, "submitted_at": "2026-07-10 10:05:00"},
+            {"order_id": "b2", "status": "Filled", "symbol": "QQQ260710C720000.US",
+             "side": "买入", "executed_qty": 2, "executed_price": 2.0, "submitted_at": "2026-07-10 11:00:00"},
+            {"order_id": "s2", "status": "Filled", "symbol": "QQQ260710C720000.US",
+             "side": "卖出", "executed_qty": 2, "executed_price": 1.8, "submitted_at": "2026-07-10 11:04:00"},
+        ]
+        rows = TradeLedger(".", TZ_ET).reconcile_order_rows(orders)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["pnl_usd"] for row in rows], [50, -40])
+        self.assertNotEqual(rows[0]["trade_cycle_id"], rows[1]["trade_cycle_id"])
+        self.assertTrue(all(row["cycle_closed"] for row in rows))
+        self.assertEqual(rows[0]["entry_order_ids"], ["b1"])
+        self.assertEqual(rows[1]["entry_order_ids"], ["b2"])
 
     def test_daily_record_restores_runtime_trades_and_statistics(self):
         payload = {
@@ -447,6 +526,27 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(payload["pnl"], 100)
         self.assertEqual(payload["trades"][0]["reason"], "VWAP_Breakout")
         self.assertEqual(payload["signal_probes"], [{"id": 1}])
+
+    def test_daily_record_keeps_missing_repeat_cycle_for_same_symbol(self):
+        symbol = "QQQ260710C720000.US"
+        internal = [{
+            "trade_cycle_id": "live-cycle", "order_id": "b1",
+            "entry_time": datetime(2026, 7, 10, 10, 0, tzinfo=TZ_ET),
+            "exit_time": datetime(2026, 7, 10, 10, 5, tzinfo=TZ_ET),
+            "dir": "call", "opt_symbol": symbol, "contracts": 1,
+            "pnl_usd": 50, "win": True,
+        }]
+        broker = [
+            {"trade_cycle_id": "broker-1", "entry_order_ids": ["b1"], "date": "2026-07-10",
+             "dir": "call", "opt_symbol": symbol, "contracts": 1, "pnl_usd": 50, "result": "win"},
+            {"trade_cycle_id": "broker-2", "entry_order_ids": ["b2"], "date": "2026-07-10",
+             "dir": "call", "opt_symbol": symbol, "contracts": 1, "pnl_usd": -20, "result": "lose"},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = TradeLedger(temp_dir, TZ_ET).save_daily_record(internal, broker, 100, [])
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["trades"][0]["trade_cycle_id"], "live-cycle")
+        self.assertEqual(result["trades"][1]["trade_cycle_id"], "broker-2")
 
 
 class SignalProbeStoreTests(unittest.TestCase):

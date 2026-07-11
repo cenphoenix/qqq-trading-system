@@ -15,6 +15,7 @@ RSI方向确认 + ATR追高回撤 + 回踩确认(动量豁免)
 5. Telegram推送交易信号 / Web仪表盘
 """
 import os, sys, time, json, signal
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import numpy as np
@@ -51,7 +52,7 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 # ===== 策略模块 =====
-from strategy import get_option_symbol, is_option_expiring_on, FilterEngine
+from strategy import get_option_symbol, is_option_expiring_on, FilterEngine, StrategyRuntimeRules
 from strategy.entry_policy import EntryPolicy
 from strategy.price_action import PriceActionFilter
 from signal_names import display_signal_name
@@ -66,7 +67,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, PositionBook, PositionRiskPolicy, PositionSizer, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter, TradingSessionPolicy
+from trading import AccountSnapshotService, LifecycleController, LongbridgeBroker, NotificationLog, NotificationService, OrderAuditLog, OrderExecution, OrderStateStore, PositionBook, QuoteQualityPolicy, ReviewSummaryScheduler, RuntimeStateStore, SignalProbeStore, TradeLedger, TraderMessageFormatter, TradingSessionPolicy
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -290,7 +291,7 @@ class QQQLiveTrader:
         self.signal_probe_store = SignalProbeStore(_app_dir(), TZ_ET, _json_default)
         self.runtime_state_store = RuntimeStateStore(_app_dir(), _json_default)
         self.lifecycle = LifecycleController()
-        self.position_risk_policy = PositionRiskPolicy()
+        self.runtime_rules = StrategyRuntimeRules()
         self.entry_policy = EntryPolicy(
             self._should_skip_entry_signal,
             lambda: self._last_entry_rejection,
@@ -373,7 +374,8 @@ class QQQLiveTrader:
         # 初始化长桥连接
         self._init_api()
         self.broker = LongbridgeBroker(self.quote_ctx, self.trade_ctx)
-        self.order_execution = OrderExecution(self.broker)
+        self.order_state_store = OrderStateStore(_app_dir(), TZ_ET)
+        self.order_execution = OrderExecution(self.broker, state_store=self.order_state_store)
         self.position_book = PositionBook(self.broker)
         self.account_service = AccountSnapshotService()
 
@@ -559,7 +561,7 @@ class QQQLiveTrader:
 
     def _timeout_profile(self, pos):
         signal = self._position_signal_name(pos)
-        return self.position_risk_policy.timeout_profile(
+        return self.runtime_rules.timeout_profile(
             pos, self.cfg, signal,
             self._is_v62_call_position(pos),
             self._is_trend_aligned_position(pos),
@@ -1705,7 +1707,7 @@ class QQQLiveTrader:
 
     def _profit_take_tiers(self):
         """Configured option partial take-profit tiers, sorted by trigger."""
-        return self.position_risk_policy.profit_tiers(self.cfg)
+        return self.runtime_rules.profit_tiers(self.cfg)
 
     def _update_signal_probes(self, candle):
         """每根已完成K线更新未完成的信号追踪记录。"""
@@ -2153,6 +2155,7 @@ class QQQLiveTrader:
             print(f"🔍 发现长桥持仓: {symbol} x{qty}")
             print("📥 正在接管并同步到系统...")
             self.position = {
+                'trade_cycle_id': uuid.uuid4().hex,
                 'order_id': 'restored',
                 'dir': direction,
                 'contracts': qty,
@@ -2222,6 +2225,12 @@ class QQQLiveTrader:
             return
         self.running = True
         self.lifecycle.mark_running()
+        try:
+            active_orders = self.order_execution.recover_active_orders()
+            if active_orders:
+                print(f"⚠️ 启动恢复发现 {len(active_orders)} 个活动订单，将阻止重复开仓")
+        except Exception as error:
+            print(f"⚠️ 活动订单恢复失败: {error}")
 
         # 预加载历史K线（解决重启后数据不足问题）
         self._preload_history()
@@ -3485,6 +3494,9 @@ class QQQLiveTrader:
 
     def _execute_trade_inner(self, sig):
         """执行期权交易（内部实现）"""
+        if self.order_execution.has_active_order(buy_only=True):
+            print("  ⛔ 长桥仍有活动买单，禁止重复开仓")
+            return
         # ===== 开仓前检查：已有持仓禁止重复开仓 =====
         try:
             existing = self._check_longbridge_position()
@@ -3517,10 +3529,26 @@ class QQQLiveTrader:
 
         # ===== 获取期权当前价格 =====
         opt_price = None
+        quote_quality = None
         try:
             opt_quotes = self.broker.quote([opt_symbol])
-            if opt_quotes and hasattr(opt_quotes[0], 'last_done') and opt_quotes[0].last_done > 0:
-                opt_price = float(opt_quotes[0].last_done)
+            if opt_quotes:
+                depth = None
+                try:
+                    depth = self.broker.depth(opt_symbol)
+                except Exception:
+                    pass
+                quote_quality = QuoteQualityPolicy.evaluate(
+                    opt_quotes[0],
+                    depth=depth,
+                    max_age_seconds=float(self.cfg.get('option_quote_max_age_seconds', 30) or 30),
+                    max_spread_pct=float(self.cfg.get('option_max_spread_pct', 0.30) or 0.30),
+                    require_timestamp=bool(self.cfg.get('option_quote_require_timestamp', False)),
+                )
+                if not quote_quality.allowed:
+                    print(f"  ⛔ 期权报价质量过滤: {quote_quality.reason}")
+                    return
+                opt_price = quote_quality.price
                 print(f"  📊 期权价格: ${opt_price:.2f}")
         except Exception as e:
             print(f"  ⚠️ 获取期权价格失败: {e}")
@@ -3585,7 +3613,7 @@ class QQQLiveTrader:
             low_price_mult = self.cfg.get('low_option_price_mult', 0.35)
             combined_mult *= low_price_mult
             print(f"  🛡️ 低权利金风控: ${opt_price:.2f} < ${min_option_price:.2f}，仓位系数降至{low_price_mult:.0%}")
-        size = PositionSizer.calculate(
+        size = self.runtime_rules.position_size(
             capital, opt_price, sig['dir'], combined_mult, self.cfg,
             afternoon=cur_min_et >= 720,
             blocked=gamma_warning,
@@ -3631,13 +3659,22 @@ class QQQLiveTrader:
             print("  ✅ 订单完全成交!" if fill.complete else f"  ⚠️ 部分成交修正: 合约数 {contracts}/{requested_contracts}")
 
             # ===== 订单成交，建立持仓 =====
-            # ===== 订单成交，建立持仓 =====
             self.position = {
+                'trade_cycle_id': uuid.uuid4().hex,
                 'order_id': order_id,
                 'dir': sig['dir'],
                 'entry_price': float(price),       # 正股入场价
                 'opt_symbol': opt_symbol,           # 期权合约代码
                 'entry_opt_price': float(executed_price) if executed_price > 0 else None,  # 期权入场价
+                'entry_bid': quote_quality.bid if quote_quality else 0,
+                'entry_ask': quote_quality.ask if quote_quality else 0,
+                'entry_mid': quote_quality.mid if quote_quality else opt_price,
+                'entry_spread_pct': quote_quality.spread_pct if quote_quality else 0,
+                'entry_quote_age_seconds': quote_quality.age_seconds if quote_quality else None,
+                'entry_slippage': (
+                    float(executed_price) - quote_quality.mid
+                    if quote_quality and quote_quality.mid > 0 and executed_price > 0 else 0
+                ),
                 'sl_pct': sig.get('sl_pct', self.cfg['sl']),  # 动态止损百分比
                 'tp_pct': self.cfg['tp'],           # 止盈百分比（旧逻辑保留）
                 'contracts': contracts,             # 张数
@@ -3847,6 +3884,7 @@ class QQQLiveTrader:
                 stock_exit_enabled = stock_entry > 100
                 option_type = symbol.replace('.US', '')[9:10]
                 self.position = {
+                    'trade_cycle_id': uuid.uuid4().hex,
                     'order_id': 'synced',
                     'dir': 'call' if option_type == 'C' else 'put',
                     'entry_opt_price': cost,
@@ -3976,7 +4014,7 @@ class QQQLiveTrader:
         entry_opt = pos.get('entry_opt_price') or opt_price or 1.0
         if entry_opt <= 0:
             entry_opt = 1.0
-        risk = self.position_risk_policy.measure(
+        risk = self.runtime_rules.risk_snapshot(
             pos, opt_price, current_stock, len(self.one_min_candles), stock_entry_valid,
         )
         pnl_pct = risk.option_pnl_pct
@@ -4934,6 +4972,8 @@ class QQQLiveTrader:
             print("  ⏭️ 非交易时间，跳过broker对账平仓补漏通知")
         for bt in broker_trades:
             if not allow_broker_notify:
+                continue
+            if not bt.get('cycle_closed', True):
                 continue
             if bt.get('date') != today_et:
                 continue

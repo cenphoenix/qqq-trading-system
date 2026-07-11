@@ -5,7 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from strategy import is_option_expiring_on
+from strategy import StrategyRuntimeRules, is_option_expiring_on
 from strategy.entry_policy import EntryPolicy
 from trading import OrderExecution, PositionSizer, TradeLedger
 
@@ -44,6 +44,13 @@ class FakeBroker:
 
 
 class SimulatedTradingWorkflowTests(unittest.TestCase):
+    def test_replay_and_live_share_runtime_timeout_rules(self):
+        config = {
+            "v62_call_pool_timeout_stage_bars": 12,
+            "v62_call_pool_timeout_bars": 20,
+        }
+        self.assertEqual(StrategyRuntimeRules.v62_lock_bars(config), 20)
+
     def test_option_expiry_parser_rejects_invalid_symbols(self):
         self.assertTrue(is_option_expiring_on("QQQ260710C500000.US", date(2026, 7, 10)))
         self.assertFalse(is_option_expiring_on("QQQ-invalid", date(2026, 7, 10)))
@@ -78,6 +85,7 @@ class SimulatedTradingWorkflowTests(unittest.TestCase):
         partial_pnl = (partial.executed_price - opened.executed_price) * 100
         final_pnl = (final.executed_price - opened.executed_price) * 100
         trade = {
+            "trade_cycle_id": "workflow-cycle-1",
             "order_id": opened.order_id,
             "entry_time": datetime(2026, 7, 10, 10, 0, tzinfo=TZ_ET),
             "exit_time": datetime(2026, 7, 10, 10, 20, tzinfo=TZ_ET),
@@ -102,8 +110,10 @@ class SimulatedTradingWorkflowTests(unittest.TestCase):
             restored = ledger.load_daily_record(saved["date"])
         self.assertEqual(payload["total"], 1)
         self.assertEqual(payload["trades"][0]["partial_exits"][0]["contracts"], 1)
+        self.assertEqual(payload["trades"][0]["trade_cycle_id"], "workflow-cycle-1")
         self.assertEqual(payload["pnl"], 160)
         self.assertEqual(restored["pnl"], 160)
+        self.assertEqual(restored["trades"][0]["trade_cycle_id"], "workflow-cycle-1")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,9 @@ class LongbridgeBroker:
     def quote(self, symbols):
         return self.quote_context.quote(symbols)
 
+    def depth(self, symbol):
+        return self.quote_context.depth(symbol)
+
     def positions(self):
         return self.trade_context.stock_positions()
 
