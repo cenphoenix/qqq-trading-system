@@ -5672,131 +5672,28 @@ class QQQLiveTrader:
                 else:
                     print(f"  ⚠️ broker对账平仓通知发送失败，稍后会重试: {sym} {direction} {contracts}张 ${pnl:+,.2f}")
 
-        # 合并：broker对账数据 + 内部trades_today（去重）
-        # broker数据更可靠，作为主源；trades_today补充未平仓的
-        seen_symbols = set()
-        all_trades = []
-        broker_reconciliation = list(broker_trades)
-
-        # 再补internal trades_today中没有被broker覆盖的
-        for t in (self.trades_today or []):
-            opt_sym = t.get('opt_symbol', '')
-            contracts = t.get('cycle_contracts') or t.get('original_contracts') or t.get('contracts', 0)
-            if not opt_sym or int(contracts or 0) <= 0:
-                continue
-            key = str(t.get('order_id') or f"{opt_sym}_{t.get('entry_time', '')}")
-            if key not in seen_symbols:
-                # 这笔交易broker没有对账记录，用internal数据
-                entry_time = t.get('entry_time', '')
-                exit_time = t.get('exit_time', '')
-                if isinstance(entry_time, datetime):
-                    time_str = entry_time.strftime('%H:%M:%S')
-                else:
-                    time_str = str(entry_time)[:8]
-                if isinstance(exit_time, datetime):
-                    exit_time_str = exit_time.strftime('%H:%M:%S')
-                else:
-                    exit_time_str = str(exit_time)[:8]
-                pnl = t.get('pnl_pct', t.get('max_pnl_pct', 0))
-                all_trades.append({
-                    'date': datetime.now(TZ_ET).strftime('%Y-%m-%d'),
-                    'entry_time': time_str,
-                    'exit_time': exit_time_str,
-                    'dir': t.get('dir', ''),
-                    # 🔧 优先保存期权开仓价（entry_opt_price），否则 fallback 到 entry_price
-                    'entry_price': t.get('entry_opt_price') or t.get('entry_price', 0),
-                    'exit_price': t.get('exit_opt_price', 0),
-                    'qty': int(contracts) * self.cfg['contract_multiplier'],
-                    'contracts': contracts,
-                    'pnl_pct': round(pnl, 2) if pnl else 0,
-                    'pnl_usd': round(t.get('pnl_usd', 0), 2),
-                    'final_exit_pnl_pct': round(t.get('final_exit_pnl_pct', 0), 2),
-                    'final_exit_pnl_usd': round(t.get('final_exit_pnl_usd', 0), 2),
-                    'partial_exits': list(t.get('partial_exits') or []),
-                    'result': 'win' if t.get('win') else ('lose' if t.get('win') is False else ''),
-                    'reason': t.get('reason', ''),
-                    'exit_reason': t.get('exit_reason', ''),
-                    'opt_symbol': opt_sym,
-                    'regime': t.get('regime', 'neutral'),
-                    'day_market_regime': t.get('day_market_regime', ''),
-                    'day_market_label': t.get('day_market_label', ''),
-                    'day_market_direction': t.get('day_market_direction', ''),
-                    'atr_at_entry': t.get('atr_at_entry', 0),
-                    'macd_hist_entry': t.get('macd_hist_entry', 0),
-                    'vwap_entry': t.get('vwap_entry', 0),
-                    '_source': 'internal',
-                })
-                seen_symbols.add(key)
-
-        internal_symbols = {str(t.get('opt_symbol', '')) for t in all_trades}
-        for bt in broker_reconciliation:
-            symbol = str(bt.get('opt_symbol', ''))
-            if symbol and symbol not in internal_symbols:
-                recovered = dict(bt)
-                recovered['_source'] = 'broker_unmatched'
-                recovered['reason'] = f"broker_unmatched: {bt.get('reason', '')}"
-                all_trades.append(recovered)
-        
-        if not all_trades:
-            print("📋 今日无交易记录，跳过保存")
-            return
-
         try:
-            # 从交易数据推断日期（broker对账的用期权到期日，internal的用当前ET）
-            from collections import Counter
-            dates_from_trades = [t.get('date', '') for t in all_trades if t.get('date')]
-            today = Counter(dates_from_trades).most_common(1)[0][0] if dates_from_trades else datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            script_dir = str(_app_dir())
-            records_dir = os.path.join(script_dir, 'records')
-            os.makedirs(records_dir, exist_ok=True)
-
-            # all_trades 已经是格式化好的（来自broker对账 + internal补充）
-            formatted_trades = all_trades
-
-            # 从broker对账数据计算总PnL（比self.daily_pnl更准确）
-            broker_pnl = sum(t.get('pnl_usd', 0) for t in broker_reconciliation)
-            internal_pnl = sum(t.get('pnl_usd', 0) for t in formatted_trades)
-            total_pnl = broker_pnl if broker_reconciliation else internal_pnl
-
-            # 保存当日文件（用美东日期）
-            filepath = os.path.join(records_dir, f'{today}.json')
-            tmp_path = filepath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'date': today,
-                    'trades': formatted_trades,
-                    'total': len(formatted_trades),
-                    'wins': sum(1 for t in formatted_trades if t.get('result') == 'win'),
-                    'pnl': round(total_pnl, 2),
-                    'internal_pnl': round(internal_pnl, 2),
-                    'broker_reconciliation': broker_reconciliation,
-                    'reconciliation_delta': round(total_pnl - internal_pnl, 2),
-                    'signal_probes': self._serialize_signal_probes(),
-                }, f, ensure_ascii=False, indent=2, default=_json_default)
-            # Windows文件锁定重试机制
-            for attempt in range(5):
-                try:
-                    os.replace(tmp_path, filepath)  # 原子替换
-                    break
-                except OSError as e:
-                    if attempt < 4:
-                        time.sleep(0.2)
-                    else:
-                        raise
-
-            broker_count = len(broker_reconciliation)
-            internal_count = sum(1 for t in formatted_trades if t.get('_source') == 'internal')
-            print(f"💾 交易记录已保存: {filepath} ({len(formatted_trades)}笔: broker={broker_count}, internal={internal_count})")
-            print(f"📊 总盈亏: ${total_pnl:+,.2f}")
-            print(f"📤 正在同步到 Gist...")
-
-            # 自动调用 update_gist（打包后直接import，避免subprocess无法启动子进程）
+            result = self.trade_ledger.save_daily_record(
+                self.trades_today or [],
+                broker_trades,
+                self.cfg['contract_multiplier'],
+                self._serialize_signal_probes(),
+            )
+            if not result:
+                print("📋 今日无交易记录，跳过保存")
+                return
+            print(
+                f"💾 交易记录已保存: {result['path']} "
+                f"({result['total']}笔: broker={result['broker_count']}, "
+                f"internal={result['internal_count']})"
+            )
+            print(f"📊 总盈亏: ${result['pnl']:+,.2f}")
+            print("📤 正在同步到 Gist...")
             try:
                 from update_gist import main as sync_gist_main
                 sync_gist_main()
             except Exception as gist_err:
                 print(f"⚠️ Gist同步失败: {gist_err}")
-
         except Exception as e:
             print(f"❌ 保存记录失败: {e}")
 

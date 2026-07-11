@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -220,3 +220,102 @@ class TradeLedger:
                     raise
                 time.sleep(0.2)
         return {"path": str(path), **payload}
+
+    def _serialize_internal_trade(self, trade: Mapping[str, Any], multiplier: int) -> dict[str, Any] | None:
+        symbol = str(trade.get("opt_symbol", "") or "")
+        contracts = trade.get("cycle_contracts") or trade.get("original_contracts") or trade.get("contracts", 0)
+        if not symbol or int(contracts or 0) <= 0:
+            return None
+        pnl_pct = trade.get("pnl_pct", trade.get("max_pnl_pct", 0))
+        return {
+            "date": datetime.now(self._timezone).strftime("%Y-%m-%d"),
+            "entry_time": self._format_time(trade.get("entry_time"))[:8],
+            "exit_time": self._format_time(trade.get("exit_time"))[:8],
+            "dir": trade.get("dir", ""),
+            "entry_price": trade.get("entry_opt_price") or trade.get("entry_price", 0),
+            "exit_price": trade.get("exit_opt_price", 0),
+            "qty": int(contracts) * multiplier,
+            "contracts": contracts,
+            "pnl_pct": round(float(pnl_pct or 0), 2),
+            "pnl_usd": round(float(trade.get("pnl_usd", 0) or 0), 2),
+            "final_exit_pnl_pct": round(float(trade.get("final_exit_pnl_pct", 0) or 0), 2),
+            "final_exit_pnl_usd": round(float(trade.get("final_exit_pnl_usd", 0) or 0), 2),
+            "partial_exits": list(trade.get("partial_exits") or []),
+            "result": "win" if trade.get("win") else "lose" if trade.get("win") is False else "",
+            "reason": trade.get("reason", ""),
+            "exit_reason": trade.get("exit_reason", ""),
+            "opt_symbol": symbol,
+            "regime": trade.get("regime", "neutral"),
+            "day_market_regime": trade.get("day_market_regime", ""),
+            "day_market_label": trade.get("day_market_label", ""),
+            "day_market_direction": trade.get("day_market_direction", ""),
+            "atr_at_entry": trade.get("atr_at_entry", 0),
+            "macd_hist_entry": trade.get("macd_hist_entry", 0),
+            "vwap_entry": trade.get("vwap_entry", 0),
+            "_source": "internal",
+        }
+
+    def save_daily_record(
+        self,
+        internal_trades: Iterable[Mapping[str, Any]],
+        broker_trades: Iterable[Mapping[str, Any]],
+        multiplier: int,
+        signal_probes: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        broker_rows = [dict(trade) for trade in broker_trades]
+        rows = []
+        seen = set()
+        for trade in internal_trades:
+            key = str(trade.get("order_id") or f"{trade.get('opt_symbol', '')}_{trade.get('entry_time', '')}")
+            if key in seen:
+                continue
+            serialized = self._serialize_internal_trade(trade, multiplier)
+            if serialized:
+                rows.append(serialized)
+                seen.add(key)
+        internal_symbols = {row["opt_symbol"] for row in rows}
+        for broker_trade in broker_rows:
+            symbol = str(broker_trade.get("opt_symbol", ""))
+            if symbol and symbol not in internal_symbols:
+                recovered = dict(broker_trade)
+                recovered["_source"] = "broker_unmatched"
+                recovered["reason"] = f"broker_unmatched: {broker_trade.get('reason', '')}"
+                rows.append(recovered)
+        if not rows:
+            return None
+
+        dates = [str(row.get("date", "")) for row in rows if row.get("date")]
+        date_str = Counter(dates).most_common(1)[0][0] if dates else datetime.now(self._timezone).strftime("%Y-%m-%d")
+        broker_pnl = sum(float(row.get("pnl_usd", 0) or 0) for row in broker_rows)
+        internal_pnl = sum(float(row.get("pnl_usd", 0) or 0) for row in rows)
+        total_pnl = broker_pnl if broker_rows else internal_pnl
+        payload = {
+            "date": date_str,
+            "trades": rows,
+            "total": len(rows),
+            "wins": sum(row.get("result") == "win" for row in rows),
+            "pnl": round(total_pnl, 2),
+            "internal_pnl": round(internal_pnl, 2),
+            "broker_reconciliation": broker_rows,
+            "reconciliation_delta": round(total_pnl - internal_pnl, 2),
+            "signal_probes": signal_probes,
+        }
+        self._records_dir.mkdir(parents=True, exist_ok=True)
+        path = self._records_dir / f"{date_str}.json"
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, default=self._json_default)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        return {
+            "path": str(path),
+            "broker_count": len(broker_rows),
+            "internal_count": sum(row.get("_source") == "internal" for row in rows),
+            **payload,
+        }

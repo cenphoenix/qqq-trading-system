@@ -246,6 +246,26 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(payload["orders"][0]["executed_qty"], 2)
         self.assertEqual(payload["orders"][0]["status"], "PartialFilled")
 
+    def test_daily_record_merges_internal_details_and_broker_reconciliation(self):
+        internal = [{
+            "order_id": "open-1", "entry_time": datetime(2026, 7, 10, 10, 0, tzinfo=TZ_ET),
+            "exit_time": datetime(2026, 7, 10, 10, 5, tzinfo=TZ_ET), "dir": "call",
+            "opt_symbol": "QQQ260710C720000.US", "contracts": 2,
+            "entry_opt_price": 1, "exit_opt_price": 1.5, "pnl_usd": 100,
+            "pnl_pct": 50, "win": True, "reason": "VWAP_Breakout",
+        }]
+        broker = [{
+            "date": "2026-07-10", "dir": "call", "opt_symbol": "QQQ260710C720000.US",
+            "contracts": 2, "pnl_usd": 100, "result": "win",
+        }]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = TradeLedger(temp_dir, TZ_ET).save_daily_record(internal, broker, 100, [{"id": 1}])
+            payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["pnl"], 100)
+        self.assertEqual(payload["trades"][0]["reason"], "VWAP_Breakout")
+        self.assertEqual(payload["signal_probes"], [{"id": 1}])
+
 
 class NotificationServiceTests(unittest.TestCase):
     def test_disabled_transports_return_false(self):
