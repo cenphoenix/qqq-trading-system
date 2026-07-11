@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, TradeLedger
+from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, SignalProbeStore, TradeLedger
 
 
 TZ_ET = ZoneInfo("America/New_York")
@@ -292,6 +292,24 @@ class TradeLedgerTests(unittest.TestCase):
         self.assertEqual(payload["pnl"], 100)
         self.assertEqual(payload["trades"][0]["reason"], "VWAP_Breakout")
         self.assertEqual(payload["signal_probes"], [{"id": 1}])
+
+
+class SignalProbeStoreTests(unittest.TestCase):
+    def test_save_and_load_normalizes_milestone_keys(self):
+        probe = {
+            "id": 7, "entry_time": "2026-07-10 10:00:00", "entry_bar": 20,
+            "signal": "VWAP_Breakout", "dir": "call", "entry_price": 500,
+            "milestones": {5: {"pct": 0.2}, 10: None, 20: None},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SignalProbeStore(temp_dir, TZ_ET)
+            saved = store.save([probe])
+            date_str = saved["date"]
+            restored = store.load(date_str)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0]["id"], 7)
+        self.assertEqual(restored[0]["milestones"][5], {"pct": 0.2})
+        self.assertIn(20, restored[0]["milestones"])
 
 
 class NotificationServiceTests(unittest.TestCase):

@@ -58,7 +58,7 @@ from longbridge.openapi import (
 
 # ===== 配置（从 config_manager 加载）=====
 from config_manager import get_flat_config
-from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, TradeLedger, TraderMessageFormatter
+from trading import AccountSnapshotService, LongbridgeBroker, NotificationLog, NotificationService, OrderExecution, PositionBook, ReviewSummaryScheduler, SignalProbeStore, TradeLedger, TraderMessageFormatter
 
 def _load_config():
     """从 settings.json 加载配置，失败回退默认值"""
@@ -278,6 +278,7 @@ class QQQLiveTrader:
         self.cfg = config or CONFIG
         self.notification_log = NotificationLog(_app_dir(), TZ_ET, _json_default)
         self.trade_ledger = TradeLedger(_app_dir(), TZ_ET, _json_default)
+        self.signal_probe_store = SignalProbeStore(_app_dir(), TZ_ET, _json_default)
         self.message_formatter = TraderMessageFormatter(self, TZ_ET)
         self.notification_service = NotificationService(
             _app_dir(), TZ_ET, lambda: self.cfg, self.message_formatter.format,
@@ -1783,55 +1784,19 @@ class QQQLiveTrader:
                 pass
 
     def _save_signal_probes_snapshot(self):
-        """把信号追踪单独落盘，避免依赖平仓记录。"""
+        """Persist signal probes independently from closed-trade records."""
         try:
-            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            records_dir = os.path.join(_app_dir(), 'records')
-            os.makedirs(records_dir, exist_ok=True)
-            filepath = os.path.join(records_dir, f'signal_probes_{today_et}.json')
-            rows = self._serialize_signal_probes()
-            tmp_path = filepath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'date': today_et,
-                    'updated': datetime.now(TZ_ET).strftime('%Y-%m-%d %H:%M:%S'),
-                    'probes': rows,
-                }, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp_path, filepath)
+            result = self.signal_probe_store.save(self.signal_probes)
             try:
                 import dashboard_v7
-                dashboard_v7.update_signal_probes(rows)
+                dashboard_v7.update_signal_probes(result['probes'])
             except Exception:
                 pass
         except Exception as e:
             print(f"  ⚠️ 信号追踪保存失败: {e}")
 
     def _serialize_signal_probes(self):
-        rows = []
-        for p in self.signal_probes:
-            rows.append({
-                'id': p.get('id'),
-                'entry_time': p.get('entry_time', ''),
-                'entry_bar': p.get('entry_bar', 0),
-                'signal': p.get('signal', ''),
-                'dir': p.get('dir', ''),
-                'entry_price': p.get('entry_price', 0),
-                'opt_symbol': p.get('opt_symbol', ''),
-                'contracts': p.get('contracts', 0),
-                'reason': p.get('reason', ''),
-                'regime': p.get('regime', ''),
-                'source': p.get('source', 'live'),
-                'rejection_reason': p.get('rejection_reason', ''),
-                'm5_pct': p.get('m5_pct'),
-                'm10_pct': p.get('m10_pct'),
-                'm20_pct': p.get('m20_pct'),
-                'm5_price': p.get('m5_price'),
-                'm10_price': p.get('m10_price'),
-                'm20_price': p.get('m20_price'),
-                'completed': p.get('completed', False),
-                'milestones': p.get('milestones', {}),
-            })
-        return rows
+        return self.signal_probe_store.serialize(self.signal_probes)
 
     def _trade_notify_key(self, trade, source='exit'):
         """生成交易通知指纹，避免同一笔平仓重复通知，也避免同合约多次交易被误去重。"""
@@ -5270,51 +5235,14 @@ class QQQLiveTrader:
             traceback.print_exc()
 
     def _load_today_signal_probes(self):
-        """恢复今日信号追踪记录，重启后继续补齐5/10/20根K线。"""
+        """Restore today's probes so 5/10/20-bar tracking survives restarts."""
         try:
-            today_et = datetime.now(TZ_ET).strftime('%Y-%m-%d')
-            filepath = os.path.join(_app_dir(), 'records', f'signal_probes_{today_et}.json')
-            if not os.path.exists(filepath):
-                return
-            with open(filepath, encoding='utf-8') as f:
-                data = json.load(f)
-            probes = data.get('probes', [])
+            probes = self.signal_probe_store.load(default_entry_bar=len(self.one_min_candles))
             if not probes:
                 return
-            self.signal_probes = []
-            for p in probes:
-                milestones = p.get('milestones') or {5: None, 10: None, 20: None}
-                norm_milestones = {}
-                for k, v in milestones.items():
-                    try:
-                        norm_milestones[int(k)] = v
-                    except Exception:
-                        pass
-                restored = {
-                    'id': int(p.get('id', len(self.signal_probes) + 1)),
-                    'entry_time': p.get('entry_time', ''),
-                    'entry_bar': int(p.get('entry_bar', len(self.one_min_candles))),
-                    'signal': p.get('signal', ''),
-                    'dir': p.get('dir', ''),
-                    'entry_price': float(p.get('entry_price', 0) or 0),
-                    'opt_symbol': p.get('opt_symbol', ''),
-                    'contracts': int(p.get('contracts', 0) or 0),
-                    'reason': p.get('reason', ''),
-                    'regime': p.get('regime', ''),
-                    'source': p.get('source', 'live'),
-                    'rejection_reason': p.get('rejection_reason', ''),
-                    'm5_pct': p.get('m5_pct'),
-                    'm10_pct': p.get('m10_pct'),
-                    'm20_pct': p.get('m20_pct'),
-                    'm5_price': p.get('m5_price'),
-                    'm10_price': p.get('m10_price'),
-                    'm20_price': p.get('m20_price'),
-                    'milestones': norm_milestones or {5: None, 10: None, 20: None},
-                    'completed': bool(p.get('completed', False)),
-                }
-                self.signal_probes.append(restored)
-            self._signal_probe_seq = max((p.get('id', 0) for p in self.signal_probes), default=0)
-            print(f"📥 恢复今日信号追踪: {len(self.signal_probes)}条")
+            self.signal_probes = probes
+            self._signal_probe_seq = max((probe.get('id', 0) for probe in probes), default=0)
+            print(f"📂 恢复今日信号追踪: {len(probes)}条")
             try:
                 import dashboard_v7
                 dashboard_v7.update_signal_probes(self._serialize_signal_probes())

@@ -7,6 +7,7 @@ from .notification_log import NotificationLog
 from .notification_service import NotificationService
 from .positions import BrokerPosition, PositionBook
 from .review_scheduler import ReviewSummaryScheduler
+from .signal_probe_store import SignalProbeStore
 from .trade_ledger import TradeLedger
 from .message_formatter import TraderMessageFormatter
 
@@ -20,6 +21,7 @@ __all__ = [
     "BrokerPosition",
     "PositionBook",
     "ReviewSummaryScheduler",
+    "SignalProbeStore",
     "TradeLedger",
     "TraderMessageFormatter",
 ]
