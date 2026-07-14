@@ -44,16 +44,29 @@ class OrderExecution:
         self._sleep = sleep_fn
         self.state_store = state_store
 
-    def recover_active_orders(self):
+    def recover_active_orders(self, option_underlying: str | None = None):
         orders = self.broker.today_orders() or []
-        return self.state_store.sync(orders) if self.state_store else []
+        if not self.state_store:
+            return []
+        self.state_store.sync(orders)
+        return self.state_store.active(option_underlying=option_underlying)
 
-    def has_active_order(self, symbol: str | None = None, buy_only: bool = True) -> bool:
+    def has_active_order(
+        self,
+        symbol: str | None = None,
+        buy_only: bool = True,
+        option_underlying: str | None = None,
+    ) -> bool:
         try:
-            self.recover_active_orders()
+            self.recover_active_orders(option_underlying=option_underlying)
         except Exception:
             pass
-        return bool(self.state_store and self.state_store.active(symbol, buy_only))
+        return bool(
+            self.state_store
+            and self.state_store.active(
+                symbol, buy_only, option_underlying=option_underlying,
+            )
+        )
 
     def find_order(self, order_id) -> Any | None:
         """Find an order through the filtered API, then the full-day list."""

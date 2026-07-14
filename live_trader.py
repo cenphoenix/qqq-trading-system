@@ -2243,9 +2243,9 @@ class QQQLiveTrader:
         self.running = True
         self.lifecycle.mark_running()
         try:
-            active_orders = self.order_execution.recover_active_orders()
+            active_orders = self.order_execution.recover_active_orders(option_underlying="QQQ")
             if active_orders:
-                print(f"⚠️ 启动恢复发现 {len(active_orders)} 个活动订单，将阻止重复开仓")
+                print(f"⚠️ 启动恢复发现 {len(active_orders)} 个 QQQ 期权活动订单，将阻止重复开仓")
         except Exception as error:
             print(f"⚠️ 活动订单恢复失败: {error}")
 
@@ -3516,8 +3516,8 @@ class QQQLiveTrader:
     def _execute_trade_inner(self, sig):
         """执行期权交易（内部实现）"""
         self.runtime_health.entry_attempts += 1
-        if self.order_execution.has_active_order(buy_only=True):
-            print("  ⛔ 长桥仍有活动买单，禁止重复开仓")
+        if self.order_execution.has_active_order(buy_only=True, option_underlying="QQQ"):
+            print("  ⛔ QQQ 期权仍有活动买单，禁止重复开仓")
             return
         # ===== 开仓前检查：已有持仓禁止重复开仓 =====
         try:
@@ -4373,7 +4373,6 @@ class QQQLiveTrader:
                 return
             executed_price = float(fill.executed_price or 0)
             half = min(int(fill.executed_quantity), half)
-            half = min(int(executed_qty), half)
 
             # 获取平仓时的期权价格
             exit_opt = float(executed_price) if executed_price > 0 else 0

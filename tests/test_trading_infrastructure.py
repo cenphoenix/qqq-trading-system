@@ -169,6 +169,38 @@ class OrderExecutionTests(unittest.TestCase):
         self.assertEqual(len(active), 1)
         self.assertEqual(restored.active(buy_only=True)[0]["order_id"], "active-1")
 
+    def test_active_order_lock_only_matches_qqq_options(self):
+        orders = [
+            type("Order", (), {
+                "order_id": "tqqq-1", "symbol": "TQQQ.US",
+                "side": "OrderSide.Buy", "quantity": 100,
+                "executed_quantity": 0, "executed_price": 0,
+                "status": "OrderStatus.New",
+            })(),
+            type("Order", (), {
+                "order_id": "qqq-expired", "symbol": "QQQ260715P700000.US",
+                "side": "OrderSide.Buy", "quantity": 1,
+                "executed_quantity": 0, "executed_price": 0,
+                "status": "OrderStatus.Expired",
+            })(),
+        ]
+
+        class Broker:
+            def today_orders(self, *args, **kwargs):
+                return orders
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = OrderStateStore(temp_dir, TZ_ET)
+            execution = OrderExecution(Broker(), sleep_fn=lambda _: None, state_store=store)
+            self.assertFalse(
+                execution.has_active_order(
+                    buy_only=True, option_underlying="QQQ",
+                )
+            )
+
+        self.assertTrue(OrderStateStore.is_option_for("QQQ260715C720000.US", "QQQ"))
+        self.assertFalse(OrderStateStore.is_option_for("TQQQ.US", "QQQ"))
+
 
 class PositionBookTests(unittest.TestCase):
     def test_positions_are_normalized_and_searchable(self):

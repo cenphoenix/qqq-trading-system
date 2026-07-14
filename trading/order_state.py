@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, tzinfo
 from enum import Enum
@@ -34,7 +35,7 @@ class OrderStateStore:
         token = str(status or "").replace("OrderStatus.", "").lower()
         if "reject" in token:
             return OrderState.REJECTED
-        if "cancel" in token or "withdraw" in token:
+        if "cancel" in token or "withdraw" in token or "expire" in token:
             return OrderState.CANCELED
         if "fill" in token and "partial" not in token:
             return OrderState.FILLED
@@ -43,6 +44,13 @@ class OrderStateStore:
         if any(part in token for part in cls.ACTIVE_TOKENS):
             return OrderState.SUBMITTED
         return OrderState.UNKNOWN
+
+    @staticmethod
+    def is_option_for(symbol: Any, underlying: str) -> bool:
+        """Return whether a symbol is an option for the requested underlying."""
+        token = str(symbol or "").upper()
+        root = re.escape(str(underlying or "").upper())
+        return bool(re.fullmatch(rf"{root}\d{{6}}[CP]\d+\.US", token))
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -108,8 +116,13 @@ class OrderStateStore:
             )
         return self.active()
 
-    def active(self, symbol: str | None = None, buy_only: bool = False) -> list[dict[str, Any]]:
-        active_states = {OrderState.SUBMITTED.value, OrderState.PARTIAL.value, OrderState.UNKNOWN.value}
+    def active(
+        self,
+        symbol: str | None = None,
+        buy_only: bool = False,
+        option_underlying: str | None = None,
+    ) -> list[dict[str, Any]]:
+        active_states = {OrderState.SUBMITTED.value, OrderState.PARTIAL.value}
         today = datetime.now(self._timezone).date()
         rows = []
         for row in self._orders.values():
@@ -124,6 +137,11 @@ class OrderStateStore:
             rows.append(row)
         if symbol:
             rows = [row for row in rows if row.get("symbol") == symbol]
+        if option_underlying:
+            rows = [
+                row for row in rows
+                if self.is_option_for(row.get("symbol"), option_underlying)
+            ]
         if buy_only:
             rows = [row for row in rows if "buy" in str(row.get("side", "")).lower()]
         return rows
